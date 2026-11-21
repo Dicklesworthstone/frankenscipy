@@ -690,3 +690,154 @@ fn adv_max_step_neg_inf() {
     let result = validate_max_step(f64::NEG_INFINITY);
     assert!(result.is_err(), "negative Inf max_step should be rejected");
 }
+
+/// Exercise the public quadrature API against a required, versioned SciPy
+/// process. The large-scale references are evaluated in normalized coordinates
+/// so the oracle's own intermediate sum does not overflow.
+#[test]
+fn de_quadrature_scipy() {
+    use fsci_integrate::{QuadResult, nsum, tanhsinh};
+    use std::process::Command;
+
+    let python = std::env::var("FSCI_PYTHON")
+        .or_else(|_| std::env::var("SCIPY_PYTHON"))
+        .unwrap_or_else(|_| "python3".into());
+    let script = r#"
+import numpy as np
+import scipy
+from scipy.integrate import tanhsinh, nsum
+assert scipy.__version__ == '1.17.1', scipy.__version__
+assert np.__version__ == '2.4.3', np.__version__
+def integral(name, f, a, b, rtol=1e-12, scale=1.):
+    with np.errstate(all='ignore'):
+        result = tanhsinh(f, a, b, atol=0., rtol=rtol, maxlevel=10)
+    print(name, float(result.integral)*scale, int(result.success),
+          float(result.error)*abs(scale))
+integral('smooth', np.exp, 0., 1.)
+integral('tiny', np.exp, 0., 1., scale=1e-300)
+integral('huge', np.exp, 0., 1., scale=5e307)
+integral('reverse_huge', np.exp, 1., 0., scale=5e307)
+integral('left_singular', lambda x: 1/np.sqrt(x), 0., 1.)
+integral('shift_loose', lambda x: np.exp(-(x-1))/np.sqrt(x-1), 1., np.inf, 1e-6)
+integral('shift_tight', lambda x: np.exp(-(x-1))/np.sqrt(x-1), 1., np.inf)
+integral('mirror_tight', lambda x: np.exp(x+1)/np.sqrt(-1-x), -np.inf, -1.)
+integral('right_singular', lambda x: (1-x)**(-0.75), 0., 1.)
+integral('gaussian', lambda x: np.exp(-x*x), -np.inf, np.inf)
+for name, f, a, b, step in [
+    ('finite_series', lambda x: x*x, -2., 2., 0.5),
+    ('infinite_series', lambda x: 1/(x*x), 1., np.inf, 1.),
+]:
+    result = nsum(f, a, b, step=step, tolerances={'atol': 0., 'rtol': 1e-11})
+    print(name, float(result.sum), int(result.success), float(result.error))
+"#;
+    let output = Command::new(&python)
+        .args(["-c", script])
+        .env("OPENBLAS_NUM_THREADS", "1")
+        .env("OMP_NUM_THREADS", "1")
+        .output();
+    let required = std::env::var("FSCI_REQUIRE_SCIPY_ORACLE").as_deref() == Ok("1");
+    let output = match output {
+        Ok(output) if output.status.success() => output,
+        other => {
+            assert!(!required, "required pinned SciPy oracle failed: {other:?}");
+            eprintln!("SKIP de_quadrature_scipy: pinned SciPy oracle unavailable: {other:?}");
+            return;
+        }
+    };
+    let text = String::from_utf8(output.stdout).expect("oracle emits UTF-8");
+    let mut compared = 0;
+    for line in text.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        assert_eq!(fields.len(), 4, "invalid oracle row: {line}");
+        let expected: f64 = fields[1].parse().unwrap();
+        let expected_success = match fields[2] {
+            "0" => false,
+            "1" => true,
+            value => panic!("invalid oracle status: {value}"),
+        };
+        let oracle_error: f64 = fields[3].parse().unwrap();
+        let result = match fields[0] {
+            "smooth" => tanhsinh(f64::exp, 0.0, 1.0, 0.0, 1e-12, 10),
+            "tiny" => tanhsinh(|x| 1e-300 * x.exp(), 0.0, 1.0, 0.0, 1e-12, 10),
+            "huge" => tanhsinh(|x| 5e307 * x.exp(), 0.0, 1.0, 0.0, 1e-12, 10),
+            "reverse_huge" => tanhsinh(|x| 5e307 * x.exp(), 1.0, 0.0, 0.0, 1e-12, 10),
+            "left_singular" => tanhsinh(|x| 1.0 / x.sqrt(), 0.0, 1.0, 0.0, 1e-12, 10),
+            "shift_loose" | "shift_tight" => tanhsinh(
+                |x| (-(x - 1.0)).exp() / (x - 1.0).sqrt(),
+                1.0,
+                f64::INFINITY,
+                0.0,
+                if fields[0] == "shift_loose" {
+                    1e-6
+                } else {
+                    1e-12
+                },
+                10,
+            ),
+            "mirror_tight" => tanhsinh(
+                |x| (x + 1.0).exp() / (-1.0 - x).sqrt(),
+                f64::NEG_INFINITY,
+                -1.0,
+                0.0,
+                1e-12,
+                10,
+            ),
+            "right_singular" => tanhsinh(|x| (1.0 - x).powf(-0.75), 0.0, 1.0, 0.0, 1e-12, 10),
+            "gaussian" => tanhsinh(
+                |x| (-x * x).exp(),
+                f64::NEG_INFINITY,
+                f64::INFINITY,
+                0.0,
+                1e-12,
+                10,
+            ),
+            "finite_series" | "infinite_series" => {
+                let sum = if fields[0] == "finite_series" {
+                    nsum(|x| x * x, -2.0, 2.0, 0.5, 0.0, 1e-11)
+                } else {
+                    nsum(|x| 1.0 / (x * x), 1.0, f64::INFINITY, 1.0, 0.0, 1e-11)
+                };
+                QuadResult {
+                    integral: sum.sum,
+                    error: sum.error,
+                    neval: sum.nfev,
+                    converged: sum.converged,
+                }
+            }
+            name => panic!("unexpected oracle case: {name}"),
+        };
+        assert!(expected.is_finite() && oracle_error.is_finite(), "{line}");
+        assert!(result.integral.is_finite() && result.error.is_finite());
+        assert_eq!(
+            result.converged, expected_success,
+            "{}: {result:?}",
+            fields[0]
+        );
+        let relative_tolerance = if fields[0] == "shift_loose" {
+            1e-6
+        } else {
+            5e-11
+        };
+        let allowance = if expected_success {
+            relative_tolerance * expected.abs()
+        } else {
+            result.error.max(oracle_error)
+        };
+        let difference = (result.integral - expected).abs();
+        assert!(
+            difference <= allowance,
+            "{}: Rust {result:?}, SciPy {expected}, difference {difference}",
+            fields[0]
+        );
+        assert!(result.neval > 0);
+        eprintln!(
+            "{}: success={}, difference={difference:e}, error={:e}",
+            fields[0], result.converged, result.error
+        );
+        compared += 1;
+    }
+    assert_eq!(
+        compared, 12,
+        "every case must be compared against the live oracle"
+    );
+}

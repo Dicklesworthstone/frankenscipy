@@ -3483,122 +3483,279 @@ where
     }
 }
 
+/// Two distinct samples closest to a finite endpoint. Infer local power-law
+/// decay from actual endpoint distances, not from transformed t coordinates:
+/// rounding of x can make the last transformed terms look artificially small.
+#[derive(Default)]
+struct DeEndpointTail {
+    nearest: Option<(f64, f64)>,
+    next: Option<(f64, f64)>,
+}
+
+impl DeEndpointTail {
+    fn record(&mut self, distance: f64, magnitude: f64) {
+        if !distance.is_finite() || distance <= 0.0 {
+            return;
+        }
+        match self.nearest {
+            None => self.nearest = Some((distance, magnitude)),
+            Some((nearest, _)) if distance < nearest => {
+                self.next = self.nearest;
+                self.nearest = Some((distance, magnitude));
+            }
+            Some((nearest, _)) if distance > nearest => {
+                if self.next.is_none_or(|(next, _)| distance < next) {
+                    self.next = Some((distance, magnitude));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn error(&self) -> f64 {
+        let (Some((distance, value)), Some((other_distance, other_value))) =
+            (self.nearest, self.next)
+        else {
+            return 0.0;
+        };
+        if value == 0.0 {
+            return 0.0;
+        }
+        if other_value == 0.0 {
+            return f64::INFINITY;
+        }
+        // For f(x) ~ C*d^p, the unresolved integral is f(x)*d/(p+1).
+        // This component matters when p approaches -1: the outer transformed
+        // term alone need not bound even a slowly convergent elementary tail.
+        let power = (value.ln() - other_value.ln()) / (distance.ln() - other_distance.ln());
+        let integrability = 1.0 + power;
+        if !integrability.is_finite() || integrability <= 0.0 {
+            return f64::INFINITY;
+        }
+        de_weighted_term(1.0 / integrability, distance, value)
+    }
+}
+
+/// The two outermost transformed samples on one side of the integration
+/// interval. A local exponential tail estimate complements the finite-endpoint
+/// power estimate: logarithmic singularities can decay arbitrarily slowly in
+/// transformed coordinates even though their local power appears integrable.
+#[derive(Default)]
+struct DeTransformedTail {
+    outer: Option<(f64, f64)>,
+    next: Option<(f64, f64)>,
+}
+
+impl DeTransformedTail {
+    fn record(&mut self, distance: f64, magnitude: f64) {
+        match self.outer {
+            None => self.outer = Some((distance, magnitude)),
+            Some((outer, _)) if distance > outer => {
+                self.next = self.outer;
+                self.outer = Some((distance, magnitude));
+            }
+            Some((outer, _)) if distance < outer => {
+                if self.next.is_none_or(|(next, _)| distance > next) {
+                    self.next = Some((distance, magnitude));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn error(&self) -> f64 {
+        let (Some((distance, value)), Some((other_distance, other_value))) =
+            (self.outer, self.next)
+        else {
+            return 0.0;
+        };
+        if value == 0.0 {
+            return 0.0;
+        }
+        if other_value == 0.0 {
+            return f64::INFINITY;
+        }
+        let decay = (other_value.ln() - value.ln()) / (distance - other_distance);
+        if !decay.is_finite() || decay <= 0.0 {
+            return f64::INFINITY;
+        }
+        // For g(t) ~ C*exp(-decay*|t|), the unresolved transformed integral
+        // is g(t)/decay. Keep the physical endpoint estimate as well: rounded
+        // abscissae can make this observed decay artificially steep.
+        value / decay
+    }
+}
+
+/// A compensated sum of the *weighted* quadrature terms. Keeping the step
+/// inside each term avoids an intermediate sum that grows by 2 at every level
+/// even when the integral itself is representable.
+struct DeSum {
+    value: f64,
+    correction: f64,
+    absolute: f64,
+    outer_t: [f64; 2],
+    outer_terms: [f64; 2],
+    endpoints: [DeEndpointTail; 2],
+    transformed_tails: [DeTransformedTail; 2],
+}
+
+impl Default for DeSum {
+    fn default() -> Self {
+        Self {
+            value: 0.0,
+            correction: 0.0,
+            absolute: 0.0,
+            outer_t: [f64::INFINITY, f64::NEG_INFINITY],
+            outer_terms: [0.0; 2],
+            endpoints: std::array::from_fn(|_| DeEndpointTail::default()),
+            transformed_tails: std::array::from_fn(|_| DeTransformedTail::default()),
+        }
+    }
+}
+
+impl DeSum {
+    fn add(&mut self, term: f64) {
+        let next = self.value + term;
+        if self.value.abs() >= term.abs() {
+            self.correction += (self.value - next) + term;
+        } else {
+            self.correction += (term - next) + self.value;
+        }
+        self.value = next;
+        self.absolute += term.abs();
+    }
+
+    fn halve(&mut self) {
+        self.value *= 0.5;
+        self.correction *= 0.5;
+        self.absolute *= 0.5;
+    }
+
+    fn total(&self) -> f64 {
+        self.value + self.correction
+    }
+}
+
+/// Multiply a positive step and Jacobian by a finite integrand value without
+/// losing a representable contribution to an underflowed intermediate weight.
+fn de_weighted_term(h: f64, jac: f64, fx: f64) -> f64 {
+    let weight = h * jac;
+    let term = weight * fx;
+    if weight.is_normal() && term.is_finite() {
+        return term;
+    }
+    let mut factors = [h, jac, fx];
+    factors.sort_by(|a, b| a.abs().total_cmp(&b.abs()));
+    (factors[0] * factors[2]) * factors[1]
+}
+
 /// Generic double-exponential quadrature driver.
 ///
 /// `node(t)` maps a quadrature parameter `t ∈ ℝ` to `Some((x, jac))` — the
 /// abscissa `x` and the full weight `jac = (dx/dt)·W(t)` — or `None` when the
 /// node has run off the (possibly infinite) interval and should be skipped.
 /// Integral ≈ `h · Σ_j jac_j · f(x_j)`. Abscissae are reused across levels
-/// (halving the step only adds odd indices), and a quadratic `d1²/d2` error
-/// model is bounded below by roundoff and the unresolved endpoint tails.
-fn de_quadrature<F, N>(f: &F, node: &N, atol: f64, rtol: f64, max_level: usize) -> QuadResult
+/// (halving the step only adds odd indices). The inter-level error estimate is
+/// bounded below by roundoff and the outermost retained terms, so a stable
+/// truncated sum does not certify an unresolved endpoint tail.
+fn de_quadrature<F, N>(
+    f: &F,
+    node: &N,
+    endpoints: [Option<f64>; 2],
+    atol: f64,
+    rtol: f64,
+    max_level: usize,
+) -> QuadResult
 where
     F: Fn(f64) -> f64,
     N: Fn(f64) -> Option<(f64, f64)>,
 {
-    struct Accumulator {
-        sum: f64,
-        correction: f64,
-        absolute_sum: f64,
-        extreme_t: [f64; 2],
-        extreme_term: [f64; 2],
-        neval: usize,
-    }
-
     // Beyond |t| ≈ 7 the double-exponential weight has either underflowed to
     // zero or driven the abscissa off the interval, so summation can stop.
     let t_cap = 7.0;
-    let eval = |t: f64, acc: &mut Accumulator| {
+    let mut neval = 0usize;
+    let eval = |t: f64, h: f64, sum: &mut DeSum, neval: &mut usize| {
         // Geometry may omit rounded endpoint nodes, but a non-finite value at
         // an interior node invalidates the integral. Do not turn it into zero.
-        if !acc.sum.is_finite() || !acc.correction.is_finite() {
+        if !sum.total().is_finite() {
             return;
         }
         if let Some((x, jac)) = node(t)
             && jac != 0.0
         {
             if !x.is_finite() || !jac.is_finite() {
-                acc.sum = f64::NAN;
+                sum.value = f64::NAN;
                 return;
             }
             let fx = f(x);
-            acc.neval += 1;
-            let term = jac * fx;
-            if !term.is_finite() {
-                acc.sum = f64::NAN;
+            *neval += 1;
+            if !fx.is_finite() {
+                sum.value = f64::NAN;
                 return;
             }
-
-            // Neumaier compensation also preserves small contributions when
-            // a later term is larger than the running sum or changes its sign.
-            let next = acc.sum + term;
-            acc.correction += if acc.sum.abs() >= term.abs() {
-                (acc.sum - next) + term
-            } else {
-                (term - next) + acc.sum
-            };
-            acc.sum = next;
-            acc.absolute_sum += term.abs();
-
-            // Keep the outermost *evaluated* term in each transformed tail,
-            // across all refinement levels. A rounded endpoint can hide a
-            // singular tail even when successive integral estimates agree.
+            sum.add(de_weighted_term(h, jac, fx));
+            for (endpoint, tail) in endpoints.iter().zip(&mut sum.endpoints) {
+                if let Some(endpoint) = endpoint {
+                    tail.record((x - endpoint).abs(), fx.abs());
+                }
+            }
+            // Do not multiply this tail indicator by h: refining the same
+            // representability-limited endpoint must not make its omitted
+            // contribution look smaller. This is the outer-term component
+            // of double-exponential error estimation, independent of the
+            // difference between two successive truncated sums.
             let side = usize::from(t >= 0.0);
-            if t.abs() > acc.extreme_t[side] {
-                acc.extreme_t[side] = t.abs();
-                acc.extreme_term[side] = term.abs();
+            let outer_term = de_weighted_term(1.0, jac, fx).abs();
+            sum.transformed_tails[side].record(t.abs(), outer_term);
+            if (side == 0 && t < sum.outer_t[0]) || (side == 1 && t > sum.outer_t[1]) {
+                sum.outer_t[side] = t;
+                sum.outer_terms[side] = outer_term;
             }
         }
     };
 
     // Level 0: every integer index at the coarse step h0 = 1.
     let mut h = 1.0_f64;
-    let mut acc = Accumulator {
-        sum: 0.0,
-        correction: 0.0,
-        absolute_sum: 0.0,
-        extreme_t: [-1.0; 2],
-        extreme_term: [0.0; 2],
-        neval: 0,
-    };
-    eval(0.0, &mut acc);
+    let mut sum = DeSum::default();
+    eval(0.0, h, &mut sum, &mut neval);
     let mut j = 1;
     while (j as f64) * h <= t_cap {
         let t = j as f64 * h;
-        eval(t, &mut acc);
-        eval(-t, &mut acc);
+        eval(t, h, &mut sum, &mut neval);
+        eval(-t, h, &mut sum, &mut neval);
         j += 1;
     }
-    let mut prev = h * (acc.sum + acc.correction);
-    if !prev.is_finite() || acc.neval == 0 {
+    if !sum.total().is_finite() || neval == 0 {
         return QuadResult {
             integral: f64::NAN,
             error: f64::INFINITY,
-            neval: acc.neval,
+            neval,
             converged: false,
         };
     }
+    let mut prev = sum.total();
     let mut prev_delta = f64::INFINITY;
     let mut last_err = f64::INFINITY;
 
     for level in 1..=max_level {
         h *= 0.5;
+        sum.halve();
         let mut j = 1;
         while (j as f64) * h <= t_cap {
             let t = j as f64 * h;
-            eval(t, &mut acc);
-            eval(-t, &mut acc);
+            eval(t, h, &mut sum, &mut neval);
+            eval(-t, h, &mut sum, &mut neval);
             j += 2;
         }
-        let cur = h * (acc.sum + acc.correction);
-        if !cur.is_finite() {
+        if !sum.total().is_finite() {
             return QuadResult {
                 integral: f64::NAN,
                 error: f64::INFINITY,
-                neval: acc.neval,
+                neval,
                 converged: false,
             };
         }
+        let cur = sum.total();
         let delta = (cur - prev).abs();
         last_err = if prev_delta > 0.0 && prev_delta.is_finite() {
             // Form the ratio before multiplying: delta squared can underflow
@@ -3607,21 +3764,22 @@ where
         } else {
             delta
         };
-        // Do not multiply the endpoint floor by h: refining the same truncated
-        // interval does not resolve the missing tail. Like the refinement
-        // estimate, this is a practical error estimate, not a rigorous bound
-        // for an arbitrary callable. The L1 floor also detects cancellation.
-        let roundoff = f64::EPSILON * (h * acc.absolute_sum);
+        let roundoff =
+            (f64::EPSILON * sum.absolute).max(if cur == 0.0 { 0.0 } else { f64::from_bits(1) });
         last_err = last_err
             .max(roundoff)
-            .max(acc.extreme_term[0])
-            .max(acc.extreme_term[1]);
+            .max(sum.outer_terms[0])
+            .max(sum.outer_terms[1])
+            .max(sum.endpoints[0].error())
+            .max(sum.endpoints[1].error())
+            .max(sum.transformed_tails[0].error())
+            .max(sum.transformed_tails[1].error());
         if level >= 2 && last_err.is_finite() && last_err <= atol + rtol * cur.abs() {
             return QuadResult {
                 integral: cur,
                 error: last_err,
-                neval: acc.neval,
-                // status: refinement, endpoint-tail and roundoff estimates all meet tolerance
+                neval,
+                // status: inter-level, roundoff and endpoint-tail estimates all meet tolerance
                 converged: true,
             };
         }
@@ -3632,7 +3790,7 @@ where
     QuadResult {
         integral: prev,
         error: last_err,
-        neval: acc.neval,
+        neval,
         converged: false,
     }
 }
@@ -3652,14 +3810,16 @@ where
 ///
 /// `atol`/`rtol` are the absolute/relative tolerances (non-positive values fall
 /// back to `0.0` and `1e-12`); `max_level` caps the refinement levels (`0` →
-/// 16). Returns the estimate, a `d1²/d2` error estimate bounded below by
-/// endpoint-tail and roundoff estimates, the
+/// 16). Returns the estimate, an error estimate accounting for successive
+/// refinement, floating-point roundoff, and the outermost retained terms, the
 /// function-evaluation count, and whether the tolerance was met.
 /// Non-finite interior values or accumulated quadrature sums return an
 /// unconverged result with a non-finite integral and infinite error. Rounded
 /// endpoint nodes are omitted so integrable endpoint singularities remain supported.
-/// If representable nodes cannot resolve an endpoint tail to the requested
-/// tolerance, the finite estimate is returned with `converged = false`.
+/// If an endpoint is too coarsely represented to meet the requested tolerance,
+/// the result remains unconverged even if the truncated sums stop changing.
+/// Error estimates use observed local decay and are practical diagnostics,
+/// not rigorous bounds for an arbitrary callable.
 pub fn tanhsinh<F>(f: F, a: f64, b: f64, atol: f64, rtol: f64, max_level: usize) -> QuadResult
 where
     F: Fn(f64) -> f64,
@@ -3734,7 +3894,7 @@ where
             }
             Some((x, w))
         };
-        de_quadrature(&f, &node, atol, rtol, max_level)
+        de_quadrature(&f, &node, [Some(lo), Some(hi)], atol, rtol, max_level)
     } else if lo.is_finite() && hi == f64::INFINITY {
         // Semi-infinite [lo, ∞): exp-sinh, x = lo + exp((π/2)·sinh t).
         let node = |t: f64| -> Option<(f64, f64)> {
@@ -3750,7 +3910,7 @@ where
             }
             Some((x, jac))
         };
-        de_quadrature(&f, &node, atol, rtol, max_level)
+        de_quadrature(&f, &node, [Some(lo), None], atol, rtol, max_level)
     } else if lo == f64::NEG_INFINITY && hi.is_finite() {
         // Semi-infinite (−∞, hi]: exp-sinh mirrored, x = hi − exp((π/2)·sinh t).
         let node = |t: f64| -> Option<(f64, f64)> {
@@ -3766,7 +3926,7 @@ where
             }
             Some((x, jac))
         };
-        de_quadrature(&f, &node, atol, rtol, max_level)
+        de_quadrature(&f, &node, [None, Some(hi)], atol, rtol, max_level)
     } else if lo == f64::NEG_INFINITY && hi == f64::INFINITY {
         // Doubly-infinite (−∞, ∞): sinh-sinh, x = sinh((π/2)·sinh t).
         let node = |t: f64| -> Option<(f64, f64)> {
@@ -3778,7 +3938,7 @@ where
             }
             Some((x, jac))
         };
-        de_quadrature(&f, &node, atol, rtol, max_level)
+        de_quadrature(&f, &node, [None, None], atol, rtol, max_level)
     } else {
         // lo == +∞ or hi == −∞ after ordering is impossible for a < b.
         return QuadResult {
@@ -3853,7 +4013,19 @@ where
                 converged: true,
             };
         }
-        let count = ((b - a) / step).floor() as i64 + 1;
+        let intervals = ((b - a) / step).floor();
+        // A saturating float-to-integer cast followed by +1 can panic, wrap
+        // into an empty loop, or schedule an effectively unbounded loop.
+        // Beyond 2^53, f64 cannot distinguish consecutive grid indices either.
+        // Refuse an unrepresentable grid before evaluating the caller's code.
+        if !intervals.is_finite()
+            || intervals >= (1_u64 << 53) as f64
+            || intervals >= usize::MAX as f64
+            || (intervals >= 1.0 && a + step == a)
+        {
+            return nan;
+        }
+        let count = intervals as usize + 1;
         let mut sum = 0.0;
         let mut nfev = 0usize;
         for k in 0..count {
@@ -8192,6 +8364,120 @@ mod tests {
     }
 
     #[test]
+    fn tanhsinh_weighted_accumulation_preserves_large_finite_integrals() {
+        // The unweighted sum overflowed during refinement although every
+        // sample and the final integral are finite. Scaling each level inside
+        // the accumulator must make the answer continuous across this range.
+        for scale in [1e300, 1e307, 5e307, -5e307] {
+            let result = tanhsinh(|x| scale * x.exp(), 0.0, 1.0, 0.0, 1e-12, 12);
+            assert!(result.converged, "scale={scale}: {result:?}");
+            assert!(result.integral.is_finite());
+            assert!(result.error.is_finite());
+            assert!(
+                (result.integral / scale - (std::f64::consts::E - 1.0)).abs() < 1e-12,
+                "scale={scale}: {result:?}"
+            );
+            assert!(result.neval < 1000);
+        }
+        // A subnormal h*jac must not discard a contribution that a large
+        // finite integrand brings back into the normal range.
+        let term = de_weighted_term(0.125, f64::from_bits(1), 1e300);
+        let expected = (f64::from_bits(1) * 1e300) * 0.125;
+        assert_eq!(term, expected);
+        assert!(term.is_normal());
+    }
+
+    #[test]
+    fn tanhsinh_endpoint_tail_limits_are_not_false_convergence() {
+        let exact = std::f64::consts::PI.sqrt();
+        for (lo, hi, direction) in [(1.0, f64::INFINITY, 1.0), (f64::NEG_INFINITY, -1.0, -1.0)] {
+            let result = tanhsinh(
+                |x| {
+                    let distance = direction * x - 1.0;
+                    (-distance).exp() / distance.sqrt()
+                },
+                lo,
+                hi,
+                0.0,
+                1e-12,
+                10,
+            );
+            let actual_error = (result.integral - exact).abs();
+            assert!(actual_error > 1e-9, "must exercise endpoint rounding");
+            assert!(!result.converged, "{result:?}");
+            assert!(
+                result.error >= actual_error,
+                "{result:?}, error={actual_error}"
+            );
+        }
+        for exponent in [-0.5, -0.75, -0.9] {
+            let result = tanhsinh(|x| (1.0 - x).powf(exponent), 0.0, 1.0, 0.0, 1e-12, 10);
+            let actual_error = (result.integral - 1.0 / (exponent + 1.0)).abs();
+            assert!(!result.converged, "exponent={exponent}: {result:?}");
+            assert!(
+                result.error >= actual_error,
+                "exponent={exponent}: {result:?}, error={actual_error}"
+            );
+        }
+    }
+
+    #[test]
+    fn tanhsinh_error_includes_roundoff_after_cancellation() {
+        let result = tanhsinh(|x| x - 0.5, 0.0, 1.0, 0.0, 1e-12, 8);
+        assert!(result.integral.abs() < 1e-15);
+        assert!(result.error > 0.0, "{result:?}");
+        assert!(
+            !result.converged,
+            "a zero-relative-only tolerance is unresolved"
+        );
+        let with_absolute_tolerance = tanhsinh(|x| x - 0.5, 0.0, 1.0, 1e-12, 1e-12, 8);
+        assert!(with_absolute_tolerance.converged);
+    }
+
+    #[test]
+    fn tanhsinh_slow_endpoint_decay_does_not_hide_a_large_omitted_tail() {
+        // The last transformed term is only about 13 or 19 here, but the
+        // omitted integral is about 69 or 963. Even atol=20 is unresolved.
+        for exponent in [-0.99, -0.999] {
+            let exact = 1.0 / (1.0 + exponent);
+            let result = tanhsinh(|x| (1.0 - x).powf(exponent), 0.0, 1.0, 20.0, 1e-12, 10);
+            let actual_error = (result.integral - exact).abs();
+            assert!(actual_error > 20.0, "exercise unresolved mass: {result:?}");
+            assert!(!result.converged, "exponent={exponent}: {result:?}");
+            assert!(
+                result.error >= actual_error,
+                "{result:?}, error={actual_error}"
+            );
+        }
+    }
+
+    #[test]
+    fn tanhsinh_logarithmic_endpoint_tails_do_not_claim_convergence() {
+        // Substitution u=1-ln(x) gives an exact integral 1/(q-1). These
+        // logarithmic tails decay slowly even in transformed coordinates;
+        // a local endpoint power alone misses most of their unresolved mass.
+        for q in [1.1, 1.01] {
+            let exact = 1.0 / (q - 1.0);
+            let result = tanhsinh(
+                |x| 1.0 / (x * (1.0 - x.ln()).powf(q)),
+                0.0,
+                1.0,
+                1.0,
+                1e-12,
+                10,
+            );
+            let actual_error = (result.integral - exact).abs();
+            assert!(result.integral.is_finite() && result.error.is_finite());
+            assert!(actual_error > 1.0, "exercise unresolved mass: {result:?}");
+            assert!(!result.converged, "q={q}: {result:?}");
+            assert!(
+                result.error >= actual_error,
+                "q={q}: {result:?}, error={actual_error}"
+            );
+        }
+    }
+
+    #[test]
     fn tanhsinh_unresolved_endpoint_tails_do_not_claim_convergence() {
         // Both integrals are exactly 2, but their singular endpoint distances
         // cannot be represented below roughly one ulp. Refinement alone used
@@ -8355,6 +8641,38 @@ mod tests {
         assert!(!finite.converged);
         assert_eq!(finite.nfev, 1);
         assert_eq!(finite.error, f64::INFINITY);
+    }
+
+    #[test]
+    fn nsum_rejects_unrepresentable_finite_grids_before_evaluation() {
+        for (a, b, step) in [
+            (-f64::MAX, f64::MAX, 1.0),
+            (0.0, 1.0, f64::from_bits(1)),
+            (0.0, (1_u64 << 53) as f64, 1.0),
+            (1e100, 1e100_f64.next_up(), 1.0),
+            (1.0, 1.0_f64.next_up(), f64::EPSILON / 4.0),
+        ] {
+            let result = nsum(
+                |_| panic!("invalid grid must be rejected before evaluation"),
+                a,
+                b,
+                step,
+                0.0,
+                1e-11,
+            );
+            assert!(!result.converged, "{a}..{b} step={step}: {result:?}");
+            assert!(result.sum.is_nan());
+            assert_eq!(result.error, f64::INFINITY);
+            assert_eq!(result.nfev, 0);
+        }
+        let single = nsum(|_| 7.0, f64::MAX, f64::MAX, 1.0, 0.0, 1e-11);
+        assert!(single.converged);
+        assert_eq!(single.sum, 7.0);
+        assert_eq!(single.nfev, 1);
+        let finite = nsum(|x| x * x, -2.0, 2.0, 0.5, 0.0, 1e-11);
+        assert!(finite.converged);
+        assert_eq!(finite.sum, 15.0);
+        assert_eq!(finite.nfev, 9);
     }
 
     #[test]
