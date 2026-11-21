@@ -85,7 +85,124 @@ impl Loss {
             .iter()
             .map(|fi| self.raw((fi / self.f_scale).powi(2)).0)
             .sum();
-        0.5 * (self.f_scale * self.f_scale) * raw
+        self.checked_cost(f, 0.5 * (self.f_scale * self.f_scale) * raw)
+    }
+
+    /// Preserve the ordinary-range arithmetic, including the different sum order
+    /// used on the first iteration. Only replace it when an intermediate loses
+    /// the residual's scale or soft_l1's subtraction rounds a nonzero loss to zero.
+    fn checked_cost(&self, f: &[f64], ordinary: f64) -> f64 {
+        let fs2 = self.f_scale * self.f_scale;
+        let use_ordinary = ordinary.is_finite()
+            && fs2.is_normal()
+            && f.iter().all(|&value| {
+                let z = (value / self.f_scale).powi(2);
+                z.is_finite()
+                    && (value == 0.0
+                        || (z.is_normal()
+                            && (self.kind != LossKind::SoftL1 || self.raw(z).0 != 0.0)))
+            });
+        if use_ordinary {
+            ordinary
+        } else {
+            f.iter().map(|&value| self.stable_cost(value)).sum()
+        }
+    }
+
+    /// Half the scaled loss of one residual. Ratios are at most one, and the
+    /// half is applied before multiplication so a representable cost does not
+    /// require a representable residual square or f_scale square.
+    fn stable_cost(&self, value: f64) -> f64 {
+        let magnitude = value.abs();
+        let scale = self.f_scale;
+        if magnitude <= scale {
+            let ratio = magnitude / scale;
+            let z = ratio * ratio;
+            let factor = match self.kind {
+                LossKind::Linear | LossKind::Huber => 0.5,
+                LossKind::SoftL1 => 1.0 / (1.0 + (1.0 + z).sqrt()),
+                LossKind::Cauchy if z != 0.0 => 0.5 * (z.ln_1p() / z),
+                LossKind::Arctan if z != 0.0 => 0.5 * (z.atan() / z),
+                LossKind::Cauchy | LossKind::Arctan => 0.5,
+            };
+            return (factor * magnitude) * magnitude;
+        }
+        let ratio = scale / magnitude;
+        let z = ratio * ratio;
+        match self.kind {
+            LossKind::Linear => (0.5 * magnitude) * magnitude,
+            LossKind::Huber => scale * (magnitude - 0.5 * scale),
+            LossKind::SoftL1 => (magnitude * ((1.0 + z).sqrt() - ratio)) * scale,
+            LossKind::Cauchy => {
+                let log_ratio = if ratio.is_normal() {
+                    -ratio.ln()
+                } else {
+                    // A subnormal quotient loses significant digits before the
+                    // logarithm even when it has not rounded all the way to zero.
+                    magnitude.ln() - scale.ln()
+                };
+                scale * (scale * (log_ratio + 0.5 * z.ln_1p()))
+            }
+            LossKind::Arctan => scale * (scale * (0.5 * (std::f64::consts::FRAC_PI_2 - z.atan()))),
+        }
+    }
+
+    /// Effective residual and Jacobian row factor. Computing the loss score
+    /// directly avoids losing rho' to underflow before multiplication by f;
+    /// dimensionless curvature avoids rho'' / f_scale² and its 0*infinity cases.
+    fn linearized(&self, value: f64, first: f64, second: f64) -> (f64, f64) {
+        let mut curvature = first + 2.0 * second * value * value;
+        if curvature < EPS {
+            curvature = EPS;
+        }
+        let row_scale = curvature.sqrt();
+        let residual = value * (first / row_scale);
+        let exact_zero_second = self.kind == LossKind::Linear
+            || (self.kind == LossKind::Huber && value.abs() <= self.f_scale)
+            || (self.kind == LossKind::Arctan && value == 0.0);
+        if (self.f_scale * self.f_scale).is_normal()
+            && first.is_normal()
+            && (second.is_normal() || (second == 0.0 && exact_zero_second))
+            && row_scale.is_finite()
+            && residual.is_finite()
+        {
+            return (row_scale, residual);
+        }
+
+        let magnitude = value.abs();
+        let scale = self.f_scale;
+        let (score, curvature) = if magnitude <= scale {
+            let ratio = magnitude / scale;
+            let z = ratio * ratio;
+            match self.kind {
+                LossKind::Linear | LossKind::Huber => (value, 1.0),
+                LossKind::SoftL1 => {
+                    let root = (1.0 + z).sqrt();
+                    (value / root, 1.0 / (root * root * root))
+                }
+                LossKind::Cauchy => (value / (1.0 + z), (1.0 - z) / (1.0 + z).powi(2)),
+                LossKind::Arctan => {
+                    let zz = z * z;
+                    (value / (1.0 + zz), (1.0 - 3.0 * zz) / (1.0 + zz).powi(2))
+                }
+            }
+        } else {
+            let ratio = scale / magnitude;
+            let z = ratio * ratio;
+            let (score, curvature) = match self.kind {
+                LossKind::Linear => (magnitude, 1.0),
+                LossKind::Huber => (scale, 0.0),
+                LossKind::SoftL1 => {
+                    let root = (1.0 + z).sqrt();
+                    (scale / root, (ratio / root).powi(3))
+                }
+                LossKind::Cauchy => (scale * (ratio / (1.0 + z)), 0.0),
+                LossKind::Arctan => (((scale * ratio) * ratio) * ratio / (1.0 + z * z), 0.0),
+            };
+            (score.copysign(value), curvature)
+        };
+        let row_scale = curvature.max(EPS).sqrt();
+        (row_scale, score / row_scale)
     }
 }
 
@@ -121,6 +238,20 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
 
 fn norm(a: &[f64]) -> f64 {
     dot(a, a).sqrt()
+}
+
+/// Half the sum of residual squares. Preserve the ordinary sum order, but do
+/// not reject a finite objective merely because the unhalved sum overflows.
+fn linear_cost(residuals: &[f64]) -> f64 {
+    let ordinary = 0.5 * dot(residuals, residuals);
+    if ordinary.is_finite() {
+        ordinary
+    } else {
+        let norm = residuals
+            .iter()
+            .fold(0.0_f64, |norm, &value| norm.hypot(value));
+        (0.5 * norm) * norm
+    }
 }
 
 /// numpy's `norm(a, ord=inf)`: one NaN entry makes it NaN. `f64::max` would drop the NaN, and
@@ -180,15 +311,16 @@ fn compute_jac_scale(
 }
 
 /// `scale_for_robust_loss_function`: rows of J and entries of f scaled in place.
-fn scale_for_robust_loss(j: &mut LeastSquaresMatrix, f: &mut [f64], rho: &[Vec<f64>; 3]) {
+fn scale_for_robust_loss(
+    j: &mut LeastSquaresMatrix,
+    f: &mut [f64],
+    rho: &[Vec<f64>; 3],
+    loss: &Loss,
+) {
     let mut row_scale = Vec::with_capacity(f.len());
     for (i, fi) in f.iter_mut().enumerate() {
-        let mut js = rho[1][i] + 2.0 * rho[2][i] * *fi * *fi;
-        if js < EPS {
-            js = EPS;
-        }
-        let js = js.sqrt();
-        *fi *= rho[1][i] / js;
+        let (js, residual) = loss.linearized(*fi, rho[1][i], rho[2][i]);
+        *fi = residual;
         row_scale.push(js);
     }
     j.scale_rows(&row_scale);
@@ -519,12 +651,7 @@ pub(crate) fn in_bounds(x: &[f64], lb: &[f64], ub: &[f64]) -> bool {
 }
 
 /// `step_size_to_bound`: `(min_step, hits)` with hits ∈ {−1, 0, 1} per coordinate.
-pub(crate) fn step_size_to_bound(
-    x: &[f64],
-    s: &[f64],
-    lb: &[f64],
-    ub: &[f64],
-) -> (f64, Vec<i8>) {
+pub(crate) fn step_size_to_bound(x: &[f64], s: &[f64], lb: &[f64], ub: &[f64]) -> (f64, Vec<i8>) {
     let steps: Vec<f64> = x
         .iter()
         .zip(s)
@@ -808,12 +935,18 @@ where
     let mut cost = match loss {
         Some(l) => {
             let rho = l.rho(&f);
-            let c = 0.5 * rho[0].iter().sum::<f64>();
-            scale_for_robust_loss(&mut j, &mut f, &rho);
+            let c = l.checked_cost(&f, 0.5 * rho[0].iter().sum::<f64>());
+            scale_for_robust_loss(&mut j, &mut f, &rho, l);
             c
         }
-        None => 0.5 * dot(&f, &f),
+        None => linear_cost(&f),
     };
+    if !cost.is_finite() {
+        return Err(fsci_sparse::SparseError::NonFiniteInput {
+            message: String::from("least-squares objective is not finite at the initial point"),
+        }
+        .into());
+    }
     let mut g = compute_grad(&j, &f)?;
     // A zero-row Jacobian still has n parameter columns. Keep the vector shapes
     // explicit so an empty residual system also works under bounds and Jac scaling.
@@ -966,8 +1099,12 @@ where
             }
             cost_new = match loss {
                 Some(l) => l.cost(&f_new),
-                None => 0.5 * dot(&f_new, &f_new),
+                None => linear_cost(&f_new),
             };
+            if !cost_new.is_finite() {
+                delta = 0.25 * step_h_norm;
+                continue;
+            }
             actual_reduction = cost - cost_new;
             let (delta_new, ratio) = update_tr_radius(
                 delta,
@@ -1002,7 +1139,7 @@ where
             njev += 1;
             if let Some(l) = loss {
                 let rho = l.rho(&f);
-                scale_for_robust_loss(&mut j, &mut f, &rho);
+                scale_for_robust_loss(&mut j, &mut f, &rho, l);
             }
             g = compute_grad(&j, &f)?;
             if jac_scale {
@@ -1134,12 +1271,18 @@ where
     let mut cost = match loss {
         Some(l) => {
             let rho = l.rho(&f);
-            let cost = 0.5 * rho[0].iter().sum::<f64>();
-            scale_for_robust_loss(&mut j, &mut f, &rho);
+            let cost = l.checked_cost(&f, 0.5 * rho[0].iter().sum::<f64>());
+            scale_for_robust_loss(&mut j, &mut f, &rho, l);
             cost
         }
-        None => 0.5 * dot(&f, &f),
+        None => linear_cost(&f),
     };
+    if !cost.is_finite() {
+        return Err(fsci_sparse::SparseError::NonFiniteInput {
+            message: String::from("least-squares objective is not finite at the initial point"),
+        }
+        .into());
+    }
     let mut g = compute_grad(&j, &f)?;
     g.resize(n, 0.0);
     let jac_scale = matches!(x_scale, XScale::Jac);
@@ -1253,8 +1396,12 @@ where
             }
             cost_new = match loss {
                 Some(l) => l.cost(&f_new),
-                None => 0.5 * dot(&f_new, &f_new),
+                None => linear_cost(&f_new),
             };
+            if !cost_new.is_finite() {
+                delta = 0.25 * step_h_norm;
+                continue;
+            }
             actual_reduction = cost - cost_new;
             let (new_delta, ratio) = update_tr_radius(
                 delta,
@@ -1296,7 +1443,7 @@ where
             j = jac(&x, &f)?;
             njev += 1;
             if let Some(l) = loss {
-                scale_for_robust_loss(&mut j, &mut f, &l.rho(&f_true));
+                scale_for_robust_loss(&mut j, &mut f, &l.rho(&f_true), l);
             }
             g = compute_grad(&j, &f)?;
             if jac_scale {
@@ -1338,9 +1485,220 @@ where
 #[cfg(test)]
 mod tests {
     use super::{Loss, LossKind, XScale, dogbox, svd_thin, trf};
-    use crate::{LeastSquaresMatrix, OptError, TrustRegionLsmrOptions, TrustRegionSolver};
+    use crate::{
+        LeastSquaresJacobian, LeastSquaresMatrix, LeastSquaresMethod, LeastSquaresOptions,
+        OptError, TrustRegionLsmrOptions, TrustRegionSolver, least_squares,
+    };
     use fsci_runtime::RuntimeMode;
-    use fsci_sparse::{CsrMatrix, Shape2D};
+    use fsci_sparse::{CsrMatrix, DenseLinearOperator, Shape2D};
+
+    #[test]
+    fn robust_loss_preserves_cost_and_score_across_extreme_scales() {
+        let mut cases = Vec::new();
+        for kind in [
+            LossKind::SoftL1,
+            LossKind::Huber,
+            LossKind::Cauchy,
+            LossKind::Arctan,
+        ] {
+            // Every loss is quadratic here, but f_scale² overflows. The
+            // original code produced 0*infinity and NaN even for f = 1.
+            cases.push((kind, 1e200, 1.0, 0.5, 1.0));
+            // At zero the derivative is one, even when f_scale² underflows.
+            cases.push((kind, 1e-200, 0.0, 0.0, 0.0));
+            // A nonzero but subnormal (f/f_scale)² has already lost digits;
+            // multiplying it by a large f_scale² must not magnify that error.
+            cases.push((kind, 1e100, 2e-62, 2e-124, 2e-62));
+        }
+        cases.extend([
+            (LossKind::SoftL1, 1e-200, 1e200, 1.0, 1e-200),
+            (LossKind::Huber, 1e-200, 1e200, 1.0, 1e-200),
+            // The scaled second derivative can underflow to zero even with
+            // normal f_scale² and a finite cost. It must still cancel rho'.
+            (LossKind::SoftL1, 1e150, 1e158, 9.999_999_9e307, 1e150),
+            (LossKind::Huber, 1e150, 1e158, 9.999_999_95e307, 1e150),
+            (
+                LossKind::Cauchy,
+                1e100,
+                1e300,
+                1e200 * (200.0 * std::f64::consts::LN_10),
+                1e-100,
+            ),
+            (
+                LossKind::Arctan,
+                1e100,
+                1e200,
+                1e200 * std::f64::consts::FRAC_PI_4,
+                1e-200,
+            ),
+            (
+                LossKind::Cauchy,
+                0.9e-150,
+                0.7e170,
+                5.966_264_914_171_492e-298,
+                0.0,
+            ),
+        ]);
+        for (kind, scale, magnitude, expected_cost, expected_score) in cases {
+            for sign in [-1.0, 1.0] {
+                let value = sign * magnitude;
+                let loss = Loss {
+                    kind,
+                    f_scale: scale,
+                };
+                let rho = loss.rho(&[value]);
+                let initial = loss.checked_cost(&[value], 0.5 * rho[0][0]);
+                let trial = loss.cost(&[value]);
+                for cost in [initial, trial] {
+                    assert!(cost.is_finite(), "{kind:?}, scale={scale}, f={value}");
+                    assert!(
+                        (cost - expected_cost).abs() <= 2e-14 * expected_cost,
+                        "{kind:?}, scale={scale}, f={value}: {cost} vs {expected_cost}"
+                    );
+                }
+                let (row, residual) = loss.linearized(value, rho[1][0], rho[2][0]);
+                assert!(row.is_finite() && residual.is_finite());
+                let score = row * residual;
+                assert!(
+                    (score - sign * expected_score).abs() <= 2e-14 * expected_score,
+                    "{kind:?}, scale={scale}, f={value}: score={score} vs {expected_score}"
+                );
+                if magnitude <= scale {
+                    assert_eq!(row, 1.0);
+                } else {
+                    assert_eq!(row, f64::EPSILON.sqrt());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn robust_loss_preserves_ordinary_scipy_arithmetic() {
+        let residuals = [0.0, -0.3, 1.4, 12.3];
+        for kind in [
+            LossKind::SoftL1,
+            LossKind::Huber,
+            LossKind::Cauchy,
+            LossKind::Arctan,
+        ] {
+            let loss = Loss { kind, f_scale: 0.7 };
+            let rho = loss.rho(&residuals);
+            let initial = 0.5 * rho[0].iter().sum::<f64>();
+            assert_eq!(
+                loss.checked_cost(&residuals, initial).to_bits(),
+                initial.to_bits()
+            );
+            let raw_sum: f64 = residuals
+                .iter()
+                .map(|f| loss.raw((f / loss.f_scale).powi(2)).0)
+                .sum();
+            let trial = 0.5 * (loss.f_scale * loss.f_scale) * raw_sum;
+            assert_eq!(loss.cost(&residuals).to_bits(), trial.to_bits());
+            for (i, &f) in residuals.iter().enumerate() {
+                let row = (rho[1][i] + 2.0 * rho[2][i] * f * f)
+                    .max(f64::EPSILON)
+                    .sqrt();
+                let residual = f * (rho[1][i] / row);
+                let (actual_row, actual_residual) = loss.linearized(f, rho[1][i], rho[2][i]);
+                assert_eq!(actual_row.to_bits(), row.to_bits());
+                assert_eq!(actual_residual.to_bits(), residual.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn robust_fits_resolve_small_residuals_and_large_loss_scales() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            for storage in ["dense", "sparse", "operator"] {
+                for (loss, scale, target) in [
+                    (LossKind::SoftL1, 1.0, 1e-9),
+                    (LossKind::SoftL1, 1e200, 1.0),
+                    (LossKind::Huber, 1e200, 1.0),
+                    (LossKind::Cauchy, 1e200, 1.0),
+                    (LossKind::Arctan, 1e200, 1.0),
+                ] {
+                    let jac = match storage {
+                        "sparse" => LeastSquaresJacobian::new_sparse(|_| {
+                            CsrMatrix::from_components(
+                                Shape2D::new(1, 1),
+                                vec![1.0],
+                                vec![0],
+                                vec![0, 1],
+                                true,
+                            )
+                            .unwrap()
+                        }),
+                        "operator" => LeastSquaresJacobian::new_operator(|_| {
+                            DenseLinearOperator::from_rows(&[vec![1.0]]).unwrap()
+                        }),
+                        _ => LeastSquaresJacobian::new(|_| vec![vec![1.0]]),
+                    };
+                    let result = least_squares(
+                        |x| vec![x[0] - target],
+                        &[0.0],
+                        LeastSquaresOptions {
+                            method: Some(method),
+                            jac: Some(jac),
+                            loss,
+                            f_scale: scale,
+                            gtol: 1e-14,
+                            ftol: 1e-14,
+                            xtol: 1e-14,
+                            ..LeastSquaresOptions::default()
+                        },
+                    )
+                    .unwrap();
+                    assert!(result.success, "{method:?}/{storage}/{loss:?}: {result:?}");
+                    assert!(
+                        (result.x[0] - target).abs() < 1e-14 * target,
+                        "{method:?}/{storage}/{loss:?}: {result:?}"
+                    );
+                    assert!(result.cost.is_finite() && result.cost < 1e-40);
+                    assert!(result.optimality < 1e-14);
+                    assert!(result.jac.all_finite());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn least_squares_rejects_unrepresentable_objective_before_success() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            let representable = least_squares(
+                |_| vec![1e154, 1e154],
+                &[0.0],
+                LeastSquaresOptions {
+                    method: Some(method),
+                    jac: Some(LeastSquaresJacobian::new(|_| vec![vec![0.0], vec![0.0]])),
+                    ..LeastSquaresOptions::default()
+                },
+            )
+            .expect("half the squared norm can be finite when the sum of squares overflows");
+            assert!(representable.success);
+            assert!((representable.cost / 1e308 - 1.0).abs() < 1e-14);
+            for loss in [
+                LossKind::Linear,
+                LossKind::SoftL1,
+                LossKind::Huber,
+                LossKind::Cauchy,
+                LossKind::Arctan,
+            ] {
+                let error = least_squares(
+                    |_| vec![1e308],
+                    &[0.0],
+                    LeastSquaresOptions {
+                        method: Some(method),
+                        jac: Some(LeastSquaresJacobian::new(|_| vec![vec![0.0]])),
+                        loss,
+                        f_scale: 1e308,
+                        ..LeastSquaresOptions::default()
+                    },
+                )
+                .expect_err("a zero gradient cannot certify an infinite objective");
+                assert!(matches!(error, OptError::NonFiniteInput { .. }));
+            }
+        }
+    }
 
     #[test]
     fn sparse_lsmr_preserves_bounds_robust_loss_and_parameter_scaling() {
