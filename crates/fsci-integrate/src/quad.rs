@@ -3490,55 +3490,94 @@ where
 /// node has run off the (possibly infinite) interval and should be skipped.
 /// Integral ≈ `h · Σ_j jac_j · f(x_j)`. Abscissae are reused across levels
 /// (halving the step only adds odd indices), and a quadratic `d1²/d2` error
-/// model stops refinement at the convergence plateau.
+/// model is bounded below by roundoff and the unresolved endpoint tails.
 fn de_quadrature<F, N>(f: &F, node: &N, atol: f64, rtol: f64, max_level: usize) -> QuadResult
 where
     F: Fn(f64) -> f64,
     N: Fn(f64) -> Option<(f64, f64)>,
 {
+    struct Accumulator {
+        sum: f64,
+        correction: f64,
+        absolute_sum: f64,
+        extreme_t: [f64; 2],
+        extreme_term: [f64; 2],
+        neval: usize,
+    }
+
     // Beyond |t| ≈ 7 the double-exponential weight has either underflowed to
     // zero or driven the abscissa off the interval, so summation can stop.
     let t_cap = 7.0;
-    let mut neval = 0usize;
-    let eval = |t: f64, sum: &mut f64, neval: &mut usize| {
+    let eval = |t: f64, acc: &mut Accumulator| {
         // Geometry may omit rounded endpoint nodes, but a non-finite value at
         // an interior node invalidates the integral. Do not turn it into zero.
-        if !sum.is_finite() {
+        if !acc.sum.is_finite() || !acc.correction.is_finite() {
             return;
         }
         if let Some((x, jac)) = node(t)
             && jac != 0.0
         {
             if !x.is_finite() || !jac.is_finite() {
-                *sum = f64::NAN;
+                acc.sum = f64::NAN;
                 return;
             }
             let fx = f(x);
-            *neval += 1;
-            *sum += jac * fx;
+            acc.neval += 1;
+            let term = jac * fx;
+            if !term.is_finite() {
+                acc.sum = f64::NAN;
+                return;
+            }
+
+            // Neumaier compensation also preserves small contributions when
+            // a later term is larger than the running sum or changes its sign.
+            let next = acc.sum + term;
+            acc.correction += if acc.sum.abs() >= term.abs() {
+                (acc.sum - next) + term
+            } else {
+                (term - next) + acc.sum
+            };
+            acc.sum = next;
+            acc.absolute_sum += term.abs();
+
+            // Keep the outermost *evaluated* term in each transformed tail,
+            // across all refinement levels. A rounded endpoint can hide a
+            // singular tail even when successive integral estimates agree.
+            let side = usize::from(t >= 0.0);
+            if t.abs() > acc.extreme_t[side] {
+                acc.extreme_t[side] = t.abs();
+                acc.extreme_term[side] = term.abs();
+            }
         }
     };
 
     // Level 0: every integer index at the coarse step h0 = 1.
     let mut h = 1.0_f64;
-    let mut bare = 0.0_f64;
-    eval(0.0, &mut bare, &mut neval);
+    let mut acc = Accumulator {
+        sum: 0.0,
+        correction: 0.0,
+        absolute_sum: 0.0,
+        extreme_t: [-1.0; 2],
+        extreme_term: [0.0; 2],
+        neval: 0,
+    };
+    eval(0.0, &mut acc);
     let mut j = 1;
     while (j as f64) * h <= t_cap {
         let t = j as f64 * h;
-        eval(t, &mut bare, &mut neval);
-        eval(-t, &mut bare, &mut neval);
+        eval(t, &mut acc);
+        eval(-t, &mut acc);
         j += 1;
     }
-    if !bare.is_finite() || neval == 0 {
+    let mut prev = h * (acc.sum + acc.correction);
+    if !prev.is_finite() || acc.neval == 0 {
         return QuadResult {
             integral: f64::NAN,
             error: f64::INFINITY,
-            neval,
+            neval: acc.neval,
             converged: false,
         };
     }
-    let mut prev = h * bare;
     let mut prev_delta = f64::INFINITY;
     let mut last_err = f64::INFINITY;
 
@@ -3547,19 +3586,19 @@ where
         let mut j = 1;
         while (j as f64) * h <= t_cap {
             let t = j as f64 * h;
-            eval(t, &mut bare, &mut neval);
-            eval(-t, &mut bare, &mut neval);
+            eval(t, &mut acc);
+            eval(-t, &mut acc);
             j += 2;
         }
-        if !bare.is_finite() {
+        let cur = h * (acc.sum + acc.correction);
+        if !cur.is_finite() {
             return QuadResult {
                 integral: f64::NAN,
                 error: f64::INFINITY,
-                neval,
+                neval: acc.neval,
                 converged: false,
             };
         }
-        let cur = h * bare;
         let delta = (cur - prev).abs();
         last_err = if prev_delta > 0.0 && prev_delta.is_finite() {
             // Form the ratio before multiplying: delta squared can underflow
@@ -3568,12 +3607,21 @@ where
         } else {
             delta
         };
+        // Do not multiply the endpoint floor by h: refining the same truncated
+        // interval does not resolve the missing tail. Like the refinement
+        // estimate, this is a practical error estimate, not a rigorous bound
+        // for an arbitrary callable. The L1 floor also detects cancellation.
+        let roundoff = f64::EPSILON * (h * acc.absolute_sum);
+        last_err = last_err
+            .max(roundoff)
+            .max(acc.extreme_term[0])
+            .max(acc.extreme_term[1]);
         if level >= 2 && last_err.is_finite() && last_err <= atol + rtol * cur.abs() {
             return QuadResult {
                 integral: cur,
                 error: last_err,
-                neval,
-                // status: level >= 2 and d1²/d2 error estimate <= atol + rtol·|I|
+                neval: acc.neval,
+                // status: refinement, endpoint-tail and roundoff estimates all meet tolerance
                 converged: true,
             };
         }
@@ -3584,7 +3632,7 @@ where
     QuadResult {
         integral: prev,
         error: last_err,
-        neval,
+        neval: acc.neval,
         converged: false,
     }
 }
@@ -3604,11 +3652,14 @@ where
 ///
 /// `atol`/`rtol` are the absolute/relative tolerances (non-positive values fall
 /// back to `0.0` and `1e-12`); `max_level` caps the refinement levels (`0` →
-/// 16). Returns the estimate, a `d1²/d2` error estimate, the
+/// 16). Returns the estimate, a `d1²/d2` error estimate bounded below by
+/// endpoint-tail and roundoff estimates, the
 /// function-evaluation count, and whether the tolerance was met.
 /// Non-finite interior values or accumulated quadrature sums return an
 /// unconverged result with a non-finite integral and infinite error. Rounded
 /// endpoint nodes are omitted so integrable endpoint singularities remain supported.
+/// If representable nodes cannot resolve an endpoint tail to the requested
+/// tolerance, the finite estimate is returned with `converged = false`.
 pub fn tanhsinh<F>(f: F, a: f64, b: f64, atol: f64, rtol: f64, max_level: usize) -> QuadResult
 where
     F: Fn(f64) -> f64,
@@ -8125,14 +8176,7 @@ mod tests {
             assert!((result.integral - exact).abs() <= 1e-12);
             assert!(result.neval > 0 && result.neval < 1000);
         }
-        let result = tanhsinh(
-            |x| 1e-308 * (x / 1e308),
-            1e308,
-            1.7e308,
-            0.0,
-            1e-12,
-            16,
-        );
+        let result = tanhsinh(|x| 1e-308 * (x / 1e308), 1e308, 1.7e308, 0.0, 1e-12, 16);
         assert!(result.converged);
         assert!((result.integral - 0.945).abs() <= 1e-12);
     }
@@ -8145,6 +8189,73 @@ mod tests {
             assert!((result.integral / scale - (std::f64::consts::E - 1.0)).abs() <= 1e-12);
             assert!(result.error.is_finite());
         }
+    }
+
+    #[test]
+    fn tanhsinh_unresolved_endpoint_tails_do_not_claim_convergence() {
+        // Both integrals are exactly 2, but their singular endpoint distances
+        // cannot be represented below roughly one ulp. Refinement alone used
+        // to certify 1e-12 despite an actual error of about 2e-8.
+        let cases: &[QuadCase] = &[
+            (|x| 1.0 / (1.0 - x).sqrt(), 0.0, 1.0, 2.0),
+            (|x| 1.0 / (x - 1.0).sqrt(), 1.0, 2.0, 2.0),
+            (|x| 1.0 / (1.0 - x).sqrt(), 1.0, 0.0, -2.0),
+        ];
+        for &(f, a, b, exact) in cases {
+            let result = tanhsinh(f, a, b, 0.0, 1e-12, 16);
+            let actual_error = (result.integral - exact).abs();
+            assert!(result.integral.is_finite() && result.error.is_finite());
+            assert!(!result.converged, "unresolved tail: {result:?}");
+            assert!(actual_error > 1e-10, "exercise the representability limit");
+            assert!(result.error >= actual_error, "{result:?}, exact={exact}");
+            assert!(result.error > 1e-12 * result.integral.abs());
+        }
+    }
+
+    #[test]
+    fn tanhsinh_resolvable_endpoint_tolerance_still_converges() {
+        let calls = std::cell::Cell::new(0usize);
+        let result = tanhsinh(
+            |x| {
+                assert!(x > 0.0 && x < 1.0, "must not evaluate an endpoint");
+                calls.set(calls.get() + 1);
+                1.0 / (1.0 - x).sqrt()
+            },
+            0.0,
+            1.0,
+            0.0,
+            1e-6,
+            16,
+        );
+        assert!(result.converged, "{result:?}");
+        assert!((result.integral - 2.0).abs() <= result.error);
+        assert!(result.error <= 1e-6 * result.integral.abs());
+        assert_eq!(result.neval, calls.get());
+        assert!(
+            result.neval < 1000,
+            "resolvable tolerances should stop early"
+        );
+    }
+
+    #[test]
+    fn tanhsinh_roundoff_does_not_masquerade_as_exact_convergence() {
+        // A relative tolerance alone cannot certify a cancellation-dominated
+        // integral whose true value is zero, even if two estimates coincide.
+        let cancelled = tanhsinh(|x| x - 0.5, 0.0, 1.0, 0.0, 1e-12, 8);
+        assert!(!cancelled.converged, "{cancelled:?}");
+        assert!(cancelled.error >= 0.24 * f64::EPSILON);
+        assert!(cancelled.integral.abs() <= cancelled.error);
+
+        let too_tight = tanhsinh(|_| 1.0, 0.0, 1.0, 0.0, 1e-20, 8);
+        assert!(!too_tight.converged, "{too_tight:?}");
+        assert!(too_tight.error >= f64::EPSILON * too_tight.integral.abs());
+
+        let absolute = tanhsinh(|x| x - 0.5, 0.0, 1.0, 1e-12, 1e-12, 8);
+        assert!(
+            absolute.converged,
+            "an absolute tolerance resolves cancellation"
+        );
+        assert!(absolute.integral.abs() <= 1e-12);
     }
 
     #[test]

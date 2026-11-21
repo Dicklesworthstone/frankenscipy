@@ -77,7 +77,7 @@ jobs:
               ;;
             quadrature)
               cargo test --locked -p fsci-integrate --lib quad::tests -- --nocapture
-              cargo test --locked -p fsci-conformance --no-default-features --test diff_integrate diff_integrate_tanhsinh_nonfinite_and_scaled_integrals -- --nocapture
+              cargo test --locked -p fsci-conformance --no-default-features --test diff_integrate diff_integrate_tanhsinh -- --nocapture
               ;;
             casp)
               cargo test --locked -p fsci-integrate --lib casp -- --nocapture

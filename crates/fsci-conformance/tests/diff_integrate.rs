@@ -748,3 +748,142 @@ print(json.dumps(dict(scipy=scipy.__version__, numpy=np.__version__, rows=rows))
     );
     ledger.finish(5);
 }
+
+#[test]
+fn diff_integrate_tanhsinh_endpoint_resolution() {
+    #[derive(Deserialize)]
+    struct Reference {
+        name: String,
+        integral: f64,
+        success: bool,
+    }
+    #[derive(Deserialize)]
+    struct Capture {
+        scipy: String,
+        numpy: String,
+        rows: Vec<Reference>,
+    }
+    let script = r#"
+import json
+import numpy as np
+import scipy
+from scipy.integrate import tanhsinh
+cases = [
+    ('right', lambda x: 1/np.sqrt(1-x), 0., 1., 1e-12),
+    ('shifted', lambda x: 1/np.sqrt(x-1), 1., 2., 1e-12),
+    ('reverse', lambda x: 1/np.sqrt(1-x), 1., 0., 1e-12),
+    ('loose', lambda x: 1/np.sqrt(1-x), 0., 1., 1e-6),
+    ('left', lambda x: 1/np.sqrt(x), 0., 1., 1e-12),
+    ('smooth', lambda x: np.exp(x), 0., 1., 1e-12),
+]
+rows = []
+with np.errstate(all='ignore'):
+    for name, f, a, b, rtol in cases:
+        result = tanhsinh(f, a, b, atol=0., rtol=rtol, maxlevel=16)
+        rows.append(dict(name=name, integral=float(result.integral),
+                         success=bool(result.success)))
+print(json.dumps(dict(scipy=scipy.__version__, numpy=np.__version__, rows=rows)))
+"#;
+    let required = std::env::var(REQUIRE_SCIPY_ENV).as_deref() == Ok("1");
+    let output = fsci_conformance::scipy_oracle_command()
+        .args(["-c", script])
+        .env("OPENBLAS_NUM_THREADS", "1")
+        .env("OMP_NUM_THREADS", "1")
+        .output();
+    let output = match output {
+        Ok(output) if output.status.success() => output,
+        other => {
+            assert!(!required, "required endpoint oracle failed: {other:?}");
+            eprintln!("SKIP endpoint oracle: {other:?}; compared cases = 0");
+            return;
+        }
+    };
+    let oracle: Capture =
+        serde_json::from_slice(&output.stdout).expect("complete endpoint capture");
+    if required {
+        assert_eq!(oracle.scipy, "1.17.1");
+        assert_eq!(oracle.numpy, "2.4.3");
+    }
+    type Case = (&'static str, fn(f64) -> f64, f64, f64, f64, f64, bool);
+    let cases: &[Case] = &[
+        (
+            "right",
+            |x| 1.0 / (1.0 - x).sqrt(),
+            0.0,
+            1.0,
+            1e-12,
+            2.0,
+            false,
+        ),
+        (
+            "shifted",
+            |x| 1.0 / (x - 1.0).sqrt(),
+            1.0,
+            2.0,
+            1e-12,
+            2.0,
+            false,
+        ),
+        (
+            "reverse",
+            |x| 1.0 / (1.0 - x).sqrt(),
+            1.0,
+            0.0,
+            1e-12,
+            -2.0,
+            false,
+        ),
+        (
+            "loose",
+            |x| 1.0 / (1.0 - x).sqrt(),
+            0.0,
+            1.0,
+            1e-6,
+            2.0,
+            true,
+        ),
+        ("left", |x| 1.0 / x.sqrt(), 0.0, 1.0, 1e-12, 2.0, true),
+        (
+            "smooth",
+            f64::exp,
+            0.0,
+            1.0,
+            1e-12,
+            std::f64::consts::E - 1.0,
+            true,
+        ),
+    ];
+    assert_eq!(oracle.rows.len(), cases.len(), "partial oracle coverage");
+    let mut ledger = CompareLedger::new(
+        "diff_integrate_tanhsinh_endpoint_resolution",
+        &["resolved", "unresolved"],
+    );
+    for (&(name, f, a, b, rtol, exact, success), reference) in cases.iter().zip(&oracle.rows) {
+        assert_eq!(reference.name, name);
+        let actual = fsci_integrate::tanhsinh(f, a, b, 0.0, rtol, 16);
+        let actual_error = (actual.integral - exact).abs();
+        // At the unresolvable endpoints the relevant parity is refusal to
+        // certify convergence. The two node grids have different truncation
+        // errors, so do not demand 1e-12 agreement from a failed integral.
+        let comparison_tol = if success { rtol * exact.abs() } else { 1e-9 };
+        let pass = actual.converged == success
+            && reference.success == success
+            && actual.integral.is_finite()
+            && actual.error.is_finite()
+            && actual_error <= actual.error
+            && (actual.integral - reference.integral).abs() <= comparison_tol
+            && (success || actual.error > rtol * actual.integral.abs());
+        eprintln!(
+            "{name}: SciPy={} success={}; Rust={actual:?}; actual_error={actual_error}",
+            reference.integral, reference.success
+        );
+        ledger.compared(if success { "resolved" } else { "unresolved" }, name, pass);
+    }
+    eprintln!(
+        "endpoint comparisons={}; scipy={} numpy={}",
+        cases.len(),
+        oracle.scipy,
+        oracle.numpy
+    );
+    ledger.finish(3);
+}
