@@ -6,6 +6,7 @@ on:
     paths:
       - "crates/fsci-opt/**"
       - "crates/fsci-integrate/**"
+      - "crates/fsci-linalg/**"
       - "crates/fsci-sparse/**"
       - "crates/fsci-stats/**"
       - "crates/fsci-conformance/src/lib.rs"
@@ -85,6 +86,10 @@ jobs:
             casp)
               cargo test --locked -p fsci-integrate --lib casp -- --nocapture
               cargo test --locked -p fsci-opt --lib casp -- --nocapture
+              cargo test --locked -p fsci-linalg --lib default_fast_solve_ -- --test-threads=1
+              cargo test --locked -p fsci-linalg --lib portfolio_solve_repairs_ -- --test-threads=1
+              cargo test --locked -p fsci-linalg --lib solve_certificate_verification_rejects_overflowed_residuals_and_magnitudes -- --test-threads=1
+              cargo test --locked -p fsci-linalg --test differential_linalg default_fast_solve_matches_live_scipy -- --nocapture
               ;;
             distribution-fit)
               cargo test --locked -p fsci-stats --lib discrete_likelihood_fits -- --nocapture

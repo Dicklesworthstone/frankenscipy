@@ -725,6 +725,9 @@ pub fn replay_decision(certificate: &SolveCertificate, snapshot: &SolverPortfoli
 /// The checkable part of a solve certificate (frankenscipy-7tb8d.6). `r = b − A·x` is computed
 /// in double-double (compensated TwoProd / TwoSum dot products, rounded once), so its own error
 /// is about `(n + 2)·u²·(|A||x| + |b|)`, far below what these quantities resolve.
+/// If a nonzero residual or its error denominator is not representable, the corresponding
+/// backward error is infinite and verification fails; this is a limitation of the diagnostic,
+/// not a claim that the exact mathematical backward error is infinite.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AccuracyCertificate {
     /// Oettli–Prager componentwise backward error `ω = max_i |r_i| / (|A||x| + |b|)_i`: the
@@ -735,7 +738,9 @@ pub struct AccuracyCertificate {
     /// A bound on `‖x − x*‖∞ / ‖x‖∞`, where `x*` is the exact solution: LAPACK xGERFS's FERR,
     /// `‖ |A⁻¹| (|r| + (n+1)·u·(|A||x| + |b|)) ‖∞ / ‖x‖∞`, which follows from
     /// `x − x* = −A⁻¹·r_exact`. `None` when it cannot be trusted: `n·u/rcond ≥ 1/2` (the
-    /// computed `A⁻¹` itself is unreliable), `‖x‖∞ = 0`, or a non-finite value.
+    /// computed `A⁻¹` itself is unreliable), `‖x‖∞ = 0`, or a non-finite value. The default
+    /// large-system fast paths certify backward errors only and leave this unavailable,
+    /// because they do not retain an inverse/factorization for a forward-error estimate.
     pub forward_error_bound: Option<f64>,
     /// How `|A⁻¹|` entered [`Self::forward_error_bound`].
     pub forward_bound_method: ForwardBoundMethod,
@@ -1326,6 +1331,71 @@ fn fast_path_solve_certificate(
     })
 }
 
+/// Check a large-system kernel's answer before accepting it. The compensated residual is
+/// shared by acceptance and the independently verifiable accuracy certificate; no second
+/// factorization is needed. An uncertifiable or inaccurate answer falls through to the
+/// ordinary portfolio, whose alternative kernels can recover from excessive pivot growth.
+fn finish_fast_path_solve(
+    a: &[Vec<f64>],
+    b: &[f64],
+    x: Vec<f64>,
+    mode: RuntimeMode,
+    rcond_estimate: f64,
+    structural_evidence: StructuralEvidence,
+    action: SolverAction,
+) -> Option<SolveResult> {
+    let (componentwise, normwise) = if x.len() == b.len() && x.iter().all(|v| v.is_finite()) {
+        let (r, magnitude) = residual_and_magnitude(a, &x, b);
+        (
+            componentwise_backward_error(&r, &magnitude),
+            normwise_backward_error(a, &x, b, &r),
+        )
+    } else {
+        (f64::INFINITY, f64::INFINITY)
+    };
+    // A bad candidate is still evidence for the persistent portfolio. In particular,
+    // recording Inaccurate must not be mistaken for permission to return the answer.
+    let backward_error = if componentwise.is_finite() {
+        normwise
+    } else {
+        f64::INFINITY
+    };
+    let mut certificate = fast_path_solve_certificate(
+        mode,
+        a.len(),
+        rcond_estimate,
+        structural_evidence,
+        action,
+        backward_error,
+    );
+    if !backward_error.is_finite() || backward_error > ATTEMPT_BACKWARD_ERROR_TOL {
+        return None;
+    }
+    certificate.accuracy = Some(AccuracyCertificate {
+        componentwise_backward_error: componentwise,
+        normwise_backward_error: normwise,
+        forward_error_bound: None,
+        forward_bound_method: ForwardBoundMethod::Unavailable,
+        solved_part: SolvedPart::Full,
+    });
+    let warning = rcond_warning(rcond_estimate);
+    emit_trace(LinalgTrace {
+        operation: "solve",
+        matrix_size: (a.len(), a.len()),
+        mode,
+        rcond: Some(rcond_estimate),
+        warning: warning.as_ref().map(|warning| format!("{warning:?}")),
+        error: None,
+    });
+    Some(SolveResult {
+        x,
+        warning,
+        backward_error: Some(backward_error),
+        certificate: Some(certificate),
+        recovered: false,
+    })
+}
+
 fn fast_path_inv_certificate(
     mode: RuntimeMode,
     n: usize,
@@ -1405,31 +1475,17 @@ pub fn solve(a: &[Vec<f64>], b: &[f64], options: SolveOptions) -> Result<SolveRe
         && (options.assume_a == Some(MatrixAssumption::PositiveDefinite)
             || detected == Some(ScipyStructure::Symmetric))
         && let Some((x, rcond_estimate)) = cholesky_solve_blocked_with_rcond(a, b)
-    {
-        let backward_error = compute_backward_error_dense(a, &x, b);
-        let certificate = fast_path_solve_certificate(
+        && let Some(result) = finish_fast_path_solve(
+            a,
+            b,
+            x,
             options.mode,
-            n,
             rcond_estimate,
             StructuralEvidence::Symmetric,
             SolverAction::SymmetricFastPath,
-            backward_error,
-        );
-        emit_trace(LinalgTrace {
-            operation: "solve",
-            matrix_size: (n, n),
-            mode: options.mode,
-            rcond: Some(rcond_estimate),
-            warning: None,
-            error: None,
-        });
-        return Ok(SolveResult {
-            x,
-            warning: None,
-            backward_error: Some(backward_error),
-            certificate: Some(certificate),
-            recovered: false,
-        });
+        )
+    {
+        return Ok(result);
     }
     // Fast path for large general square systems: our own multithreaded blocked LU
     // (trailing update on all cores). Restricted to the plain Strict / untransposed /
@@ -1457,36 +1513,21 @@ pub fn solve(a: &[Vec<f64>], b: &[f64], options: SolveOptions) -> Result<SolveRe
         && b.iter().all(|v| v.is_finite())
         && let Some((x, rcond_estimate)) =
             lu_solve_mixed_precision_with_rcond(a, b).or_else(|| lu_solve_blocked_with_rcond(a, b))
-    {
-        let backward_error = compute_backward_error_dense(a, &x, b);
-        let structural_evidence = if detected == Some(ScipyStructure::Symmetric) {
-            StructuralEvidence::Symmetric
-        } else {
-            StructuralEvidence::General
-        };
-        let certificate = fast_path_solve_certificate(
-            options.mode,
-            n,
-            rcond_estimate,
-            structural_evidence,
-            SolverAction::DirectLU,
-            backward_error,
-        );
-        emit_trace(LinalgTrace {
-            operation: "solve",
-            matrix_size: (n, n),
-            mode: options.mode,
-            rcond: Some(rcond_estimate),
-            warning: None,
-            error: None,
-        });
-        return Ok(SolveResult {
+        && let Some(result) = finish_fast_path_solve(
+            a,
+            b,
             x,
-            warning: None,
-            backward_error: Some(backward_error),
-            certificate: Some(certificate),
-            recovered: false,
-        });
+            options.mode,
+            rcond_estimate,
+            if detected == Some(ScipyStructure::Symmetric) {
+                StructuralEvidence::Symmetric
+            } else {
+                StructuralEvidence::General
+            },
+            SolverAction::DirectLU,
+        )
+    {
+        return Ok(result);
     }
     // Fast path for large symmetric / Hermitian systems (real input ⇒ Hermitian == Symmetric).
     // LU with partial pivoting is valid for any symmetric matrix; if the matrix also happens
@@ -1515,31 +1556,17 @@ pub fn solve(a: &[Vec<f64>], b: &[f64], options: SolveOptions) -> Result<SolveRe
                 lu_solve_blocked_with_rcond(a, b)
                     .map(|(x, rcond)| (x, rcond, SolverAction::DirectLU))
             })
-    {
-        let backward_error = compute_backward_error_dense(a, &x, b);
-        let certificate = fast_path_solve_certificate(
+        && let Some(result) = finish_fast_path_solve(
+            a,
+            b,
+            x,
             options.mode,
-            n,
             rcond_estimate,
             StructuralEvidence::Symmetric,
             action,
-            backward_error,
-        );
-        emit_trace(LinalgTrace {
-            operation: "solve",
-            matrix_size: (n, n),
-            mode: options.mode,
-            rcond: Some(rcond_estimate),
-            warning: None,
-            error: None,
-        });
-        return Ok(SolveResult {
-            x,
-            warning: None,
-            backward_error: Some(backward_error),
-            certificate: Some(certificate),
-            recovered: false,
-        });
+        )
+    {
+        return Ok(result);
     }
     with_default_solver_portfolio(options.mode, |portfolio| {
         solve_with_portfolio_internal(a, b, options, portfolio, "solve", true)
@@ -3136,36 +3163,55 @@ fn residual_and_magnitude(a: &[Vec<f64>], x: &[f64], b: &[f64]) -> (Vec<f64>, Ve
 }
 
 /// Oettli–Prager `ω = max_i |r_i| / (|A||x| + |b|)_i`; a zero denominator contributes 0 with a
-/// zero residual and ∞ otherwise.
+/// zero residual and ∞ otherwise. Unrepresentable diagnostics fail closed: a nonzero
+/// residual divided by an overflowing magnitude must not become a certified zero.
 fn componentwise_backward_error(r: &[f64], magnitude: &[f64]) -> f64 {
-    r.iter().zip(magnitude).fold(0.0_f64, |omega, (&ri, &mi)| {
+    let mut omega = 0.0_f64;
+    for (&ri, &mi) in r.iter().zip(magnitude) {
+        if !ri.is_finite() || mi.is_nan() || mi < 0.0 {
+            return f64::INFINITY;
+        }
         let term = if ri == 0.0 {
+            // An exactly zero compensated residual has zero backward error even
+            // if the positive magnitude sum lies above f64::MAX.
             0.0
-        } else if mi == 0.0 {
+        } else if mi == 0.0 || !mi.is_finite() {
             f64::INFINITY
         } else {
             ri.abs() / mi
         };
-        if term.is_nan() {
-            f64::NAN
-        } else {
-            omega.max(term)
-        }
-    })
+        omega = omega.max(term);
+    }
+    omega
 }
 
 /// `‖r‖∞ / (‖A‖∞‖x‖∞ + ‖b‖∞)`.
 fn normwise_backward_error(a: &[Vec<f64>], x: &[f64], b: &[f64], r: &[f64]) -> f64 {
-    let inf = |v: &[f64]| v.iter().fold(0.0_f64, |m, e| m.max(e.abs()));
-    let a_inf = a
-        .iter()
-        .map(|row| row.iter().map(|e| e.abs()).sum::<f64>())
-        .fold(0.0_f64, f64::max);
-    let residual = inf(r);
-    let denominator = a_inf * inf(x) + inf(b);
+    let inf = |v: &[f64]| {
+        v.iter()
+            .try_fold(0.0_f64, |m, e| e.is_finite().then_some(m.max(e.abs())))
+    };
+    let (Some(x_inf), Some(b_inf), Some(residual)) = (inf(x), inf(b), inf(r)) else {
+        return f64::INFINITY;
+    };
+    let mut a_inf = 0.0_f64;
+    for row in a {
+        let Some(row_sum) = row.iter().try_fold(0.0_f64, |sum, value| {
+            value.is_finite().then_some(sum + value.abs())
+        }) else {
+            return f64::INFINITY;
+        };
+        a_inf = a_inf.max(row_sum);
+    }
     if residual == 0.0 {
-        0.0
-    } else if denominator == 0.0 {
+        return 0.0;
+    }
+    let denominator = if x_inf == 0.0 {
+        b_inf
+    } else {
+        a_inf * x_inf + b_inf
+    };
+    if denominator == 0.0 || !denominator.is_finite() {
         f64::INFINITY
     } else {
         residual / denominator
@@ -3259,7 +3305,11 @@ fn forward_error_bound(
     let x_inf = x.iter().fold(0.0_f64, |m, e| m.max(e.abs()));
     // The computed A⁻¹ is itself only accurate to about n·u·κ.
     let trustworthy = rcond > 0.0 && (n as f64) * unit_roundoff / rcond < 0.5;
-    if n == 0 || x_inf == 0.0 || !x_inf.is_finite() || !trustworthy {
+    if n == 0
+        || x_inf == 0.0
+        || x.iter().chain(r).chain(magnitude).any(|v| !v.is_finite())
+        || !trustworthy
+    {
         return (None, ForwardBoundMethod::Unavailable);
     }
     let g: Vec<f64> = r
@@ -3267,6 +3317,9 @@ fn forward_error_bound(
         .zip(magnitude)
         .map(|(ri, mi)| ri.abs() + (n as f64 + 1.0) * unit_roundoff * mi)
         .collect();
+    if g.iter().any(|v| !v.is_finite()) {
+        return (None, ForwardBoundMethod::Unavailable);
+    }
     let explicit = |inv: &dyn Fn(usize, usize) -> f64| {
         (0..n)
             .map(|i| (0..n).map(|j| inv(i, j).abs() * g[j]).sum::<f64>())
@@ -3553,7 +3606,10 @@ pub fn verify_solve_certificate(
     let omega = componentwise_backward_error(&r, &magnitude);
     let eta = normwise_backward_error(&solved, x, b, &r);
     let within = |recomputed: f64, certified: f64| {
-        recomputed.is_finite() && recomputed <= certified * (1.0 + VERIFY_RELATIVE_SLACK)
+        recomputed.is_finite()
+            && certified.is_finite()
+            && certified >= 0.0
+            && recomputed <= certified * (1.0 + VERIFY_RELATIVE_SLACK)
     };
     let mut reasons = Vec::new();
     if !within(omega, accuracy.componentwise_backward_error) {
@@ -3886,8 +3942,10 @@ pub fn solve_with_action(
 /// loop walked an order fixed before the first attempt and learned nothing). An attempt that
 /// returns Ok with a backward error above [`ATTEMPT_BACKWARD_ERROR_TOL`] is a failed attempt
 /// too; it used to be accepted unexamined. If every applicable action is inaccurate, the most
-/// accurate result is still returned (SciPy returns a solution there, with a warning), and the
-/// full-validation policy downstream may still reject it.
+/// accurate finite result is still returned (SciPy returns a solution there, with a warning),
+/// and the full-validation policy downstream may still reject it. Non-finite solutions or
+/// numeric error estimates cannot enter that pool. The deliberate Strict-mode IEEE passthrough
+/// with disabled finite-input checks carries no numeric error estimate and is unchanged.
 #[allow(clippy::too_many_arguments)]
 fn run_portfolio_attempts(
     portfolio: &mut SolverPortfolio,
@@ -3925,20 +3983,47 @@ fn run_portfolio_attempts(
             cholesky_cache,
             mode == RuntimeMode::Hardened,
         ) {
-            Ok(solve_result) => {
+            Ok(mut solve_result) => {
+                let finite_solution = solve_result.x.iter().all(|v| v.is_finite());
+                if finite_solution
+                    && solve_result
+                        .backward_error
+                        .is_some_and(|error| !error.is_finite())
+                {
+                    // Older kernels square norms in their error estimate. A perfectly
+                    // finite scaled solution can overflow those squares, so consult the
+                    // compensated diagnostic before classifying the attempt as unusable.
+                    let solved = solved_matrix(effective_a, solved_part(report));
+                    let (residual, magnitude) = residual_and_magnitude(&solved, &solve_result.x, b);
+                    let componentwise = componentwise_backward_error(&residual, &magnitude);
+                    let normwise = normwise_backward_error(&solved, &solve_result.x, b, &residual);
+                    if componentwise.is_finite() && normwise.is_finite() {
+                        solve_result.backward_error = Some(normwise);
+                    }
+                }
                 let omega = solve_result.backward_error.unwrap_or(0.0);
-                if omega <= ATTEMPT_BACKWARD_ERROR_TOL {
+                if solve_result.backward_error.is_some() && (!omega.is_finite() || !finite_solution)
+                {
+                    portfolio.record_outcome(rcond, action, AttemptOutcome::Inaccurate);
+                    inaccurate_errors.push(f64::INFINITY);
+                    last_error = Some(LinalgError::ConvergenceFailure {
+                        detail: format!(
+                            "{action:?} produced a non-finite solution or backward-error estimate"
+                        ),
+                    });
+                } else if omega <= ATTEMPT_BACKWARD_ERROR_TOL {
                     portfolio.record_outcome(rcond, action, AttemptOutcome::Ok);
                     accepted = Some((action, solve_result));
                     break;
-                }
-                portfolio.record_outcome(rcond, action, AttemptOutcome::Inaccurate);
-                inaccurate_errors.push(omega);
-                let improves = least_inaccurate
-                    .as_ref()
-                    .is_none_or(|(_, best)| omega < best.backward_error.unwrap_or(f64::INFINITY));
-                if improves {
-                    least_inaccurate = Some((action, solve_result));
+                } else {
+                    portfolio.record_outcome(rcond, action, AttemptOutcome::Inaccurate);
+                    inaccurate_errors.push(omega);
+                    let improves = least_inaccurate.as_ref().is_none_or(|(_, best)| {
+                        omega < best.backward_error.unwrap_or(f64::INFINITY)
+                    });
+                    if improves {
+                        least_inaccurate = Some((action, solve_result));
+                    }
                 }
             }
             Err(err) => {
@@ -53055,6 +53140,316 @@ mod chol_syrk_nc_blocking {
     }
 
     #[test]
+    fn default_fast_solve_certificates_verify_and_reject_perturbed_answers() {
+        use super::*;
+
+        let n = SOLVE_FLAT_MIN_DIM;
+        for assumption in [
+            MatrixAssumption::General,
+            MatrixAssumption::PositiveDefinite,
+            MatrixAssumption::Symmetric,
+        ] {
+            reset_default_solver_portfolio();
+            let mut a = vec![vec![0.0; n]; n];
+            for i in 0..n {
+                a[i][i] = if assumption == MatrixAssumption::Symmetric && i % 2 == 1 {
+                    -4.0
+                } else {
+                    4.0
+                };
+                if i + 1 < n {
+                    a[i][i + 1] = 0.25;
+                    a[i + 1][i] = if assumption == MatrixAssumption::General {
+                        0.125
+                    } else {
+                        0.25
+                    };
+                }
+            }
+            // x = 1 is exact for every route, including symmetric indefinite LU.
+            let b: Vec<f64> = a.iter().map(|row| row.iter().sum()).collect();
+            let result = solve(
+                &a,
+                &b,
+                SolveOptions {
+                    assume_a: Some(assumption),
+                    ..SolveOptions::default()
+                },
+            )
+            .expect("large solve");
+            assert!(result.x.iter().all(|&x| (x - 1.0).abs() <= 1e-12));
+            let certificate = result.certificate.as_ref().expect("CASP certificate");
+            assert_eq!(
+                certificate.action,
+                if assumption == MatrixAssumption::PositiveDefinite {
+                    SolverAction::SymmetricFastPath
+                } else {
+                    SolverAction::DirectLU
+                }
+            );
+            let report = verify_solve_certificate(&a, &b, &result.x, certificate);
+            assert!(report.verified, "{assumption:?}: {}", report.reason);
+            let mut perturbed = result.x.clone();
+            perturbed[n / 2] += 1e-4;
+            assert!(
+                !verify_solve_certificate(&a, &b, &perturbed, certificate).verified,
+                "{assumption:?}: a corrupted solution must not verify"
+            );
+        }
+    }
+
+    #[test]
+    fn default_fast_solve_falls_back_from_unstable_lu() {
+        use super::*;
+        use fsci_runtime::PortfolioEvidence;
+
+        reset_default_solver_portfolio();
+        let n = SOLVE_FLAT_MIN_DIM;
+        // Wilkinson-type growth with a unique diagonal pivot: d > 1 removes
+        // ties, while the last column grows by (1 + 1/d) at each elimination.
+        // The unperturbed d=1 case happens to retain its exact unit solution
+        // in our fast kernels; this dyadic perturbation exposes their error.
+        // The exact row sums below need no numerical oracle.
+        let diagonal = 1.0 + 2_f64.powi(-10);
+        let a: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                (0..n)
+                    .map(|j| {
+                        if i == j {
+                            diagonal
+                        } else if j == n - 1 {
+                            1.0
+                        } else if i > j {
+                            -1.0
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let b: Vec<f64> = a.iter().map(|row| row.iter().sum()).collect();
+        let result = solve(
+            &a,
+            &b,
+            SolveOptions {
+                assume_a: Some(MatrixAssumption::General),
+                ..SolveOptions::default()
+            },
+        )
+        .expect("a stable portfolio fallback exists");
+        assert!(
+            result.x.iter().all(|&x| (x - 1.0).abs() < 1e-10),
+            "unstable LU result escaped: {:?}",
+            &result.x[n - 8..]
+        );
+        let certificate = result.certificate.as_ref().expect("fallback certificate");
+        assert!(certificate.fallback_active);
+        assert_ne!(certificate.action, SolverAction::DirectLU);
+        assert!(verify_solve_certificate(&a, &b, &result.x, certificate).verified);
+
+        // Prove a fast candidate was actually rejected before the successful
+        // solve. fallback_active describes a change of SolverAction, rather
+        // than merely a second kernel of the same action being attempted.
+        let snapshot = default_solver_portfolio_snapshot(RuntimeMode::Strict);
+        let evidence = snapshot.evidence();
+        assert!(
+            evidence.len() >= 2,
+            "missing rejected-fast-attempt evidence"
+        );
+        let rejected = evidence.front().expect("rejected fast candidate");
+        assert_eq!(rejected.chosen_action, SolverAction::DirectLU);
+        assert!(
+            rejected
+                .backward_error
+                .is_some_and(|error| error > ATTEMPT_BACKWARD_ERROR_TOL)
+        );
+        let accepted = evidence.back().expect("accepted portfolio answer");
+        assert_eq!(accepted.chosen_action, certificate.action);
+        assert_eq!(accepted.fallback_active, certificate.fallback_active);
+        assert!(
+            accepted
+                .backward_error
+                .is_some_and(|error| { error.is_finite() && error <= ATTEMPT_BACKWARD_ERROR_TOL })
+        );
+    }
+
+    #[test]
+    fn default_fast_solve_reports_ill_conditioning() {
+        use super::*;
+
+        reset_default_solver_portfolio();
+        let n = SOLVE_FLAT_MIN_DIM;
+        let small = 2_f64.powi(-50);
+        let mut a = vec![vec![0.0; n]; n];
+        let mut b = vec![1.0; n];
+        for (i, row) in a.iter_mut().enumerate() {
+            row[i] = if i == 0 { small } else { 1.0 };
+        }
+        b[0] = small;
+        let result = solve(
+            &a,
+            &b,
+            SolveOptions {
+                assume_a: Some(MatrixAssumption::General),
+                ..SolveOptions::default()
+            },
+        )
+        .expect("finite ill-conditioned solve");
+        assert!(result.x.iter().all(|&x| x == 1.0));
+        assert!(matches!(
+            result.warning,
+            Some(LinalgWarning::IllConditioned { reciprocal_condition })
+                if reciprocal_condition < 1e-12
+        ));
+        let certificate = result.certificate.as_ref().expect("CASP certificate");
+        assert!(verify_solve_certificate(&a, &b, &result.x, certificate).verified);
+    }
+
+    #[test]
+    fn default_fast_solve_preserves_extreme_finite_scales() {
+        use super::*;
+
+        let n = SOLVE_FLAT_MIN_DIM;
+        for scale in [1e-200, 1e200, 1e308] {
+            reset_default_solver_portfolio();
+            let mut a = vec![vec![0.0; n]; n];
+            for (i, row) in a.iter_mut().enumerate() {
+                row[i] = scale;
+            }
+            let b = vec![scale; n];
+            let result = solve(
+                &a,
+                &b,
+                SolveOptions {
+                    assume_a: Some(MatrixAssumption::General),
+                    ..SolveOptions::default()
+                },
+            )
+            .expect("a scaled identity has a finite exact solution");
+            assert!(result.x.iter().all(|&x| x == 1.0));
+            assert_eq!(result.backward_error, Some(0.0));
+            assert!(
+                verify_solve_certificate(
+                    &a,
+                    &b,
+                    &result.x,
+                    result.certificate.as_ref().expect("scale certificate")
+                )
+                .verified,
+                "scale={scale:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn portfolio_solve_repairs_overflowed_legacy_error_estimates() {
+        use super::*;
+
+        // Default structure detection uses the diagonal portfolio route at
+        // both sizes. Powers of two keep the exact solution representable
+        // even when its error denominator exceeds f64::MAX.
+        for n in [4, SOLVE_FLAT_MIN_DIM] {
+            for exponent in [-700, 700, 1023] {
+                reset_default_solver_portfolio();
+                let scale = 2_f64.powi(exponent);
+                let mut a = vec![vec![0.0; n]; n];
+                for (i, row) in a.iter_mut().enumerate() {
+                    row[i] = scale;
+                }
+                let b = vec![scale; n];
+                let result = solve(&a, &b, SolveOptions::default()).expect("scaled diagonal solve");
+                assert!(result.x.iter().all(|&x| x == 1.0));
+                assert_eq!(result.backward_error, Some(0.0));
+                assert!(
+                    verify_solve_certificate(
+                        &a,
+                        &b,
+                        &result.x,
+                        result.certificate.as_ref().expect("accuracy certificate")
+                    )
+                    .verified,
+                    "n={n}, exponent={exponent}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn default_fast_solve_does_not_return_non_finite_answers_as_success() {
+        use super::*;
+
+        reset_default_solver_portfolio();
+        let n = SOLVE_FLAT_MIN_DIM;
+        let mut a = vec![vec![0.0; n]; n];
+        for (i, row) in a.iter_mut().enumerate() {
+            row[i] = 1e-200;
+        }
+        // Every exact component is 1e400, outside f64. No portfolio member
+        // can return a finite answer, so this must be an explicit error.
+        assert!(
+            solve(
+                &a,
+                &vec![1e200; n],
+                SolveOptions {
+                    assume_a: Some(MatrixAssumption::General),
+                    ..SolveOptions::default()
+                },
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn solve_certificate_verification_rejects_overflowed_residuals_and_magnitudes() {
+        use super::*;
+
+        let identity = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let b = [1.0, 1.0];
+        // Certify the full matrix: auto-detecting the identity as diagonal
+        // would correctly ignore the off-diagonal entry in the first probe.
+        let result = solve(
+            &identity,
+            &b,
+            SolveOptions {
+                assume_a: Some(MatrixAssumption::General),
+                ..SolveOptions::default()
+            },
+        )
+        .expect("identity solve");
+        let certificate = result.certificate.as_ref().expect("identity certificate");
+        assert_eq!(
+            certificate.accuracy.as_ref().expect("accuracy").solved_part,
+            SolvedPart::Full
+        );
+        assert!(verify_solve_certificate(&identity, &b, &result.x, certificate).verified);
+
+        // The first row has true componentwise error 1/3. An overflowing
+        // |A||x| + |b| must not turn that error into zero.
+        let a = vec![vec![1e308, 1e308], vec![0.0, 1.0]];
+        assert!(
+            !verify_solve_certificate(&a, &[1e308, 1.0], &[1.0, 1.0], certificate).verified,
+            "an infinite denominator must not certify a wrong finite answer"
+        );
+
+        // A NaN residual in an early row must survive subsequent zero rows.
+        let a = vec![vec![f64::MAX, 0.0], vec![0.0, 1.0]];
+        assert!(
+            !verify_solve_certificate(&a, &[0.0, 1.0], &[2.0, 1.0], certificate).verified,
+            "a non-finite residual must never be dropped by the max reduction"
+        );
+
+        let mut forged = certificate.clone();
+        let accuracy = forged.accuracy.as_mut().expect("accuracy certificate");
+        accuracy.componentwise_backward_error = f64::INFINITY;
+        accuracy.normwise_backward_error = f64::INFINITY;
+        assert!(
+            !verify_solve_certificate(&identity, &b, &result.x, &forged).verified,
+            "non-finite claimed errors must not authorize every finite answer"
+        );
+    }
+
+    #[test]
     fn default_solve_inv_lstsq_pinv_populate_honest_certificates_and_persist_portfolio_state() {
         use super::*;
 
@@ -53310,7 +53705,8 @@ mod chol_syrk_nc_blocking {
                     );
                 }
 
-                // Interleaved A/B timing: bare kernel vs default solve (which adds O(n) pivot rcond + O(1) certificate)
+                // Interleaved A/B timing: bare kernel vs default solve, including its
+                // compensated backward-error certificate and CASP decision metadata.
                 let mut bare_ns = Vec::with_capacity(iters);
                 let mut casp_ns = Vec::with_capacity(iters);
                 for _ in 0..iters {
@@ -53331,8 +53727,9 @@ mod chol_syrk_nc_blocking {
                 let bare_p50_us = bare_ns[iters / 2] / 1e3;
                 let casp_p50_us = casp_ns[iters / 2] / 1e3;
 
-                // Also measure the isolated certificate emission + O(n) pivot scan directly so
-                // scheduling jitter on the O(n^3) thread pool cannot mask or inflate the true overhead.
+                // Measure the isolated CASP decision-metadata emission as before. This
+                // 3% budget does not include the O(n²) numerical accuracy check, whose
+                // cost is included in the complete solve timings immediately above.
                 let mut cert_only_ns = Vec::with_capacity(50);
                 for _ in 0..50 {
                     let t_c = Instant::now();

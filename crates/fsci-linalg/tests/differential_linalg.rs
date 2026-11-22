@@ -1,7 +1,8 @@
 //! Differential oracle, metamorphic relation, and adversarial tests
 //! for fsci-linalg operations (bd-3jh.13.6).
 //!
-//! Oracle values are hand-computed or derived from matrix algebra identities.
+//! Oracle values are hand-computed, derived from matrix algebra identities,
+//! or compared with a live SciPy installation when available.
 
 use fsci_linalg::{
     InvOptions, LstsqOptions, PinvOptions, SolveOptions, TriangularSolveOptions, det, inv, lstsq,
@@ -517,4 +518,124 @@ fn adv_det_non_square() {
     let a = vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]];
     let result = det(&a, RuntimeMode::Strict, true);
     assert!(result.is_err());
+}
+
+#[test]
+fn default_fast_solve_matches_live_scipy() {
+    use fsci_linalg::{
+        LinalgWarning, MatrixAssumption, reset_default_solver_portfolio, verify_solve_certificate,
+    };
+    use fsci_runtime::SolverAction;
+    use std::process::Command;
+
+    let required = std::env::var("FSCI_REQUIRE_SCIPY_ORACLE").as_deref() == Ok("1");
+    let python = std::env::var("FSCI_PYTHON").unwrap_or_else(|_| "python3".into());
+    let available = Command::new(&python)
+        .args(["-c", "import scipy.linalg; import numpy"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !available {
+        assert!(!required, "required SciPy oracle unavailable via {python}");
+        eprintln!("SKIP default_fast_solve: SciPy unavailable; compared cases = 0");
+        return;
+    }
+    let script = r#"
+import json, os
+import numpy as np
+import scipy
+from scipy.linalg import solve
+if os.environ.get('FSCI_REQUIRE_SCIPY_ORACLE') == '1':
+    assert (scipy.__version__, np.__version__) == ('1.17.1', '2.4.3')
+n = 128
+known = 1.0 + (np.arange(n) % 11) / 16.0
+rows = []
+for case, assumption in enumerate(['gen', 'pos', 'sym', 'gen']):
+    a = np.zeros((n, n))
+    for i in range(n):
+        a[i, i] = (2.0**-50 if i == 0 else 1.0) if case == 3 else (-4.0 if case == 2 and i % 2 else 4.0)
+        if case != 3 and i+1 < n:
+            a[i, i+1] = 0.25
+            a[i+1, i] = 0.125 if case == 0 else 0.25
+    x = solve(a, a @ known, assume_a=assumption)
+    assert np.isfinite(x).all()
+    rows.append({'id': case, 'x': x.tolist()})
+print(json.dumps({'scipy': scipy.__version__, 'numpy': np.__version__, 'rows': rows}, allow_nan=False))
+"#;
+    let output = Command::new(&python).args(["-c", script]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "SciPy solve failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let oracle: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let rows = oracle["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 4, "every oracle case must be present");
+    let assumptions = [
+        MatrixAssumption::General,
+        MatrixAssumption::PositiveDefinite,
+        MatrixAssumption::Symmetric,
+        MatrixAssumption::General,
+    ];
+    let n = 128;
+    let known: Vec<f64> = (0..n).map(|i| 1.0 + (i % 11) as f64 / 16.0).collect();
+    let mut compared = 0;
+    for (id, (&assumption, row)) in assumptions.iter().zip(rows).enumerate() {
+        assert_eq!(row["id"].as_u64().unwrap(), id as u64);
+        reset_default_solver_portfolio();
+        let mut a = vec![vec![0.0; n]; n];
+        for i in 0..n {
+            a[i][i] = if id == 3 {
+                if i == 0 { 2_f64.powi(-50) } else { 1.0 }
+            } else if id == 2 && i % 2 == 1 {
+                -4.0
+            } else {
+                4.0
+            };
+            if id != 3 && i + 1 < n {
+                a[i][i + 1] = 0.25;
+                a[i + 1][i] = if id == 0 { 0.125 } else { 0.25 };
+            }
+        }
+        let b = matvec(&a, &known);
+        let result = solve(
+            &a,
+            &b,
+            SolveOptions {
+                assume_a: Some(assumption),
+                ..SolveOptions::default()
+            },
+        )
+        .expect("finite fast-path solution");
+        let expected: Vec<f64> = serde_json::from_value(row["x"].clone()).unwrap();
+        assert_eq!(expected.len(), n);
+        assert_vec_close(&result.x, &expected);
+        assert_vec_close(&result.x, &known);
+        let certificate = result.certificate.as_ref().expect("CASP certificate");
+        assert_eq!(
+            certificate.action,
+            if id == 1 {
+                SolverAction::SymmetricFastPath
+            } else {
+                SolverAction::DirectLU
+            }
+        );
+        let accuracy = certificate.accuracy.as_ref().expect("accuracy certificate");
+        assert!(accuracy.componentwise_backward_error.is_finite());
+        assert!(accuracy.normwise_backward_error.is_finite());
+        let verification = verify_solve_certificate(&a, &b, &result.x, certificate);
+        assert!(verification.verified, "case {id}: {}", verification.reason);
+        if id == 3 {
+            assert!(matches!(result.warning,
+                Some(LinalgWarning::IllConditioned { reciprocal_condition })
+                    if reciprocal_condition < 1e-12));
+        } else {
+            assert!(result.warning.is_none(), "case {id}: {:?}", result.warning);
+        }
+        compared += 1;
+    }
+    assert_eq!(compared, 4);
+    eprintln!(
+        "default_fast_solve compared {compared}/4 cases; SciPy {}, NumPy {}",
+        oracle["scipy"], oracle["numpy"]
+    );
 }
