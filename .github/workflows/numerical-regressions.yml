@@ -78,6 +78,8 @@ jobs:
             quadrature)
               cargo test --locked -p fsci-integrate --lib quad::tests -- --nocapture
               cargo test --locked -p fsci-integrate --test differential_integrate de_quadrature_scipy -- --nocapture
+              cargo test --locked -p fsci-integrate --test differential_integrate sampled_simpson_scipy -- --nocapture
+              cargo test --locked -p fsci-integrate --test differential_integrate gauss_kronrod_global_error_matches_live_scipy -- --nocapture
               cargo test --locked -p fsci-conformance --no-default-features --test diff_integrate diff_integrate_tanhsinh -- --nocapture
               ;;
             casp)

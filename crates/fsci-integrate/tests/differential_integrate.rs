@@ -691,6 +691,104 @@ fn adv_max_step_neg_inf() {
     assert!(result.is_err(), "negative Inf max_step should be rejected");
 }
 
+/// Check all sampled Simpson entry points on the same geometry in different
+/// coordinate units. Extreme-scale oracle values use normalized coordinates;
+/// the analytic change of variables avoids SciPy's own squared-width overflow.
+#[test]
+fn sampled_simpson_scipy() {
+    use fsci_integrate::{cumulative_simpson, simpson, simpson_irregular};
+    use std::process::Command;
+
+    let python = std::env::var("FSCI_PYTHON")
+        .or_else(|_| std::env::var("SCIPY_PYTHON"))
+        .unwrap_or_else(|_| "python3".into());
+    let script = r#"
+import numpy as np
+import scipy
+from scipy.integrate import simpson, cumulative_simpson
+assert scipy.__version__ == '1.17.1', scipy.__version__
+assert np.__version__ == '2.4.3', np.__version__
+t = np.array([0., .25, .75, 1.5, 2., 3.])
+for kind in range(3):
+    values = (t*t, np.sin(t), np.exp(-t))[kind]
+    for n in range(3, 7):
+        for scale in [1e-200, 1e-20, 1., 1e20, 1e200]:
+            oracle_scale = scale if 1e-100 <= scale <= 1e100 else 1.
+            x, y = t[:n]*oracle_scale, values[:n]/oracle_scale
+            print(kind, n, scale, float(simpson(y, x=x)),
+                  *[float(v) for v in cumulative_simpson(y, x=x)])
+"#;
+    let output = Command::new(&python)
+        .args(["-c", script])
+        .env("OPENBLAS_NUM_THREADS", "1")
+        .env("OMP_NUM_THREADS", "1")
+        .output();
+    let required = std::env::var("FSCI_REQUIRE_SCIPY_ORACLE").as_deref() == Ok("1");
+    let output = match output {
+        Ok(output) if output.status.success() => output,
+        other => {
+            assert!(!required, "required pinned SciPy oracle failed: {other:?}");
+            eprintln!("SKIP sampled_simpson_scipy: pinned SciPy oracle unavailable: {other:?}");
+            return;
+        }
+    };
+    let agrees = |actual: f64, expected: f64| {
+        actual.is_finite()
+            && expected.is_finite()
+            && (actual - expected).abs() <= 2e-13 * (1.0 + expected.abs())
+    };
+    assert!(agrees(1.0, 1.0));
+    assert!(
+        !agrees(1.0001, 1.0),
+        "comparison must detect a wrong result"
+    );
+    assert!(!agrees(f64::NAN, 1.0));
+    let grid = [0.0_f64, 0.25, 0.75, 1.5, 2.0, 3.0];
+    let text = String::from_utf8(output.stdout).expect("oracle emits UTF-8");
+    let mut compared = 0;
+    for line in text.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        assert!(fields.len() >= 6, "invalid oracle row: {line}");
+        let kind: usize = fields[0].parse().unwrap();
+        let n: usize = fields[1].parse().unwrap();
+        let scale: f64 = fields[2].parse().unwrap();
+        assert!((3..=6).contains(&n));
+        assert_eq!(fields.len(), n + 3, "invalid cumulative shape: {line}");
+        let expected: f64 = fields[3].parse().unwrap();
+        let x: Vec<_> = grid[..n].iter().map(|t| t * scale).collect();
+        let y: Vec<_> = grid[..n]
+            .iter()
+            .map(|&t| {
+                let value = match kind {
+                    0 => t * t,
+                    1 => t.sin(),
+                    2 => (-t).exp(),
+                    _ => panic!("unknown oracle family {kind}"),
+                };
+                value / scale
+            })
+            .collect();
+        for (name, actual) in [
+            ("simpson", simpson(&y, &x).expect("valid samples").integral),
+            ("simpson_irregular", simpson_irregular(&y, &x)),
+        ] {
+            assert!(agrees(actual, expected), "{name}: {actual} != {line}");
+        }
+        let cumulative = cumulative_simpson(&y, &x).expect("increasing grid");
+        assert_eq!(cumulative.len(), n - 1);
+        for (i, value) in cumulative.iter().enumerate() {
+            let expected: f64 = fields[4 + i].parse().unwrap();
+            assert!(
+                agrees(*value, expected),
+                "cumulative[{i}]: {value} != {expected}, case={line}"
+            );
+        }
+        compared += 1;
+    }
+    assert_eq!(compared, 60, "every declared oracle case must be compared");
+    eprintln!("sampled Simpson: {compared} cases, 180 routine comparisons against SciPy 1.17.1");
+}
+
 /// Exercise the public quadrature API against a required, versioned SciPy
 /// process. The large-scale references are evaluated in normalized coordinates
 /// so the oracle's own intermediate sum does not overflow.
@@ -839,5 +937,129 @@ for name, f, a, b, step in [
     assert_eq!(
         compared, 12,
         "every case must be compared against the live oracle"
+    );
+}
+
+#[test]
+fn gauss_kronrod_global_error_matches_live_scipy() {
+    use fsci_integrate::{QuadOptions, gauss_kronrod_quad};
+    use std::process::Command;
+
+    let required = std::env::var("FSCI_REQUIRE_SCIPY_ORACLE").as_deref() == Ok("1");
+    let python = std::env::var("FSCI_PYTHON").unwrap_or_else(|_| "python3".into());
+    let available = Command::new(&python)
+        .args(["-c", "import scipy.integrate; import numpy"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !available {
+        assert!(!required, "required SciPy oracle unavailable via {python}");
+        eprintln!("SKIP gauss_kronrod: SciPy unavailable; compared cases = 0");
+        return;
+    }
+
+    let script = r#"
+import json, math, os, warnings
+import numpy as np
+import scipy
+from scipy.integrate import quad
+if os.environ.get('FSCI_REQUIRE_SCIPY_ORACLE') == '1':
+    assert (scipy.__version__, np.__version__) == ('1.17.1', '2.4.3')
+cusp = lambda x: abs(x-1/3)**.5 + abs(x-2/3)**.5
+cases = [
+    (math.exp, -2., 3., 1e-10, 1e-10, 128),
+    (cusp, 0., 1., 1e-8, 0., 128),
+    (lambda x: 1/math.sqrt(x), 0., 1., 1e-8, 0., 256),
+    (lambda x: math.sin(100*x), 0., 1., 1e-10, 0., 128),
+    (lambda x: math.exp(-x*x), -3., 2., 1e-11, 1e-11, 128),
+    (cusp, 1., 0., 1e-8, 0., 128),
+    (lambda x: x**12, 0., 1., 1e-12, 1e-12, 64),
+    (lambda x: 1e-200*math.exp(x), 0., 1., 0., 1e-11, 64),
+    (math.sin, 0., math.tau, 0., 1e-10, 64),
+    (lambda x: math.sin(10000*x), 0., 1., 1e-12, 0., 6),
+]
+rows = []
+with warnings.catch_warnings():
+    warnings.simplefilter('ignore')
+    for index, (fun,a,b,atol,rtol,limit) in enumerate(cases):
+        result = quad(fun,a,b,epsabs=atol,epsrel=rtol,limit=limit,full_output=True)
+        rows.append({'id':index, 'integral':result[0], 'error':result[1],
+                     'success':len(result)==3})
+print(json.dumps({'scipy':scipy.__version__,'numpy':np.__version__,'rows':rows}))
+"#;
+    let output = Command::new(&python).args(["-c", script]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "SciPy quadrature failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let oracle: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let rows = oracle["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 10, "every oracle case must be present");
+    let cases = [
+        (-2.0, 3.0, 1e-10, 1e-10, 128),
+        (0.0, 1.0, 1e-8, 0.0, 128),
+        (0.0, 1.0, 1e-8, 0.0, 256),
+        (0.0, 1.0, 1e-10, 0.0, 128),
+        (-3.0, 2.0, 1e-11, 1e-11, 128),
+        (1.0, 0.0, 1e-8, 0.0, 128),
+        (0.0, 1.0, 1e-12, 1e-12, 64),
+        (0.0, 1.0, 0.0, 1e-11, 64),
+        (0.0, std::f64::consts::TAU, 0.0, 1e-10, 64),
+        (0.0, 1.0, 1e-12, 0.0, 6),
+    ];
+    let mut compared = 0;
+    for (id, (&(a, b, epsabs, epsrel, limit), row)) in cases.iter().zip(rows).enumerate() {
+        assert_eq!(row["id"].as_u64().unwrap(), id as u64);
+        let calls = std::cell::Cell::new(0usize);
+        let result = gauss_kronrod_quad(
+            |x| {
+                calls.set(calls.get() + 1);
+                match id {
+                    0 => x.exp(),
+                    1 | 5 => (x - 1.0 / 3.0).abs().sqrt() + (x - 2.0 / 3.0).abs().sqrt(),
+                    2 => 1.0 / x.sqrt(),
+                    3 => (100.0 * x).sin(),
+                    4 => (-x * x).exp(),
+                    6 => x.powi(12),
+                    7 => 1e-200 * x.exp(),
+                    8 => x.sin(),
+                    9 => (10_000.0 * x).sin(),
+                    _ => unreachable!(),
+                }
+            },
+            a,
+            b,
+            QuadOptions {
+                epsabs,
+                epsrel,
+                limit,
+            },
+        );
+        let expected = row["integral"].as_f64().unwrap();
+        let expected_success = row["success"].as_bool().unwrap();
+        assert!(expected.is_finite() && row["error"].as_f64().unwrap().is_finite());
+        assert!(result.integral.is_finite() && result.error.is_finite());
+        assert_eq!(result.neval, calls.get());
+        assert!(result.neval > 0 && result.neval <= 15 + 30 * (limit - 1));
+        assert_eq!(result.converged, expected_success, "case {id}: {result:?}");
+        if expected_success {
+            let tolerance = epsabs.max(epsrel * expected.abs());
+            assert!(
+                (result.integral - expected).abs() <= tolerance,
+                "case {id}: Rust {result:?} versus SciPy {expected}"
+            );
+            assert!(result.error <= epsabs.max(epsrel * result.integral.abs()));
+        } else {
+            // A capped oscillatory estimate has no accuracy certificate in
+            // either algorithm. Compare the failure status, not two different
+            // unfinished estimates; the evaluation budget is checked above.
+            assert!(id >= 8);
+        }
+        compared += 1;
+    }
+    assert_eq!(compared, 10);
+    eprintln!(
+        "gauss_kronrod compared {compared}/10 cases; SciPy {}, NumPy {}",
+        oracle["scipy"], oracle["numpy"]
     );
 }

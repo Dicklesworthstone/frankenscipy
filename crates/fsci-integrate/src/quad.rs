@@ -1394,8 +1394,8 @@ pub fn trapezoid_uniform(
 ///
 /// For an even number of intervals (odd number of points), uses composite
 /// Simpson's 1/3 rule. For an odd number of intervals (even number of points),
-/// uses Simpson's 1/3 rule on the first n-1 panels and a trapezoidal correction
-/// on the last panel (matching SciPy's default behavior).
+/// uses Simpson's 1/3 rule on the first n-2 intervals and the Cartwright
+/// parabolic correction on the last interval, matching SciPy's default.
 pub fn simpson(y: &[f64], x: &[f64]) -> Result<CompositeQuadResult, IntegrateValidationError> {
     if y.len() != x.len() {
         return Err(IntegrateValidationError::QuadInvalidBounds {
@@ -1420,45 +1420,33 @@ pub fn simpson(y: &[f64], x: &[f64]) -> Result<CompositeQuadResult, IntegrateVal
         return trapezoid(y, x);
     }
 
-    let n = y.len();
+    Ok(CompositeQuadResult {
+        integral: simpson_nonuniform(y, x),
+    })
+}
 
+/// Shared sampled-data kernel, including the final parabolic interval.
+fn simpson_nonuniform(y: &[f64], x: &[f64]) -> f64 {
+    let n = y.len();
+    let odd_len = if n % 2 == 1 { n } else { n - 1 };
+    let integral = simpson_nonuniform_odd(&y[..odd_len], &x[..odd_len]);
     if n % 2 == 1 {
-        // Odd number of points = even number of intervals.
-        // Use composite Simpson's 1/3 rule directly.
-        let integral = simpson_nonuniform_odd(y, x);
-        Ok(CompositeQuadResult { integral })
-    } else {
-        // Even number of points = odd number of intervals. Apply Simpson's 1/3
-        // on the first n-1 points, then correct the final interval with the
-        // Cartwright parabolic formula (a quadratic through the last three
-        // points), exactly as scipy.integrate.simpson — NOT a plain trapezoid,
-        // which left the result off by up to ~3e-3.
-        let integral_simp = simpson_nonuniform_odd(&y[..n - 1], &x[..n - 1]);
-        let h0 = x[n - 2] - x[n - 3];
-        let h1 = x[n - 1] - x[n - 2];
-        let den_a = 6.0 * (h1 + h0);
-        let den_b = 6.0 * h0;
-        let den_e = 6.0 * h0 * (h0 + h1);
-        let alpha = if den_a != 0.0 {
-            (2.0 * h1 * h1 + 3.0 * h0 * h1) / den_a
-        } else {
-            0.0
-        };
-        let beta = if den_b != 0.0 {
-            (h1 * h1 + 3.0 * h0 * h1) / den_b
-        } else {
-            0.0
-        };
-        let eta = if den_e != 0.0 {
-            h1 * h1 * h1 / den_e
-        } else {
-            0.0
-        };
-        let last = alpha * y[n - 1] + beta * y[n - 2] - eta * y[n - 3];
-        Ok(CompositeQuadResult {
-            integral: integral_simp + last,
-        })
+        return integral;
     }
+    let h0 = x[n - 2] - x[n - 3];
+    let h1 = x[n - 1] - x[n - 2];
+    // Preserve the established zero-denominator convention for degenerate
+    // final panels. Cumulative Simpson only accepts strictly increasing x.
+    let last = if h1 == 0.0 {
+        0.0
+    } else if h0 == 0.0 {
+        de_weighted_term(h1, 1.0 / 3.0, y[n - 1])
+    } else if h0 == -h1 {
+        de_weighted_term(h1, 1.0 / 3.0, y[n - 2])
+    } else {
+        cumulative_simpson_right_interval(y[n - 3], y[n - 2], y[n - 1], h0, h1)
+    };
+    integral + last
 }
 
 /// Simpson's 1/3 rule for non-uniform spacing with an odd number of points.
@@ -1470,9 +1458,6 @@ fn simpson_nonuniform_odd(y: &[f64], x: &[f64]) -> f64 {
     while i + 2 < n {
         let h0 = x[i + 1] - x[i];
         let h1 = x[i + 2] - x[i + 1];
-        let h_sum = h0 + h1;
-        let h_prod = h0 * h1;
-
         // Exactly zero, not a floor. This branch exists for COINCIDENT points,
         // where the Simpson weights below divide by h0, h1 and their product;
         // that is undefined only when a spacing is zero. The test used to be
@@ -1491,11 +1476,19 @@ fn simpson_nonuniform_odd(y: &[f64], x: &[f64]) -> f64 {
             integral += 0.5 * h0 * (y[i] + y[i + 1]);
             integral += 0.5 * h1 * (y[i + 1] + y[i + 2]);
         } else {
-            // Non-uniform Simpson's rule for a pair of panels
-            integral += (h_sum / 6.0)
-                * ((2.0 - h1 / h0) * y[i]
-                    + (h_sum * h_sum / h_prod) * y[i + 1]
-                    + (2.0 - h0 / h1) * y[i + 2]);
+            // Ratios of normalized spacings carry no coordinate units. In
+            // particular, h0*h1 and (h0+h1)^2 must not underflow/overflow just
+            // because the caller changes from seconds to another unit.
+            let scale = h0.abs().max(h1.abs());
+            let u = h0 / scale;
+            let v = h1 / scale;
+            let sum = u + v;
+            let weights = [
+                (sum / 6.0) * (2.0 - v / u),
+                (sum / 6.0) * (sum / u) * (sum / v),
+                (sum / 6.0) * (2.0 - u / v),
+            ];
+            integral += sampled_simpson_weighted_sum(scale, weights, [y[i], y[i + 1], y[i + 2]]);
         }
         i += 2;
     }
@@ -3401,26 +3394,53 @@ pub fn cumulative_simpson(y: &[f64], x: &[f64]) -> Result<Vec<f64>, IntegrateVal
 }
 
 fn cumulative_simpson_left_interval(y0: f64, y1: f64, y2: f64, h0: f64, h1: f64) -> f64 {
-    if h0.abs() < f64::EPSILON || h1.abs() < f64::EPSILON {
+    if h0 == 0.0 || h1 == 0.0 {
         0.5 * h0 * (y0 + y1)
     } else {
-        let hsum = h0 + h1;
-        h0 / 6.0
-            * ((3.0 - h0 / hsum) * y0 + (3.0 + h0 * h0 / (h1 * hsum) + h0 / hsum) * y1
-                - h0 * h0 / (h1 * hsum) * y2)
+        let scale = h0.abs().max(h1.abs());
+        let u = h0 / scale;
+        let v = h1 / scale;
+        let fraction = u / (u + v);
+        let ratio = (u / v) * fraction;
+        sampled_simpson_weighted_sum(
+            h0,
+            [
+                (3.0 - fraction) / 6.0,
+                (3.0 + ratio + fraction) / 6.0,
+                -ratio / 6.0,
+            ],
+            [y0, y1, y2],
+        )
     }
 }
 
 fn cumulative_simpson_right_interval(y0: f64, y1: f64, y2: f64, h0: f64, h1: f64) -> f64 {
-    if h0.abs() < f64::EPSILON || h1.abs() < f64::EPSILON {
+    if h0 == 0.0 || h1 == 0.0 {
         0.5 * h1 * (y1 + y2)
     } else {
-        let hsum = h0 + h1;
-        h1 / 6.0
-            * (-h1 * h1 / (h0 * hsum) * y0
-                + (3.0 + h1 * h1 / (h0 * hsum) + h1 / hsum) * y1
-                + (3.0 - h1 / hsum) * y2)
+        let scale = h0.abs().max(h1.abs());
+        let u = h0 / scale;
+        let v = h1 / scale;
+        let fraction = v / (u + v);
+        let ratio = (v / u) * fraction;
+        sampled_simpson_weighted_sum(
+            h1,
+            [
+                -ratio / 6.0,
+                (3.0 + ratio + fraction) / 6.0,
+                (3.0 - fraction) / 6.0,
+            ],
+            [y0, y1, y2],
+        )
     }
+}
+
+fn sampled_simpson_weighted_sum(width: f64, weights: [f64; 3], y: [f64; 3]) -> f64 {
+    // Weight each ordinate before summing. A large ordinate and a tiny
+    // interval can have a finite integral even if an unweighted sum does not.
+    de_weighted_term(width, weights[0], y[0])
+        + de_weighted_term(width, weights[1], y[1])
+        + de_weighted_term(width, weights[2], y[2])
 }
 
 /// Romberg integration using Richardson extrapolation on the trapezoidal rule.
@@ -4173,52 +4193,22 @@ pub fn simpson_irregular(y: &[f64], x: &[f64]) -> f64 {
         return trapezoid_irregular(y, x);
     }
 
-    let n = y.len();
-    let mut sum = 0.0;
-    let mut i = 0;
-
-    // Process pairs of intervals with Simpson's rule
-    while i + 2 < n {
-        let h0 = x[i + 1] - x[i];
-        let h1 = x[i + 2] - x[i + 1];
-        let hsum = h0 + h1;
-
-        // Fall back to the two local trapezoids only when a panel is genuinely
-        // degenerate. The test used to be `< 1e-15` on each spacing — an
-        // absolute floor on a quantity in units of x, so this public entry
-        // degraded to the trapezoid rule from about x-scale 1e-13, even earlier
-        // than its `simpson` sibling, which tests the product
-        // (frankenscipy-bshyq). Both are fixed together because they are two
-        // copies of one decision, the lesson frankenscipy-kwi99 paid for.
-        if h0 == 0.0 || h1 == 0.0 {
-            sum += 0.5 * (y[i] + y[i + 1]) * h0 + 0.5 * (y[i + 1] + y[i + 2]) * h1;
-            i += 2;
-            continue;
-        }
-
-        // Simpson's 3/8 for unequal spacing
-        sum += hsum / 6.0
-            * (y[i] * (2.0 - h1 / h0)
-                + y[i + 1] * hsum * hsum / (h0 * h1)
-                + y[i + 2] * (2.0 - h0 / h1));
-
-        i += 2;
-    }
-
-    // Handle remaining interval with trapezoidal rule
-    if i + 1 < n {
-        sum += 0.5 * (y[i] + y[i + 1]) * (x[i + 1] - x[i]);
-    }
-
-    sum
+    simpson_nonuniform(y, x)
 }
 
 /// Gauss-Kronrod adaptive quadrature (7-15 point rule).
 ///
-/// Higher accuracy than basic adaptive Simpson's. Uses a 7-point Gauss
-/// rule with a 15-point Kronrod extension for error estimation.
+/// Refines the subinterval with the largest estimated error until the sum of
+/// all subinterval errors meets `max(epsabs, epsrel * abs(integral))`.
+/// `limit` bounds the number of active subintervals: at most
+/// `15 + 30 * (limit - 1)` integrand evaluations are performed. The error
+/// estimate includes a roundoff floor, so cancellation or an exhausted budget
+/// cannot certify convergence from the individual subintervals alone.
 ///
-/// Matches `scipy.integrate.quad` behavior (which uses QUADPACK's QAG).
+/// Finite reversed bounds negate the integral. Equal bounds return zero
+/// without evaluating `f`. Invalid controls, non-finite samples, or intervals
+/// with no representable interior node return `converged=false`. For infinite
+/// intervals, break points, or QUADPACK extrapolation use [`quad`].
 pub fn gauss_kronrod_quad<F>(f: F, a: f64, b: f64, options: QuadOptions) -> QuadResult
 where
     F: Fn(f64) -> f64,
@@ -4229,6 +4219,7 @@ where
         || !options.epsrel.is_finite()
         || options.epsabs < 0.0
         || options.epsrel < 0.0
+        || options.limit == 0
     {
         return QuadResult {
             integral: f64::NAN,
@@ -4238,10 +4229,159 @@ where
         };
     }
 
-    gauss_kronrod_inner(&f, a, b, options)
+    if a == b {
+        return QuadResult {
+            integral: 0.0,
+            error: 0.0,
+            neval: 0,
+            // status: the empty interval has an exactly zero integral.
+            converged: true,
+        };
+    }
+
+    let (lower, upper, sign) = if a < b { (a, b, 1.0) } else { (b, a, -1.0) };
+    let mut neval = 0;
+    let first = gauss_kronrod_panel(&f, lower, upper, &mut neval);
+    let mut integral = GaussKronrodSum::default();
+    let mut error = GaussKronrodSum::default();
+    let mut roundoff = GaussKronrodSum::default();
+    integral.add(first.integral);
+    error.add(first.error);
+    roundoff.add(first.roundoff);
+    let mut panels = std::collections::BinaryHeap::from([first]);
+
+    loop {
+        let value = integral.total();
+        let summed_error = error.total();
+        let roundoff_error = roundoff.total();
+        let abs_error = summed_error.max(roundoff_error);
+        let tolerance = options.epsabs.max(options.epsrel * value.abs());
+        let finite = value.is_finite() && summed_error.is_finite() && roundoff_error.is_finite();
+        let converged = finite && abs_error <= tolerance;
+        if converged || !finite || panels.len() >= options.limit || abs_error <= roundoff_error {
+            return QuadResult {
+                integral: sign * value,
+                error: if finite { abs_error } else { f64::INFINITY },
+                neval,
+                converged,
+            };
+        }
+
+        let worst = panels.pop().expect("at least one quadrature panel");
+        let mid = worst.a.midpoint(worst.b);
+        if worst.a.next_up() >= mid || mid.next_up() >= worst.b {
+            return QuadResult {
+                integral: sign * value,
+                error: abs_error,
+                neval,
+                converged: false,
+            };
+        }
+        let left = gauss_kronrod_panel(&f, worst.a, mid, &mut neval);
+        let right = gauss_kronrod_panel(&f, mid, worst.b, &mut neval);
+
+        // Keep the children separate from the removed parent in the error
+        // sums: a replacement delta can round away small child errors before
+        // cancellation restores their scale. Integral replacements also need
+        // to avoid overflowing when a large negative panel is removed.
+        gauss_kronrod_replace_panel(&mut integral, worst.integral, left.integral, right.integral);
+        error.add(-worst.error);
+        error.add(left.error);
+        error.add(right.error);
+        roundoff.add(-worst.roundoff);
+        roundoff.add(left.roundoff);
+        roundoff.add(right.roundoff);
+        panels.push(left);
+        panels.push(right);
+    }
 }
 
-fn gauss_kronrod_inner(f: &dyn Fn(f64) -> f64, a: f64, b: f64, options: QuadOptions) -> QuadResult {
+#[derive(Debug)]
+struct GaussKronrodPanel {
+    a: f64,
+    b: f64,
+    integral: f64,
+    error: f64,
+    roundoff: f64,
+}
+
+impl PartialEq for GaussKronrodPanel {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for GaussKronrodPanel {}
+
+impl PartialOrd for GaussKronrodPanel {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for GaussKronrodPanel {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.error
+            .total_cmp(&other.error)
+            .then_with(|| other.a.total_cmp(&self.a))
+            .then_with(|| other.b.total_cmp(&self.b))
+    }
+}
+
+#[derive(Default)]
+struct GaussKronrodSum {
+    value: f64,
+    correction: f64,
+}
+
+impl GaussKronrodSum {
+    fn add(&mut self, term: f64) {
+        let next = self.value + term;
+        if self.value.is_finite() && term.is_finite() && next.is_finite() {
+            self.correction += if self.value.abs() >= term.abs() {
+                (self.value - next) + term
+            } else {
+                (term - next) + self.value
+            };
+        } else {
+            self.correction = 0.0;
+        }
+        self.value = next;
+    }
+
+    fn total(&self) -> f64 {
+        self.value + self.correction
+    }
+}
+
+fn gauss_kronrod_replace_panel(sum: &mut GaussKronrodSum, parent: f64, left: f64, right: f64) {
+    // Add the three terms separately so that removing a large coarse-panel
+    // estimate cannot erase tiny children. Prefer cancellation at each step:
+    // removing a negative parent first can overflow a positive total even
+    // when adding its negative children makes the refined total finite.
+    let mut terms = [-parent, left, right];
+    for i in 0..terms.len() {
+        let mut next = i;
+        for j in i + 1..terms.len() {
+            let candidate_cancels = terms[j].is_sign_negative() != sum.value.is_sign_negative();
+            let next_cancels = terms[next].is_sign_negative() != sum.value.is_sign_negative();
+            if (candidate_cancels && !next_cancels)
+                || (candidate_cancels == next_cancels && terms[j].abs() > terms[next].abs())
+            {
+                next = j;
+            }
+        }
+        terms.swap(i, next);
+        sum.add(terms[i]);
+    }
+}
+
+fn gauss_kronrod_panel(
+    f: &dyn Fn(f64) -> f64,
+    a: f64,
+    b: f64,
+    neval: &mut usize,
+) -> GaussKronrodPanel {
     // Gauss-Kronrod G7-K15 quadrature rule.
     // The 7 Gauss nodes are a subset of the 15 Kronrod nodes.
     // We evaluate f at all 15 Kronrod nodes, and compute both the
@@ -4300,6 +4440,16 @@ fn gauss_kronrod_inner(f: &dyn Fn(f64) -> f64, a: f64, b: f64, options: QuadOpti
     // Indices into k_nodes that correspond to the 7 Gauss nodes
     let g_indices: [usize; 7] = [1, 3, 5, 7, 9, 11, 13];
 
+    let failed = || GaussKronrodPanel {
+        a,
+        b,
+        integral: f64::NAN,
+        error: f64::INFINITY,
+        roundoff: f64::INFINITY,
+    };
+    if a.next_up() >= b {
+        return failed();
+    }
     let mid = a.midpoint(b);
     let width = b - a;
     let half = if width.is_finite() {
@@ -4309,83 +4459,69 @@ fn gauss_kronrod_inner(f: &dyn Fn(f64) -> f64, a: f64, b: f64, options: QuadOpti
     };
 
     // Evaluate f at all 15 Kronrod nodes
-    let fvals: Vec<f64> = k_nodes.iter().map(|&node| f(mid + half * node)).collect();
-    let neval = 15;
+    let fvals: [f64; 15] = std::array::from_fn(|i| {
+        let x = (mid + half * k_nodes[i]).clamp(a.next_up(), b.next_down());
+        *neval += 1;
+        f(x)
+    });
     if fvals.iter().any(|value| !value.is_finite()) {
-        return QuadResult {
-            integral: f64::NAN,
-            error: f64::INFINITY,
-            neval,
-            converged: false,
-        };
+        return failed();
     }
 
-    // Kronrod estimate (15-point)
-    let kronrod_sum: f64 = fvals
-        .iter()
-        .zip(k_weights.iter())
-        .map(|(&fv, &w)| w * fv)
-        .sum::<f64>()
-        * half;
-
-    // Gauss estimate (7-point, using subset of evaluations)
-    let gauss_sum: f64 = g_indices
-        .iter()
-        .zip(g_weights.iter())
-        .map(|(&idx, &w)| w * fvals[idx])
-        .sum::<f64>()
-        * half;
-
-    let error = (kronrod_sum - gauss_sum).abs();
-    if !kronrod_sum.is_finite() || !error.is_finite() {
-        return QuadResult {
-            integral: kronrod_sum,
-            error: f64::INFINITY,
-            neval,
-            converged: false,
-        };
-    }
-    let within_tolerance = error <= options.epsabs || error <= options.epsrel * kronrod_sum.abs();
-
-    if !within_tolerance && options.limit > 1 {
-        let left = gauss_kronrod_inner(
-            f,
+    // Work in the integrand's local units, then apply the interval width.
+    // An unscaled Kronrod sum is twice a constant integrand and can overflow
+    // even on [0, 1] when the integral is representable. Normalized sums also
+    // keep the embedded-rule difference and deviation estimate in range.
+    let scale = fvals.iter().fold(0.0_f64, |s, value| s.max(value.abs()));
+    if scale == 0.0 {
+        return GaussKronrodPanel {
             a,
-            mid,
-            QuadOptions {
-                limit: options.limit - 1,
-                ..options
-            },
-        );
-        let right = gauss_kronrod_inner(
-            f,
-            mid,
             b,
-            QuadOptions {
-                limit: options.limit - 1,
-                ..options
-            },
-        );
-        let integral = left.integral + right.integral;
-        let error = left.error + right.error;
-        return QuadResult {
-            integral,
-            error,
-            neval: neval + left.neval + right.neval,
-            converged: left.converged
-                && right.converged
-                && integral.is_finite()
-                && error.is_finite(),
+            integral: 0.0,
+            error: 0.0,
+            roundoff: 0.0,
         };
     }
+    let mut kronrod = GaussKronrodSum::default();
+    let mut gauss = GaussKronrodSum::default();
+    let mut absolute = GaussKronrodSum::default();
+    for (&value, &weight) in fvals.iter().zip(&k_weights) {
+        let normalized = value / scale;
+        kronrod.add(weight * normalized);
+        absolute.add(weight * normalized.abs());
+    }
+    for (&idx, &weight) in g_indices.iter().zip(&g_weights) {
+        gauss.add(weight * (fvals[idx] / scale));
+    }
+    let mean = 0.5 * kronrod.total();
+    let mut deviation = GaussKronrodSum::default();
+    for (&value, &weight) in fvals.iter().zip(&k_weights) {
+        deviation.add(weight * (value / scale - mean).abs());
+    }
+    let deviation = deviation.total();
+    let mut error = (kronrod.total() - gauss.total()).abs();
+    // QUADPACK's resasc correction and roundoff floor; an embedded-rule
+    // coincidence alone is not an accuracy certificate under cancellation.
+    if deviation > 0.0 && error > 0.0 {
+        error = deviation * (200.0 * (error / deviation)).powf(1.5).min(1.0);
+    }
+    let roundoff = 50.0 * f64::EPSILON * absolute.total();
+    error = error.max(roundoff);
+    let scaled_bound = |value: f64| {
+        let bound = de_weighted_term(half, scale, value);
+        if bound == 0.0 && value > 0.0 {
+            f64::from_bits(1)
+        } else {
+            bound
+        }
+    };
 
-    // br-szq1n.7: a leaf is converged only if its tolerance test passed. Reaching
-    // the depth limit with the error still too large used to report `true`.
-    QuadResult {
-        integral: kronrod_sum,
-        error,
-        neval,
-        converged: within_tolerance,
+    GaussKronrodPanel {
+        a,
+        b,
+        integral: de_weighted_term(half, scale, kronrod.total()),
+        error: scaled_bound(error),
+        roundoff: scaled_bound(roundoff),
     }
 }
 
@@ -8709,6 +8845,190 @@ mod tests {
     }
 
     #[test]
+    fn gauss_kronrod_limit_is_a_global_subinterval_budget() {
+        for limit in [1, 2, 3, 6] {
+            let calls = std::cell::Cell::new(0usize);
+            let result = gauss_kronrod_quad(
+                |x| {
+                    calls.set(calls.get() + 1);
+                    (10_000.0 * x).sin()
+                },
+                0.0,
+                1.0,
+                QuadOptions {
+                    epsabs: 1e-12,
+                    epsrel: 0.0,
+                    limit,
+                },
+            );
+            assert!(!result.converged, "limit={limit}: {result:?}");
+            assert!(result.error > 1e-12);
+            assert_eq!(result.neval, calls.get());
+            assert!(
+                result.neval <= 15 + 30 * (limit - 1),
+                "limit={limit} exceeded its panel budget: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gauss_kronrod_certifies_the_sum_of_all_subinterval_errors() {
+        // The recursive implementation accepted each cusp at epsabs=1e-6
+        // and returned success with estimated error 1.5723e-6 and actual
+        // error 1.5814e-6. Both errors must obey the single global budget.
+        let options = QuadOptions {
+            epsabs: 1e-6,
+            epsrel: 0.0,
+            limit: 128,
+        };
+        let expected = 4.0 / 3.0 * ((1.0_f64 / 3.0).powf(1.5) + (2.0_f64 / 3.0).powf(1.5));
+        for (a, b, sign) in [(0.0, 1.0, 1.0), (1.0, 0.0, -1.0)] {
+            let result = gauss_kronrod_quad(
+                |x| (x - 1.0 / 3.0).abs().sqrt() + (x - 2.0 / 3.0).abs().sqrt(),
+                a,
+                b,
+                options,
+            );
+            assert!(result.converged, "{result:?}");
+            assert!(result.error <= options.epsabs, "{result:?}");
+            assert!((result.integral - sign * expected).abs() <= options.epsabs);
+            assert!(result.neval <= 15 + 30 * (options.limit - 1));
+        }
+    }
+
+    #[test]
+    fn gauss_kronrod_cancellation_cannot_certify_a_relative_only_tolerance() {
+        let options = QuadOptions {
+            epsabs: 0.0,
+            epsrel: 1e-10,
+            limit: 64,
+        };
+        let result = gauss_kronrod_quad(f64::sin, 0.0, std::f64::consts::TAU, options);
+        assert!(!result.converged, "{result:?}");
+        assert!(result.error > options.epsrel * result.integral.abs());
+        assert!(result.integral.abs() < 1e-12);
+        assert!(result.error.is_finite());
+        assert!(result.neval <= 15 + 30 * (options.limit - 1));
+    }
+
+    #[test]
+    fn gauss_kronrod_preserves_representable_integrals_at_extreme_scales() {
+        let options = QuadOptions {
+            epsabs: 0.0,
+            epsrel: 1e-12,
+            ..QuadOptions::default()
+        };
+        for scale in [1e-300, 1e-200, 1e200, 5e307, 1e308, -1e308] {
+            let result = gauss_kronrod_quad(|_| scale, 0.0, 1.0, options);
+            assert!(result.converged, "scale={scale}: {result:?}");
+            assert!((result.integral / scale - 1.0).abs() <= 4.0 * f64::EPSILON);
+            assert!(result.error.is_finite() && result.error > 0.0);
+            assert_eq!(result.neval, 15);
+        }
+
+        let result = gauss_kronrod_quad(
+            |x| {
+                assert!(x.is_finite() && x > -1e308 && x < 1e308);
+                1e-308
+            },
+            -1e308,
+            1e308,
+            options,
+        );
+        assert!(result.converged, "{result:?}");
+        assert!((result.integral - 2.0).abs() < 1e-14);
+
+        let width = 2.0 * f64::from_bits(1);
+        let result = gauss_kronrod_quad(|_| 1e300, 0.0, width, options);
+        assert!(result.converged, "{result:?}");
+        assert!((result.integral / (width * 1e300) - 1.0).abs() < 1e-14);
+    }
+
+    #[test]
+    fn gauss_kronrod_retains_small_integrals_after_refining_large_coarse_estimates() {
+        for sign in [-1.0, 1.0] {
+            // Changing a function at one point does not change its integral.
+            // The coarse rule samples that point, while both refined panels
+            // see the small constant. A single replacement delta loses it.
+            let result = gauss_kronrod_quad(
+                |x| sign * if x == 0.5 { 1e300 } else { 1e-300 },
+                0.0,
+                1.0,
+                QuadOptions {
+                    epsabs: 0.0,
+                    epsrel: 1e-8,
+                    limit: 2,
+                },
+            );
+            assert!(result.converged, "{result:?}");
+            assert_eq!(result.neval, 45);
+            assert!((result.integral / (sign * 1e-300) - 1.0).abs() <= 4.0 * f64::EPSILON);
+            assert!(result.error > 0.0);
+            assert!(result.error <= 1e-8 * result.integral.abs());
+        }
+    }
+
+    #[test]
+    fn gauss_kronrod_handles_empty_and_unsampleable_intervals_before_callbacks() {
+        let empty = gauss_kronrod_quad(
+            |_| panic!("an empty interval needs no evaluation"),
+            3.0,
+            3.0,
+            QuadOptions::default(),
+        );
+        assert!(empty.converged);
+        assert_eq!(empty.integral, 0.0);
+        assert_eq!(empty.error, 0.0);
+        assert_eq!(empty.neval, 0);
+
+        for (a, b) in [(1.0, 1.0_f64.next_up()), (1.0_f64.next_up(), 1.0)] {
+            let result = gauss_kronrod_quad(
+                |_| panic!("no representable interior point"),
+                a,
+                b,
+                QuadOptions::default(),
+            );
+            assert!(!result.converged);
+            assert!(result.integral.is_nan());
+            assert_eq!(result.error, f64::INFINITY);
+            assert_eq!(result.neval, 0);
+        }
+        let no_budget = gauss_kronrod_quad(
+            |_| panic!("a zero panel budget must be rejected before evaluation"),
+            0.0,
+            1.0,
+            QuadOptions {
+                limit: 0,
+                ..QuadOptions::default()
+            },
+        );
+        assert!(!no_budget.converged);
+        assert_eq!(no_budget.neval, 0);
+    }
+
+    #[test]
+    fn gauss_kronrod_refines_endpoint_singularities_without_sampling_bounds() {
+        let options = QuadOptions {
+            epsabs: 1e-8,
+            epsrel: 0.0,
+            limit: 256,
+        };
+        let result = gauss_kronrod_quad(
+            |x| {
+                assert!(x > 0.0 && x < 1.0);
+                1.0 / x.sqrt()
+            },
+            0.0,
+            1.0,
+            options,
+        );
+        assert!(result.converged, "{result:?}");
+        assert!(result.error <= options.epsabs);
+        assert!((result.integral - 2.0).abs() <= options.epsabs);
+        assert!(result.neval <= 15 + 30 * (options.limit - 1));
+    }
+
+    #[test]
     fn tanhsinh_rejects_nonfinite_tolerances() {
         for (atol, rtol) in [
             (f64::NAN, 1e-12),
@@ -8741,6 +9061,66 @@ mod tests {
         let y = vec![1.0, 1.0, 1.0, 1.0]; // constant = 1
         let result = trapezoid_irregular(&y, &x);
         assert!((result - 4.0).abs() < 1e-10); // area = 4
+    }
+
+    #[test]
+    fn simpson_sampled_quadratics_are_invariant_to_coordinate_units() {
+        let grid = [0.0_f64, 0.25, 0.75, 1.5, 2.0, 3.0];
+        for scale in [1e-200_f64, 1e-20, 1.0, 1e20, 1e200] {
+            for n in 3..=grid.len() {
+                let x: Vec<_> = grid[..n].iter().map(|t| scale * t).collect();
+                // Normalize y inversely so every integral remains O(1), even
+                // when squared grid spacings underflow or overflow.
+                let y: Vec<_> = grid[..n].iter().map(|t| t * t / scale).collect();
+                let expected = grid[n - 1].powi(3) / 3.0;
+                for (name, actual) in [
+                    ("simpson", simpson(&y, &x).unwrap().integral),
+                    ("simpson_irregular", simpson_irregular(&y, &x)),
+                ] {
+                    assert!(
+                        (actual - expected).abs() <= 2e-13 * expected,
+                        "{name}, scale={scale:e}, n={n}: {actual} != {expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cumulative_simpson_sampled_quadratics_are_invariant_to_coordinate_units() {
+        let grid = [0.0_f64, 0.25, 0.75, 1.5, 2.0, 3.0];
+        for scale in [1e-200_f64, 1e-20, 1.0, 1e20, 1e200] {
+            for n in 3..=grid.len() {
+                let x: Vec<_> = grid[..n].iter().map(|t| scale * t).collect();
+                let y: Vec<_> = grid[..n].iter().map(|t| t * t / scale).collect();
+                let actual = cumulative_simpson(&y, &x).unwrap();
+                assert_eq!(actual.len(), n - 1);
+                for (i, value) in actual.iter().enumerate() {
+                    let expected = grid[i + 1].powi(3) / 3.0;
+                    assert!(
+                        (value - expected).abs() <= 2e-13 * expected,
+                        "cumulative_simpson, scale={scale:e}, n={n}, i={i}: {value} != {expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn simpson_irregular_even_samples_use_the_cartwright_correction() {
+        for grid in [
+            vec![0.0_f64, 1.0, 2.0, 3.0],
+            vec![0.0, 0.2, 0.9, 1.7, 2.1, 3.0],
+            vec![3.0, 2.0, 1.0, 0.0],
+        ] {
+            let y: Vec<_> = grid.iter().map(|x| x * x).collect();
+            let expected = (grid[grid.len() - 1].powi(3) - grid[0].powi(3)) / 3.0;
+            let actual = simpson_irregular(&y, &grid);
+            assert!(
+                (actual - expected).abs() < 1e-13,
+                "grid={grid:?}: {actual} != {expected}"
+            );
+        }
     }
 
     #[test]
@@ -8778,7 +9158,7 @@ mod tests {
         );
     }
 
-    // br-szq1n.7: `converged` must be false when the depth limit stops refinement
+    // br-szq1n.7: `converged` must be false when the panel budget stops refinement
     // while the error estimate is still above tolerance (it used to be `true`),
     // and true when the tolerance test passes.
     #[test]
@@ -8795,7 +9175,7 @@ mod tests {
         );
         assert!(
             !shallow.converged,
-            "depth limit 3 cannot resolve |x-1/3|^-0.9 (error {:e})",
+            "a budget of 3 panels cannot resolve |x-1/3|^-0.9 (error {:e})",
             shallow.error
         );
         let smooth = gauss_kronrod_quad(|x| x.exp(), 0.0, 1.0, QuadOptions::default());
