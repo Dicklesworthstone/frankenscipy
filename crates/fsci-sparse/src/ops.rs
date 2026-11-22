@@ -827,11 +827,7 @@ fn combine_coo(lhs: &CooMatrix, rhs: &CooMatrix, rhs_scale: f64) -> SparseResult
 /// Row pointers are used only when their size is bounded by the number of
 /// entries. A very tall, mostly empty COO matrix instead sorts its actual
 /// entries; its logical dimensions never cause a dimension-sized allocation.
-fn combine_coo_stably(
-    lhs: &CooMatrix,
-    rhs: &CooMatrix,
-    rhs_scale: f64,
-) -> SparseResult<CooMatrix> {
+fn combine_coo_stably(lhs: &CooMatrix, rhs: &CooMatrix, rhs_scale: f64) -> SparseResult<CooMatrix> {
     let shape = lhs.shape();
     let capacity = lhs
         .nnz()

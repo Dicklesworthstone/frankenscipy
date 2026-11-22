@@ -22796,17 +22796,14 @@ mod tests {
         // these fixtures use and the general counters this test reads stay at zero -- a failure
         // that says nothing about what is being asserted. Same scoping the harness applies to its
         // own A/B guards.
-        let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
-        // Guard FIRST — it takes the lock, so the store below cannot interleave with
-        // another test's factorization. Constructing it after the store would leave a
-        // window in which the very race this guards against can still happen.
-        let _restore_banded = RestoreBandedToggle::new(banded_was);
-        SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
-
         use std::sync::atomic::Ordering;
         let _guard = PERF_TOGGLE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Guard under the already-held `PERF_TOGGLE_TEST_LOCK` so `SPLU_BANDED_ENABLE` is
+        // snapshotted and restored inside the same critical section without a second mutex (gh#19).
+        let _restore_banded = RestoreBandedToggle::with_lock(&_guard);
+        SPLU_BANDED_ENABLE.store(false, Ordering::Relaxed);
 
         assert!(
             SPLU_ONE_COLUMN_INSERT_ENABLE.load(Ordering::Relaxed),
@@ -22897,11 +22894,9 @@ mod tests {
         // these fixtures use and the general counters this test reads stay at zero -- a failure
         // that says nothing about what is being asserted. Same scoping the harness applies to its
         // own A/B guards.
-        let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
-        // Guard FIRST — it takes the lock, so the store below cannot interleave with
-        // another test's factorization. Constructing it after the store would leave a
-        // window in which the very race this guards against can still happen.
-        let _restore_banded = RestoreBandedToggle::new(banded_was);
+        // Lock `PERF_TOGGLE_TEST_LOCK` first and snapshot `SPLU_BANDED_ENABLE` inside the guard
+        // so the store and restore cannot interleave with another test's factorization (gh#19).
+        let _restore_banded = RestoreBandedToggle::lock();
         SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
 
         // MUST NOT FIRE: scattered takes the in-place fast path on 100% of updates
@@ -24380,11 +24375,9 @@ mod tests {
         // these fixtures use and the general counters this test reads stay at zero -- a failure
         // that says nothing about what is being asserted. Same scoping the harness applies to its
         // own A/B guards.
-        let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
-        // Guard FIRST — it takes the lock, so the store below cannot interleave with
-        // another test's factorization. Constructing it after the store would leave a
-        // window in which the very race this guards against can still happen.
-        let _restore_banded = RestoreBandedToggle::new(banded_was);
+        // Lock `PERF_TOGGLE_TEST_LOCK` first and snapshot `SPLU_BANDED_ENABLE` inside the guard
+        // so the store and restore cannot interleave with another test's factorization (gh#19).
+        let _restore_banded = RestoreBandedToggle::lock();
         SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
 
         // TWO ARMS, because this counter's job is to BOUND a rewrite and both failure
@@ -24511,9 +24504,8 @@ mod tests {
         // `calls = 0`. The counters would otherwise have printed a tidy set of zeros and
         // read as "the prefix scan skips everything", which is the opposite of the truth.
         // The subject here is the GENERAL merge, so the general path is what must run.
-        let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
-        // Guard FIRST — it takes the lock, so the store below cannot interleave.
-        let _restore_banded = RestoreBandedToggle::new(banded_was);
+        // Lock `PERF_TOGGLE_TEST_LOCK` first and snapshot `SPLU_BANDED_ENABLE` inside the guard (gh#19).
+        let _restore_banded = RestoreBandedToggle::lock();
         SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
 
         // Same 7-point Dirichlet stencil as `llywn_cubic_ordering_fill_probe` builds, copied
@@ -25792,29 +25784,107 @@ mod tests {
     ///
     /// Poisoning is ignored deliberately: one failing toggle test must report its own
     /// assertion rather than cascade into unrelated poisoned panics that bury it.
-    static BANDED_TOGGLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Holds `BANDED_TOGGLE_LOCK` for the caller's scope AND restores `SPLU_BANDED_ENABLE`
-    /// on drop, including on unwind. The restore behaviour is unchanged; the lock is new.
-    struct RestoreBandedToggle {
-        previous: bool,
-        /// Never read: held only so the lock is released when the restore runs.
-        _guard: std::sync::MutexGuard<'static, ()>,
+    /// Lock ownership for [`RestoreBandedToggle`], always backed by `PERF_TOGGLE_TEST_LOCK`
+    /// so no test can hold two toggle mutexes in opposing orders (gh#19).
+    #[allow(dead_code)]
+    enum BandedLockHandle<'a> {
+        Owned(std::sync::MutexGuard<'static, ()>),
+        Borrowed(&'a std::sync::MutexGuard<'static, ()>),
     }
-    impl RestoreBandedToggle {
-        fn new(previous: bool) -> Self {
+
+    /// Holds or borrows `PERF_TOGGLE_TEST_LOCK` for the caller's scope, snapshots
+    /// `SPLU_BANDED_ENABLE` after the lock is held, and restores it on drop (including unwind)
+    /// before the lock is released.
+    struct RestoreBandedToggle<'a> {
+        previous: bool,
+        /// Never read: held only so the lock stays acquired until after `Drop::drop` restores the toggle.
+        _lock: BandedLockHandle<'a>,
+    }
+    impl RestoreBandedToggle<'static> {
+        fn lock() -> Self {
+            let guard = PERF_TOGGLE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let previous = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
             Self {
                 previous,
-                _guard: BANDED_TOGGLE_LOCK
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                _lock: BandedLockHandle::Owned(guard),
             }
         }
     }
-    impl Drop for RestoreBandedToggle {
+    impl<'a> RestoreBandedToggle<'a> {
+        fn with_lock(guard: &'a std::sync::MutexGuard<'static, ()>) -> Self {
+            let previous = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+            Self {
+                previous,
+                _lock: BandedLockHandle::Borrowed(guard),
+            }
+        }
+    }
+    impl Drop for RestoreBandedToggle<'_> {
         fn drop(&mut self) {
             SPLU_BANDED_ENABLE.store(self.previous, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    #[test]
+    fn restore_banded_toggle_single_mutex_restores_on_unwind_and_does_not_deadlock() {
+        use std::sync::{Arc, Barrier, atomic::Ordering};
+
+        // Normal and unwind restoration via both `lock` and `with_lock`.
+        let original = {
+            let _g = PERF_TOGGLE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            SPLU_BANDED_ENABLE.load(Ordering::Relaxed)
+        };
+        {
+            let _restore = RestoreBandedToggle::lock();
+            SPLU_BANDED_ENABLE.store(!original, Ordering::Relaxed);
+        }
+        assert_eq!(SPLU_BANDED_ENABLE.load(Ordering::Relaxed), original);
+
+        let unwind_result = std::panic::catch_unwind(|| {
+            let guard = PERF_TOGGLE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _restore = RestoreBandedToggle::with_lock(&guard);
+            SPLU_BANDED_ENABLE.store(!original, Ordering::Relaxed);
+            panic!("intentional unwind to verify RestoreBandedToggle::drop");
+        });
+        assert!(unwind_result.is_err());
+        assert_eq!(SPLU_BANDED_ENABLE.load(Ordering::Relaxed), original);
+
+        // Concurrent barrier-synchronized stress of both guard paths (no AB/BA lock cycle).
+        let threads = 16;
+        let barrier = Arc::new(Barrier::new(threads));
+        let mut handles = Vec::with_capacity(threads);
+        for tid in 0..threads {
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for iter in 0..32 {
+                    if (tid + iter) % 2 == 0 {
+                        let guard = PERF_TOGGLE_TEST_LOCK
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let _restore = RestoreBandedToggle::with_lock(&guard);
+                        SPLU_BANDED_ENABLE.store(false, Ordering::Relaxed);
+                        std::hint::black_box(SPLU_BANDED_ENABLE.load(Ordering::Relaxed));
+                    } else {
+                        let _restore = RestoreBandedToggle::lock();
+                        SPLU_BANDED_ENABLE.store(false, Ordering::Relaxed);
+                        std::hint::black_box(SPLU_BANDED_ENABLE.load(Ordering::Relaxed));
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle
+                .join()
+                .expect("worker thread completed without panic");
+        }
+        assert_eq!(SPLU_BANDED_ENABLE.load(Ordering::Relaxed), original);
     }
 
     /// WHAT IS A PROFILE-REDUCING ORDERING WORTH? Measured before anything is built on it.
@@ -26260,11 +26330,9 @@ mod tests {
         // these fixtures use and the general counters this test reads stay at zero -- a failure
         // that says nothing about what is being asserted. Same scoping the harness applies to its
         // own A/B guards.
-        let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
-        // Guard FIRST — it takes the lock, so the store below cannot interleave with
-        // another test's factorization. Constructing it after the store would leave a
-        // window in which the very race this guards against can still happen.
-        let _restore_banded = RestoreBandedToggle::new(banded_was);
+        // Lock `PERF_TOGGLE_TEST_LOCK` first and snapshot `SPLU_BANDED_ENABLE` inside the guard
+        // so the store and restore cannot interleave with another test's factorization (gh#19).
+        let _restore_banded = RestoreBandedToggle::lock();
         SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
 
         // TWO ARMS, and here the must-MISS arm is the load-bearing one: a churn counter
@@ -26316,10 +26384,8 @@ mod tests {
         // `factorize_csr` now returns early when the banded path accepts, and these fixtures are
         // exactly the shape it accepts -- without this the column-compare toggles never take
         // effect and the test fails for a reason that has nothing to do with what it asserts.
-        // Held under the same `PERF_TOGGLE_TEST_LOCK` as every other toggle-writing test.
-        let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
-        // Guard FIRST — it takes the lock, so the store below cannot interleave.
-        let _restore_banded = RestoreBandedToggle::new(banded_was);
+        // Held under the same `PERF_TOGGLE_TEST_LOCK` as every other toggle-writing test (gh#19).
+        let _restore_banded = RestoreBandedToggle::with_lock(&_guard);
         SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
 
         // SHIPS OFF. This arm corrupts values by design, so the default is not a
@@ -26413,10 +26479,8 @@ mod tests {
         // `factorize_csr` now returns early when the banded path accepts, and these fixtures are
         // exactly the shape it accepts -- without this the column-compare toggles never take
         // effect and the test fails for a reason that has nothing to do with what it asserts.
-        // Held under the same `PERF_TOGGLE_TEST_LOCK` as every other toggle-writing test.
-        let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
-        // Guard FIRST — it takes the lock, so the store below cannot interleave.
-        let _restore_banded = RestoreBandedToggle::new(banded_was);
+        // Held under the same `PERF_TOGGLE_TEST_LOCK` as every other toggle-writing test (gh#19).
+        let _restore_banded = RestoreBandedToggle::with_lock(&_guard);
         SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
 
         assert!(
@@ -26918,9 +26982,8 @@ mod tests {
     /// GENERAL kernel's density goes, and AMD is the low-density arm: measured
     /// `skipped_fraction` 0.2715 against RCM's 0.9936, mean run 13.990 against 1.000.
     fn ab_totals_general_factor() -> usize {
-        let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
-        // Guard FIRST — it takes the lock, so the store below cannot interleave.
-        let _restore = RestoreBandedToggle::new(banded_was);
+        // Lock `PERF_TOGGLE_TEST_LOCK` first and snapshot `SPLU_BANDED_ENABLE` inside the guard (gh#19).
+        let _restore = RestoreBandedToggle::lock();
         SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
         let matrix = splu_dirichlet_laplacian_3d(10);
         let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Amd)
@@ -26961,9 +27024,8 @@ mod tests {
     #[test]
     #[ignore = "A/B totals arm: run under callgrind, comparison SKIPPED (incorrect, bound only)"]
     fn ab_totals_column_compare_skipped() {
-        let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
-        // Guard FIRST — it takes the lock, so the store below cannot interleave.
-        let _restore = RestoreBandedToggle::new(banded_was);
+        // Lock `PERF_TOGGLE_TEST_LOCK` first and snapshot `SPLU_BANDED_ENABLE` inside the guard (gh#19).
+        let _restore = RestoreBandedToggle::lock();
         SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
         SKIP_COLUMN_COMPARE.with(|arm| arm.set(true));
         let result = NativeSparseLu::factorize_csr(
@@ -26983,11 +27045,9 @@ mod tests {
         // these fixtures use and the general counters this test reads stay at zero -- a failure
         // that says nothing about what is being asserted. Same scoping the harness applies to its
         // own A/B guards.
-        let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
-        // Guard FIRST — it takes the lock, so the store below cannot interleave with
-        // another test's factorization. Constructing it after the store would leave a
-        // window in which the very race this guards against can still happen.
-        let _restore_banded = RestoreBandedToggle::new(banded_was);
+        // Lock `PERF_TOGGLE_TEST_LOCK` first and snapshot `SPLU_BANDED_ENABLE` inside the guard
+        // so the store and restore cannot interleave with another test's factorization (gh#19).
+        let _restore_banded = RestoreBandedToggle::lock();
         SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
 
         // The invariant this counter rests on is that `matched_run_length` returns a
@@ -49932,6 +49992,7 @@ impl<'a> ExpmActionPlan<'a> {
                         }
                     }
                 }
+                // status: initialized true and AND-folded over every component meeting previous + |term| <= tol * |result|
                 converged = true;
                 for ((term, result), &product) in term.iter_mut().zip(&mut result).zip(&next) {
                     let previous = term.abs();
@@ -50009,6 +50070,7 @@ impl<'a> ExpmActionPlan<'a> {
                         }
                     }
                 }
+                // status: initialized true and AND-folded over every scaled component meeting previous + |product| <= tol * |result|
                 converged = true;
                 for ((term, result), &product) in term.iter_mut().zip(&mut result).zip(&next) {
                     let previous = term.abs();
