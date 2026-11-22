@@ -1027,6 +1027,21 @@ fn feed_minimize_options(
             fingerprinter.u64(value);
         }
     }
+    fn optional_bool(fingerprinter: &mut Fingerprinter, value: Option<bool>) {
+        fingerprinter.bool(value.is_some());
+        if let Some(value) = value {
+            fingerprinter.bool(value);
+        }
+    }
+    fn optional_matrix(fingerprinter: &mut Fingerprinter, matrix: Option<&[Vec<f64>]>) {
+        fingerprinter.bool(matrix.is_some());
+        if let Some(rows) = matrix {
+            fingerprinter.usize(rows.len());
+            for row in rows {
+                fingerprinter.f64s(row);
+            }
+        }
+    }
 
     fingerprinter.f64s(x0).str(&format!("{:?}", options.method));
     optional_f64(fingerprinter, options.tol);
@@ -1060,6 +1075,37 @@ fn feed_minimize_options(
     }
     optional_u64(fingerprinter, options.seed);
     fingerprinter.str(&format!("{:?}", options.mode));
+
+    let method_options = &options.method_options;
+    optional_f64(fingerprinter, method_options.gtol);
+    optional_f64(fingerprinter, method_options.norm);
+    optional_f64(fingerprinter, method_options.c1);
+    optional_f64(fingerprinter, method_options.c2);
+    optional_f64(fingerprinter, method_options.xrtol);
+    optional_u64(fingerprinter, method_options.maxcor.map(|v| v as u64));
+    optional_u64(fingerprinter, method_options.maxls.map(|v| v as u64));
+    optional_f64(fingerprinter, method_options.ftol);
+    optional_f64(fingerprinter, method_options.xtol);
+    optional_f64(fingerprinter, method_options.xatol);
+    optional_f64(fingerprinter, method_options.fatol);
+    optional_bool(fingerprinter, method_options.adaptive);
+    optional_matrix(fingerprinter, method_options.initial_simplex);
+    optional_matrix(fingerprinter, method_options.direc);
+    optional_f64(fingerprinter, method_options.barrier_tol);
+    optional_f64(fingerprinter, method_options.initial_tr_radius);
+    optional_f64(fingerprinter, method_options.initial_constr_penalty);
+    optional_f64(fingerprinter, method_options.initial_barrier_parameter);
+    optional_f64(fingerprinter, method_options.initial_barrier_tolerance);
+    fingerprinter.bool(method_options.factorization_method.is_some());
+    if let Some(factorization_method) = method_options.factorization_method {
+        fingerprinter.str(&format!("{factorization_method:?}"));
+    }
+    optional_f64(fingerprinter, method_options.finite_diff_rel_step);
+    optional_bool(fingerprinter, method_options.sparse_jacobian);
+    optional_f64(fingerprinter, method_options.rhobeg);
+    optional_f64(fingerprinter, method_options.catol);
+    optional_f64(fingerprinter, method_options.f_target);
+    optional_bool(fingerprinter, method_options.inexact);
 }
 
 fn minimize_audit_fingerprint(x0: &[f64], options: &MinimizeOptions<'_>) -> String {
@@ -6838,6 +6884,272 @@ mod tests {
         let payload = f64::from_bits(f64::NAN.to_bits() ^ 1);
         assert!(payload.is_nan());
         assert_ne!(quiet, fingerprint_of(&[payload], options));
+
+        // gh#5: every `method_options` scalar, boolean, enum, and matrix field must affect the
+        // audit fingerprint, including shape boundaries and IEEE bit patterns.
+        use crate::MinimizeMethodOptions;
+        let simplex_a = vec![vec![0.0, 0.0], vec![1.0, 0.0], vec![0.0, 1.0]];
+        let simplex_b = vec![vec![0.0, 0.0], vec![2.0, 0.0], vec![0.0, 1.0]];
+        let simplex_flat_split = vec![vec![0.0], vec![0.0, 1.0, 0.0], vec![0.0, 1.0]];
+        let direc_a = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let direc_b = vec![vec![0.0, 1.0], vec![1.0, 0.0]];
+
+        let variants: Vec<(&str, MinimizeMethodOptions<'_>)> = vec![
+            (
+                "gtol",
+                MinimizeMethodOptions {
+                    gtol: Some(1.0e-6),
+                    ..Default::default()
+                },
+            ),
+            (
+                "norm",
+                MinimizeMethodOptions {
+                    norm: Some(2.0),
+                    ..Default::default()
+                },
+            ),
+            (
+                "c1",
+                MinimizeMethodOptions {
+                    c1: Some(1.0e-3),
+                    ..Default::default()
+                },
+            ),
+            (
+                "c2",
+                MinimizeMethodOptions {
+                    c2: Some(0.8),
+                    ..Default::default()
+                },
+            ),
+            (
+                "xrtol",
+                MinimizeMethodOptions {
+                    xrtol: Some(1.0e-7),
+                    ..Default::default()
+                },
+            ),
+            (
+                "maxcor",
+                MinimizeMethodOptions {
+                    maxcor: Some(15),
+                    ..Default::default()
+                },
+            ),
+            (
+                "maxls",
+                MinimizeMethodOptions {
+                    maxls: Some(30),
+                    ..Default::default()
+                },
+            ),
+            (
+                "ftol",
+                MinimizeMethodOptions {
+                    ftol: Some(1.0e-9),
+                    ..Default::default()
+                },
+            ),
+            (
+                "xtol",
+                MinimizeMethodOptions {
+                    xtol: Some(1.0e-5),
+                    ..Default::default()
+                },
+            ),
+            (
+                "xatol",
+                MinimizeMethodOptions {
+                    xatol: Some(1.0e-5),
+                    ..Default::default()
+                },
+            ),
+            (
+                "fatol",
+                MinimizeMethodOptions {
+                    fatol: Some(1.0e-5),
+                    ..Default::default()
+                },
+            ),
+            (
+                "adaptive",
+                MinimizeMethodOptions {
+                    adaptive: Some(true),
+                    ..Default::default()
+                },
+            ),
+            (
+                "initial_simplex",
+                MinimizeMethodOptions {
+                    initial_simplex: Some(&simplex_a),
+                    ..Default::default()
+                },
+            ),
+            (
+                "direc",
+                MinimizeMethodOptions {
+                    direc: Some(&direc_a),
+                    ..Default::default()
+                },
+            ),
+            (
+                "barrier_tol",
+                MinimizeMethodOptions {
+                    barrier_tol: Some(1.0e-7),
+                    ..Default::default()
+                },
+            ),
+            (
+                "initial_tr_radius",
+                MinimizeMethodOptions {
+                    initial_tr_radius: Some(2.0),
+                    ..Default::default()
+                },
+            ),
+            (
+                "initial_constr_penalty",
+                MinimizeMethodOptions {
+                    initial_constr_penalty: Some(3.0),
+                    ..Default::default()
+                },
+            ),
+            (
+                "initial_barrier_parameter",
+                MinimizeMethodOptions {
+                    initial_barrier_parameter: Some(0.2),
+                    ..Default::default()
+                },
+            ),
+            (
+                "initial_barrier_tolerance",
+                MinimizeMethodOptions {
+                    initial_barrier_tolerance: Some(0.2),
+                    ..Default::default()
+                },
+            ),
+            (
+                "factorization_method",
+                MinimizeMethodOptions {
+                    factorization_method: Some(
+                        crate::trust_constr::FactorizationMethod::SvdFactorization,
+                    ),
+                    ..Default::default()
+                },
+            ),
+            (
+                "finite_diff_rel_step",
+                MinimizeMethodOptions {
+                    finite_diff_rel_step: Some(1.0e-6),
+                    ..Default::default()
+                },
+            ),
+            (
+                "sparse_jacobian",
+                MinimizeMethodOptions {
+                    sparse_jacobian: Some(true),
+                    ..Default::default()
+                },
+            ),
+            (
+                "rhobeg",
+                MinimizeMethodOptions {
+                    rhobeg: Some(0.5),
+                    ..Default::default()
+                },
+            ),
+            (
+                "catol",
+                MinimizeMethodOptions {
+                    catol: Some(1.0e-6),
+                    ..Default::default()
+                },
+            ),
+            (
+                "f_target",
+                MinimizeMethodOptions {
+                    f_target: Some(-1.0),
+                    ..Default::default()
+                },
+            ),
+            (
+                "inexact",
+                MinimizeMethodOptions {
+                    inexact: Some(false),
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (name, method_options) in variants {
+            let varied = MinimizeOptions {
+                method_options,
+                ..options
+            };
+            let fp = fingerprint_of(&[0.0, 1.0], varied);
+            assert_ne!(
+                base, fp,
+                "method_options.{name} must alter audit fingerprint"
+            );
+            assert_eq!(fp, fingerprint_of(&[0.0, 1.0], varied));
+        }
+
+        let simplex_fp_a = fingerprint_of(
+            &[0.0, 1.0],
+            MinimizeOptions {
+                method_options: MinimizeMethodOptions {
+                    initial_simplex: Some(&simplex_a),
+                    ..Default::default()
+                },
+                ..options
+            },
+        );
+        let simplex_fp_b = fingerprint_of(
+            &[0.0, 1.0],
+            MinimizeOptions {
+                method_options: MinimizeMethodOptions {
+                    initial_simplex: Some(&simplex_b),
+                    ..Default::default()
+                },
+                ..options
+            },
+        );
+        let simplex_fp_split = fingerprint_of(
+            &[0.0, 1.0],
+            MinimizeOptions {
+                method_options: MinimizeMethodOptions {
+                    initial_simplex: Some(&simplex_flat_split),
+                    ..Default::default()
+                },
+                ..options
+            },
+        );
+        assert_ne!(simplex_fp_a, simplex_fp_b);
+        assert_ne!(
+            simplex_fp_a, simplex_fp_split,
+            "row-length framing must separate matrices with identical flattened entries"
+        );
+
+        let direc_fp_a = fingerprint_of(
+            &[0.0, 1.0],
+            MinimizeOptions {
+                method_options: MinimizeMethodOptions {
+                    direc: Some(&direc_a),
+                    ..Default::default()
+                },
+                ..options
+            },
+        );
+        let direc_fp_b = fingerprint_of(
+            &[0.0, 1.0],
+            MinimizeOptions {
+                method_options: MinimizeMethodOptions {
+                    direc: Some(&direc_b),
+                    ..Default::default()
+                },
+                ..options
+            },
+        );
+        assert_ne!(direc_fp_a, direc_fp_b);
     }
 
     #[test]
