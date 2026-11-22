@@ -4193,39 +4193,50 @@ impl FDistribution {
         Self { dfn, dfd }
     }
 
-    /// Log-density at many points, hoisting the constant `0.5·d1·ln(d1/d2)` lead
-    /// term and the `ln_beta(d1/2, d2/2)` normalizer (three lgamma evals) out of the
-    /// per-point loop. Byte-identical to mapping `logpdf`: the lead term is kept as
-    /// the FIRST addend and `ln_beta` as the LAST subtraction, matching the
-    /// arithmetic order exactly; x≤0 delegates to `pdf`.
+    /// Log-density at many points, hoisting `a = d1/2`, `b = d2/2`,
+    /// `ln(d1) - ln(d2)`, and `ln_beta(a, b)` out of the per-point loop.
+    /// Byte-identical to mapping `logpdf`, including `x <= 0` and `x == +∞`.
     #[must_use]
     pub fn logpdf_many(&self, xs: &[f64]) -> Vec<f64> {
-        let d1 = self.dfn;
-        let d2 = self.dfd;
-        let lead = 0.5 * d1 * (d1 / d2).ln();
-        let lb = ln_beta(0.5 * d1, 0.5 * d2);
+        let a = 0.5 * self.dfn;
+        let b = 0.5 * self.dfd;
+        let log_df_diff = self.dfn.ln() - self.dfd.ln();
+        let lb = ln_beta(a, b);
         par_continuous_map_min(xs, 65536, |x| {
-            if x <= 0.0 {
-                return self.pdf(x).ln();
+            if x <= 0.0 || x == f64::INFINITY {
+                return f64::NEG_INFINITY;
             }
-            lead + (0.5 * d1 - 1.0) * x.ln() - 0.5 * (d1 + d2) * (1.0 + d1 * x / d2).ln() - lb
+            let log_x = x.ln();
+            let log_ratio = log_df_diff + log_x;
+            let log_kernel = if log_ratio >= 0.0 {
+                -b * log_ratio - (a + b) * (-log_ratio).exp().ln_1p()
+            } else {
+                a * log_ratio - (a + b) * log_ratio.exp().ln_1p()
+            };
+            log_kernel - log_x - lb
         })
     }
 
-    /// Density at many points; hoists the lead term and `ln_beta` like
-    /// [`logpdf_many`](Self::logpdf_many). Byte-identical to mapping `pdf`.
+    /// Density at many points; hoists constants like [`logpdf_many`](Self::logpdf_many).
+    /// Byte-identical to mapping `pdf`.
     #[must_use]
     pub fn pdf_many(&self, xs: &[f64]) -> Vec<f64> {
-        let d1 = self.dfn;
-        let d2 = self.dfd;
-        let lead = 0.5 * d1 * (d1 / d2).ln();
-        let lb = ln_beta(0.5 * d1, 0.5 * d2);
+        let a = 0.5 * self.dfn;
+        let b = 0.5 * self.dfd;
+        let log_df_diff = self.dfn.ln() - self.dfd.ln();
+        let lb = ln_beta(a, b);
         par_continuous_map_min(xs, 65536, |x| {
-            if x <= 0.0 {
+            if x <= 0.0 || x == f64::INFINITY {
                 return 0.0;
             }
-            (lead + (0.5 * d1 - 1.0) * x.ln() - 0.5 * (d1 + d2) * (1.0 + d1 * x / d2).ln() - lb)
-                .exp()
+            let log_x = x.ln();
+            let log_ratio = log_df_diff + log_x;
+            let log_kernel = if log_ratio >= 0.0 {
+                -b * log_ratio - (a + b) * (-log_ratio).exp().ln_1p()
+            } else {
+                a * log_ratio - (a + b) * log_ratio.exp().ln_1p()
+            };
+            (log_kernel - log_x - lb).exp()
         })
     }
 
@@ -8258,6 +8269,7 @@ impl ContinuousDistribution for Logistic {
             h_beta_tau /= n;
             h_tau_tau = h_tau_tau / n + 1.0 / (tau * tau);
             if g_beta.abs().max((tau * g_tau).abs()) <= 1.0e-12 {
+                // status: scaled log-likelihood gradient norm fell within 1e-12 stationarity tolerance
                 converged = true;
                 break;
             }
@@ -16406,6 +16418,14 @@ impl DiscreteDistribution for Hypergeometric {
 /// Type-I items weighted by the `odds` ratio (biased urn). Support is
 /// `max(0, N-(M-n)) ..= min(n, N)`.
 ///
+/// # Fitting
+///
+/// Unconstrained 4-parameter fitting via [`DiscreteDistribution::try_fit`] is not
+/// supported and returns [`FitError::NotImplemented`] (and [`DiscreteDistribution::fit`]
+/// panics as documented), because the three discrete urn sizes `(M, n, N)` are not
+/// identifiable from sample counts alone. When `(M, n, N)` are known, use
+/// [`NchypergeomWallenius::try_fit_odds`] to estimate `odds` by maximum likelihood.
+///
 /// PMF (Fog 2008), after the regularizing substitution `u = t^{1/D}`:
 /// `P(x) = C(n,x) C(M-n,N-x) · D ∫_0^1 (1-u^ω)^x (1-u)^{N-x} u^{D-1} du`,
 /// with `D = ω(n-x) + (M-n-N+x)`.
@@ -16433,6 +16453,154 @@ impl NchypergeomWallenius {
             big_n,
             odds,
         }
+    }
+
+    /// Maximum-likelihood estimate of `odds` given known urn parameters `(M, n, N)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FitError::InsufficientData`] when `data` is empty,
+    /// [`FitError::UnsupportedData`] for invalid urn dimensions (`n > M` or `N > M`)
+    /// or observations outside `[max(0, N-(M-n)), min(n, N)]`, and
+    /// [`FitError::NonConvergent`] when the support is degenerate (`lo == hi`) or all
+    /// observations lie on a single support boundary (where the likelihood supremum
+    /// is approached only at `odds -> 0` or `odds -> +∞`).
+    pub fn try_fit_odds(data: &[i64], big_m: u64, n: u64, big_n: u64) -> Result<Self, FitError> {
+        validate_discrete_fit_data(data)?;
+        if n > big_m {
+            return Err(FitError::UnsupportedData(format!(
+                "NchypergeomWallenius requires n <= M; got n={n}, M={big_m}"
+            )));
+        }
+        if big_n > big_m {
+            return Err(FitError::UnsupportedData(format!(
+                "NchypergeomWallenius requires N <= M; got N={big_n}, M={big_m}"
+            )));
+        }
+        let lo = big_n.saturating_sub(big_m - n);
+        let hi = n.min(big_n);
+        if lo >= hi {
+            return Err(FitError::NonConvergent(
+                "NchypergeomWallenius support is degenerate; odds is not identifiable".into(),
+            ));
+        }
+
+        let mut counts: std::collections::BTreeMap<i64, usize> = std::collections::BTreeMap::new();
+        let mut all_lo = true;
+        let mut all_hi = true;
+        for &value in data {
+            let Ok(k) = u64::try_from(value) else {
+                return Err(FitError::UnsupportedData(format!(
+                    "NchypergeomWallenius observation {value} is outside support [{lo}, {hi}]"
+                )));
+            };
+            if k < lo || k > hi {
+                return Err(FitError::UnsupportedData(format!(
+                    "NchypergeomWallenius observation {k} is outside support [{lo}, {hi}]"
+                )));
+            }
+            all_lo &= k == lo;
+            all_hi &= k == hi;
+            *counts.entry(value).or_insert(0) += 1;
+        }
+        if all_lo || all_hi {
+            return Err(FitError::NonConvergent(
+                "NchypergeomWallenius MLE for a boundary-only sample has no finite positive odds"
+                    .into(),
+            ));
+        }
+
+        let neg_log_lik = |log_odds: f64| -> f64 {
+            let odds = log_odds.exp();
+            if !odds.is_finite() || odds <= 0.0 {
+                return f64::INFINITY;
+            }
+            let dist = Self {
+                big_m,
+                n,
+                big_n,
+                odds,
+            };
+            let mut nll = 0.0_f64;
+            for (&k, &count) in &counts {
+                let p = dist.pmf(k);
+                if !(p > 0.0 && p.is_finite()) {
+                    return f64::INFINITY;
+                }
+                nll -= (count as f64) * p.ln();
+            }
+            nll
+        };
+
+        // Coarse scan in log(odds) over [-12, 12] (odds in ~[6e-6, 1.6e5]) to bracket the
+        // unimodal minimum, followed by golden-section refinement.
+        const LO_LOG: f64 = -12.0;
+        const HI_LOG: f64 = 12.0;
+        const GRID: usize = 48;
+        let mut best_idx = 0usize;
+        let mut best_nll = f64::INFINITY;
+        for idx in 0..=GRID {
+            let theta = LO_LOG + (HI_LOG - LO_LOG) * (idx as f64 / GRID as f64);
+            let nll = neg_log_lik(theta);
+            if nll < best_nll {
+                best_nll = nll;
+                best_idx = idx;
+            }
+        }
+        if !best_nll.is_finite() {
+            return Err(FitError::NonConvergent(
+                "NchypergeomWallenius log-likelihood could not be evaluated finitely".into(),
+            ));
+        }
+        let step = (HI_LOG - LO_LOG) / GRID as f64;
+        let mut a = if best_idx == 0 {
+            LO_LOG
+        } else {
+            LO_LOG + (best_idx - 1) as f64 * step
+        };
+        let mut b = if best_idx == GRID {
+            HI_LOG
+        } else {
+            LO_LOG + (best_idx + 1) as f64 * step
+        };
+
+        let inv_phi = 0.5 * (5.0_f64.sqrt() - 1.0);
+        let inv_phi2 = 1.0 - inv_phi;
+        let mut c = a + inv_phi2 * (b - a);
+        let mut d = a + inv_phi * (b - a);
+        let mut fc = neg_log_lik(c);
+        let mut fd = neg_log_lik(d);
+        for _ in 0..64 {
+            if (b - a).abs() <= 1.0e-11 {
+                break;
+            }
+            if fc < fd {
+                b = d;
+                d = c;
+                fd = fc;
+                c = a + inv_phi2 * (b - a);
+                fc = neg_log_lik(c);
+            } else {
+                a = c;
+                c = d;
+                fc = fd;
+                d = a + inv_phi * (b - a);
+                fd = neg_log_lik(d);
+            }
+        }
+        let best_log_odds = 0.5 * (a + b);
+        let odds = best_log_odds.exp();
+        if !odds.is_finite() || odds <= 0.0 {
+            return Err(FitError::NonConvergent(
+                "NchypergeomWallenius fitted odds is not finite and positive".into(),
+            ));
+        }
+        Ok(Self {
+            big_m,
+            n,
+            big_n,
+            odds,
+        })
     }
 
     fn support(&self) -> (u64, u64) {
@@ -16500,6 +16668,15 @@ impl DiscreteDistribution for NchypergeomWallenius {
 
     fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<i64> {
         signed_variates(self.rvs(count, rng))
+    }
+
+    /// Unconstrained 4-parameter fitting is unsupported because the discrete urn sizes
+    /// `(M, n, N)` are not identifiable from counts alone; use
+    /// [`NchypergeomWallenius::try_fit_odds`] when `(M, n, N)` are known.
+    fn try_fit(_data: &[i64]) -> Result<Self, FitError> {
+        Err(FitError::NotImplemented {
+            distribution: "NchypergeomWallenius",
+        })
     }
 }
 
@@ -48962,12 +49139,12 @@ fn kstwo_raw_moments_12(n: usize) -> (f64, f64) {
     };
     let (mut m1, mut m2) = (a, a * a);
     for w in cuts.windows(2) {
-        // GK15/G7 bisection to 1e-15 of the panel width (depth <= 12); valid finite bounds
-        // and tolerances, so quad_vec cannot fail here.
+        // Global-panel GK15/G7 adaptive quadrature to 1e-15 of the panel width; valid finite
+        // bounds and tolerances, so quad_vec cannot fail here.
         let options = fsci_integrate::QuadOptions {
             epsabs: 1e-15 * (w[1] - w[0]),
             epsrel: 0.0,
-            limit: 12,
+            limit: 256,
         };
         let Ok(r) = fsci_integrate::quad_vec(integrand, w[0], w[1], options) else {
             return (f64::NAN, f64::NAN);
@@ -70390,19 +70567,34 @@ impl<D: ContinuousDistribution> NumericalInverseHermite<D> {
             dx.push(d);
         }
 
-        // Adaptive refinement: bisect any interval whose midpoint u-error misses.
+        // Adaptive refinement: bisect any interval whose interior u-error misses.
+        // Checking symmetric off-center probes catches asymmetric tail curvature, and
+        // tightening the tail u-tolerance proportionally to `min(u, 1 - u)` (floored
+        // safely above f64 roundoff) keeps x-space quantile error `≈ u_err / f(x)`
+        // controlled deep in the tails where `f(x)` vanishes.
         let mut max_err;
         loop {
             let mut worst = 0.0_f64;
             let mut split: Vec<usize> = Vec::new();
             for i in 0..u.len() - 1 {
-                let um = 0.5 * (u[i] + u[i + 1]);
-                let xm = Self::hermite(u[i], u[i + 1], x[i], x[i + 1], dx[i], dx[i + 1], um);
-                let err = (dist.cdf(xm) - um).abs();
-                if err > worst {
-                    worst = err;
+                let mut interval_err = 0.0_f64;
+                for t in [0.15_f64, 0.5, 0.85] {
+                    let ut = u[i] + t * (u[i + 1] - u[i]);
+                    let xt = Self::hermite(u[i], u[i + 1], x[i], x[i + 1], dx[i], dx[i + 1], ut);
+                    let err = (dist.cdf(xt) - ut).abs();
+                    if err > interval_err {
+                        interval_err = err;
+                    }
                 }
-                if err > u_resolution {
+                if interval_err > worst {
+                    worst = interval_err;
+                }
+                let um = 0.5 * (u[i] + u[i + 1]);
+                let tail_prob = um.min(1.0 - um);
+                let interval_tol = (u_resolution * 100.0 * tail_prob)
+                    .min(u_resolution)
+                    .max(1.0e-14);
+                if interval_err > interval_tol {
                     split.push(i);
                 }
             }
@@ -70754,7 +70946,12 @@ impl<D: ContinuousDistribution> FastGeneratorInversion<D> {
             }
             let x_exact = self.inner.dist.ppf(u_mapped);
             if x_exact.is_finite() {
-                let x_err = (x - x_exact).abs();
+                let x_err_abs = (x - x_exact).abs();
+                let x_err = if x_exact != 0.0 {
+                    x_err_abs.min(x_err_abs / x_exact.abs())
+                } else {
+                    x_err_abs
+                };
                 if x_err > max_x_err {
                     max_x_err = x_err;
                 }
@@ -77172,6 +77369,72 @@ mod tests {
     }
 
     #[test]
+    fn nchypergeom_wallenius_try_fit_refusal_and_fixed_urn_mle() {
+        // Unconstrained 4-parameter trait try_fit explicitly refuses with NotImplemented (gh#14).
+        let err = <NchypergeomWallenius as DiscreteDistribution>::try_fit(&[3, 4, 5])
+            .expect_err("unconstrained Wallenius fit must be refused");
+        assert!(matches!(
+            err,
+            FitError::NotImplemented {
+                distribution: "NchypergeomWallenius"
+            }
+        ));
+
+        // Fixed-urn MLE recovers unbiased odds = 1.0 on a symmetric central sample.
+        let symmetric = [2_i64, 3, 4, 5, 5, 6, 7, 8];
+        let fitted_sym =
+            NchypergeomWallenius::try_fit_odds(&symmetric, 20, 10, 10).expect("symmetric urn fit");
+        assert!(
+            (fitted_sym.odds - 1.0).abs() < 1e-6,
+            "symmetric sample must fit odds=1.0, got {}",
+            fitted_sym.odds
+        );
+
+        // Fixed-urn MLE maximizes exact log-likelihood on biased counts.
+        let biased = [5_i64, 6, 6, 6, 7, 5, 6, 7, 5, 6];
+        let fitted =
+            NchypergeomWallenius::try_fit_odds(&biased, 20, 7, 12).expect("biased urn fit");
+        assert!(fitted.odds > 2.0, "expected odds > 2, got {}", fitted.odds);
+        let nll = |odds: f64| -> f64 {
+            let d = NchypergeomWallenius::new(20, 7, 12, odds);
+            biased.iter().map(|&k| -d.pmf(k).ln()).sum()
+        };
+        let best = nll(fitted.odds);
+        assert!(best < nll(fitted.odds * 0.9));
+        assert!(best < nll(fitted.odds * 1.1));
+
+        // Refusals: invalid urn, empty data, out-of-support observation, boundary-only sample.
+        assert!(matches!(
+            NchypergeomWallenius::try_fit_odds(&[], 20, 7, 12),
+            Err(FitError::InsufficientData { .. })
+        ));
+        assert!(matches!(
+            NchypergeomWallenius::try_fit_odds(&[1, 2], 10, 11, 5),
+            Err(FitError::UnsupportedData(_))
+        ));
+        assert!(matches!(
+            NchypergeomWallenius::try_fit_odds(&[1, 2], 10, 5, 11),
+            Err(FitError::UnsupportedData(_))
+        ));
+        assert!(matches!(
+            NchypergeomWallenius::try_fit_odds(&[0, 8], 20, 7, 12),
+            Err(FitError::UnsupportedData(_))
+        ));
+        assert!(matches!(
+            NchypergeomWallenius::try_fit_odds(&[-1, 3], 20, 7, 12),
+            Err(FitError::UnsupportedData(_))
+        ));
+        assert!(matches!(
+            NchypergeomWallenius::try_fit_odds(&[7, 7, 7], 20, 7, 12),
+            Err(FitError::NonConvergent(_))
+        ));
+        assert!(matches!(
+            NchypergeomWallenius::try_fit_odds(&[0, 0, 0], 20, 7, 12),
+            Err(FitError::NonConvergent(_))
+        ));
+    }
+
+    #[test]
     fn poisson_pmf_known() {
         let p = Poisson::new(3.0);
         // P(0) = exp(-3) ≈ 0.04979
@@ -80951,9 +81214,11 @@ mod tests {
         assert_close(d1.ppf(0.5), 0.959_115_069_315_210_1, 1e-12, "d1.ppf(0.5)");
         let d2 = TruncWeibullMin::new(1.0, 0.0, 5.0);
         assert_close(d2.cdf(2.0), 0.870_530_303_811_567_4, 1e-12, "d2.cdf(2)");
-        // Outside support
+        // Support boundaries match SciPy 1.17.1 closed [a, b]; outside is 0.
+        assert_close(d1.pdf(0.5), 1.024_084_150_793_529_2, 1e-12, "d1.pdf(a)");
+        assert_close(d1.pdf(2.0), 0.096_336_603_174_116_5, 1e-12, "d1.pdf(b)");
         assert_eq!(d1.pdf(0.0), 0.0);
-        assert_eq!(d1.pdf(0.5), 0.0); // x must be > a strictly
+        assert_eq!(d1.pdf(0.499_999), 0.0);
         assert_eq!(d1.pdf(2.5), 0.0);
         assert_eq!(d1.cdf(0.4), 0.0);
         assert_eq!(d1.cdf(2.5), 1.0);
@@ -95206,12 +95471,7 @@ mod tests {
             data.iter().map(|&x| distribution.logpdf(x)).sum::<f64>()
         };
         assert!(likelihood(fit.a) > likelihood(3.0) + 0.1);
-        assert_close(
-            InverseGamma::fit(&data).a,
-            fit.a,
-            0.0,
-            "fit delegates to MLE",
-        );
+        assert_eq!(InverseGamma::fit(&data).a, fit.a, "fit delegates to MLE");
     }
 
     #[test]
@@ -102978,12 +103238,7 @@ mod tests {
         };
         assert!(likelihood(fitted.c) > likelihood(fitted.c * 0.99));
         assert!(likelihood(fitted.c) > likelihood(fitted.c * 1.01));
-        assert_close(
-            InvWeibull::fit(&data).c,
-            fitted.c,
-            0.0,
-            "fit delegates to MLE",
-        );
+        assert_eq!(InvWeibull::fit(&data).c, fitted.c, "fit delegates to MLE");
     }
 
     #[test]
@@ -103034,7 +103289,7 @@ mod tests {
         };
         assert!(likelihood(fitted.c) > likelihood(fitted.c * 0.99));
         assert!(likelihood(fitted.c) > likelihood(fitted.c * 1.01));
-        assert_close(Fisk::fit(&data).c, fitted.c, 0.0, "fit delegates to MLE");
+        assert_eq!(Fisk::fit(&data).c, fitted.c, "fit delegates to MLE");
     }
 
     #[test]
@@ -103841,15 +104096,26 @@ mod tests {
 
     #[test]
     fn invgamma_fit_metamorphic_mean_inverts_a() {
-        // For unit-scale InverseGamma, sample_mean = 1/(a-1) ⟺ a = 1 + 1/mean.
+        // Unit-scale InverseGamma MLE solves the exact score equation
+        // digamma(a) + mean(ln(x)) = 0 and achieves strictly higher
+        // log-likelihood than the former method-of-moments estimate 1 + 1/mean.
         let data = [0.5_f64, 1.0, 1.5, 2.0, 3.0];
-        let m = data.iter().sum::<f64>() / data.len() as f64;
+        let mean_ln_x = data.iter().map(|&x| x.ln()).sum::<f64>() / data.len() as f64;
         let fitted = InverseGamma::try_fit(&data).expect("fit");
-        let expected = 1.0 + 1.0 / m;
+        let score = digamma(fitted.a) + mean_ln_x;
         assert!(
-            (fitted.a - expected).abs() < 1e-13,
-            "MoM mean-inversion: a={} expected {expected}",
+            score.abs() < 1e-12,
+            "MLE digamma score residual: a={}, score={score}",
             fitted.a
+        );
+        let mom_a = 1.0 + 1.0 / (data.iter().sum::<f64>() / data.len() as f64);
+        let ll = |a| {
+            let d = InverseGamma::new(a);
+            data.iter().map(|&x| d.logpdf(x)).sum::<f64>()
+        };
+        assert!(
+            ll(fitted.a) > ll(mom_a),
+            "MLE must improve log-likelihood over MoM ({mom_a})"
         );
     }
 
@@ -119080,7 +119346,7 @@ mod histogram_distribution_matches_scipy {
         use fsci_runtime::RuntimeMode;
 
         let strict = StatsOptions::new(RuntimeMode::Strict);
-        let mut state = 0x5EED_3C8_0005_u64;
+        let mut state = 0x05EE_D3C8_0005_u64;
         let mut next_f64 = || -> f64 {
             state = state
                 .wrapping_mul(6364136223846793005)

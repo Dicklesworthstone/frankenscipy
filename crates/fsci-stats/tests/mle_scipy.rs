@@ -394,7 +394,7 @@ fn discrete_mle_preserves_likelihood_near_parameter_boundaries() {
                 (
                     vec![10_000_000, 20_000_000],
                     0.999_999_996_580_082_9,
-                    38.972_113_490_036_816,
+                    38.972_113_490_036_82,
                 ),
             ] {
                 // Independent 65-digit score roots, not method-of-moments
@@ -413,7 +413,7 @@ fn discrete_mle_preserves_likelihood_near_parameter_boundaries() {
             let mut rare = vec![1; 100_000];
             rare.push(2);
             let fitted = LogSeries::try_fit(&rare).unwrap();
-            assert!((fitted.p / 1.999_946_668_044_409_7e-5 - 1.0).abs() < 2.0e-12);
+            assert!((fitted.p / 1.999_946_668_044_41e-5 - 1.0).abs() < 2.0e-12);
             assert!((fitted.mean() - (1.0 + 1.0 / rare.len() as f64)).abs() < 3.0e-15);
 
             let mut concentrated = vec![1; 999];
@@ -584,11 +584,11 @@ fn rice_mle_finds_interior_and_boundary_likelihood_maxima() {
                 (
                     vec![1.0, 2.0, 5.0, 10.0],
                     4.382_179_946_147_269,
-                    28.798_957_737_546_447,
+                    28.798_957_737_546_45,
                 ),
                 (
                     vec![1000.0, 1001.0, 999.0, 1002.0],
-                    1000.499_500_249_500_6,
+                    1_000.499_500_249_500_6,
                     6.175_754_382_568_785,
                 ),
             ] {
@@ -838,7 +838,7 @@ fn nakagami_mle_preserves_concentrated_samples_without_a_shape_ceiling() {
         ),
         (
             [1.0 - 1.0e-10, 1.0, 1.0 + 1.0e-10],
-            3.749_999_379_447_294_5e19,
+            3.749_999_379_447_294e19,
             -65.428_934_604_148_5,
         ),
     ] {
@@ -3158,7 +3158,9 @@ fn censored_mle_matches_live_scipy() {
             left,
             right,
             intervals
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| (pair[0], pair[1]))
                 .collect(),
         );
@@ -3413,7 +3415,12 @@ fn location_scale_mle_matches_live_scipy() {
             exact,
             left,
             right,
-            intervals.chunks_exact(2).map(|p| (p[0], p[1])).collect(),
+            intervals
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|p| (p[0], p[1]))
+                .collect(),
         );
         assert_eq!(data.len(), 800);
         let parameters: Vec<_> = initial
