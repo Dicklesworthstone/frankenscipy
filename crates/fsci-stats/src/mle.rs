@@ -484,6 +484,167 @@ fn validate_shape_sample(
     crate::validate_finite_fit_data(data, minimum_sample, family)
 }
 
+/// The Landau law has no moments; quantile matching supplies a scale-equivariant
+/// start without letting a large right-tail observation dominate the search.
+pub(crate) fn landau_mle(data: &[f64]) -> Result<crate::Landau, FitError> {
+    validate_shape_sample(data, 2, "Landau")?;
+    let quantiles = crate::quantile(data, &[0.0, 0.25, 0.5, 0.75, 1.0]);
+    let minimum = quantiles[0];
+    let minimum_count = data.iter().filter(|&&x| x == minimum).count();
+    if minimum_count > data.len() - minimum_count {
+        // At the minimum, each repeated density grows like 1/scale; at every
+        // larger observation the Landau right tail decays like scale. More
+        // than half the sample at the minimum therefore gives an unbounded
+        // likelihood, not a valid small-scale MLE.
+        return Err(FitError::NonConvergent(
+            "Landau likelihood is unbounded as scale tends to zero".into(),
+        ));
+    }
+    let standard_iqr = crate::landau::landau_ppf(0.75) - crate::landau::landau_ppf(0.25);
+    let iqr = quantiles[3] - quantiles[1];
+    let mut spread = if iqr.is_finite() {
+        iqr / standard_iqr
+    } else {
+        quantiles[3] / standard_iqr - quantiles[1] / standard_iqr
+    };
+    if spread == 0.0 {
+        // A nonconstant, heavily rounded sample can have zero IQR. Its range
+        // still supplies a valid start unless the MLE scale is unrepresentable.
+        spread = quantiles[4] / standard_iqr - minimum / standard_iqr;
+    }
+    if !spread.is_finite() || spread <= 0.0 {
+        return Err(FitError::NonConvergent(
+            "Landau sample has no positive finite fitting scale".into(),
+        ));
+    }
+    let origin = quantiles[2];
+    let standardized: Vec<_> = data
+        .iter()
+        .map(|&x| {
+            let difference = x - origin;
+            if difference.is_finite() {
+                difference / spread
+            } else {
+                x / spread - origin / spread
+            }
+        })
+        .collect();
+    if standardized.iter().any(|x| !x.is_finite()) {
+        return Err(FitError::NonConvergent(
+            "Landau sample range is not representable in fitting coordinates".into(),
+        ));
+    }
+    let fitted = fit_mle(
+        &standardized,
+        &[
+            MleParameter::Free(-crate::landau::landau_ppf(0.5)),
+            MleParameter::Positive(1.0),
+        ],
+        |p| {
+            Some(crate::Landau {
+                loc: p[0],
+                scale: p[1],
+            })
+        },
+        MleOptions::default(),
+    )?
+    .distribution;
+    let distribution = crate::Landau {
+        loc: spread.mul_add(fitted.loc, origin),
+        scale: spread * fitted.scale,
+    };
+    if !distribution.loc.is_finite()
+        || !distribution.scale.is_finite()
+        || distribution.scale <= 0.0
+        || data.iter().any(|&x| !distribution.logpdf(x).is_finite())
+    {
+        return Err(FitError::NonConvergent(
+            "Landau MLE is not representable with finite parameters and log densities".into(),
+        ));
+    }
+    Ok(distribution)
+}
+
+/// Work in the sample's unit range. Nonnegative margins keep every observation
+/// inside the trial support while c <= d preserves the ordered plateau. Multiple
+/// starts prevent a collapsed uniform/triangular simplex from hiding an interior
+/// maximum; all candidates still use the same unpenalized likelihood driver.
+pub(crate) fn trapezoid_mle(data: &[f64]) -> Result<crate::Trapezoid, FitError> {
+    validate_shape_sample(data, 2, "Trapezoid")?;
+    let minimum = data.iter().copied().fold(f64::INFINITY, f64::min);
+    let maximum = data.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let width = maximum - minimum;
+    if !width.is_finite() || width <= 0.0 {
+        return Err(FitError::NonConvergent(
+            "Trapezoid MLE requires a positive, finite sample range".into(),
+        ));
+    }
+    let standardized: Vec<_> = data.iter().map(|&x| (x - minimum) / width).collect();
+    let mut best: Option<MleResult<crate::Trapezoid>> = None;
+    let mut failure = FitError::NonConvergent("Trapezoid MLE did not converge".into());
+    for [c, d, left_margin, right_margin] in [
+        [0.2, 0.8, 0.05, 0.05],
+        [0.1, 0.3, 0.05, 0.05],
+        [0.7, 0.9, 0.05, 0.05],
+        [0.5, 0.5, 0.05, 0.05],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.4, 0.0, 0.05],
+        [0.6, 1.0, 0.05, 0.0],
+    ] {
+        let bounded = |initial, upper| MleParameter::Bounded {
+            initial,
+            lower: 0.0,
+            upper,
+        };
+        let result = fit_mle(
+            &standardized,
+            &[
+                bounded(c, 1.0),
+                bounded(d, 1.0),
+                bounded(left_margin, f64::INFINITY),
+                bounded(right_margin, f64::INFINITY),
+            ],
+            |p| {
+                let scale = 1.0 + p[2] + p[3];
+                (p[0] <= p[1] && scale.is_finite()).then_some(crate::Trapezoid {
+                    c: p[0],
+                    d: p[1],
+                    loc: -p[2],
+                    scale,
+                })
+            },
+            MleOptions::default(),
+        );
+        match result {
+            Ok(candidate) => {
+                if best.as_ref().is_none_or(|previous| {
+                    candidate.negative_log_likelihood < previous.negative_log_likelihood
+                }) {
+                    best = Some(candidate);
+                }
+            }
+            Err(error) => failure = error,
+        }
+    }
+    let fitted = best.ok_or(failure)?.distribution;
+    let distribution = crate::Trapezoid {
+        c: fitted.c,
+        d: fitted.d,
+        loc: width.mul_add(fitted.loc, minimum),
+        scale: width * fitted.scale,
+    };
+    if !distribution.loc.is_finite()
+        || !distribution.scale.is_finite()
+        || distribution.scale <= 0.0
+        || data.iter().any(|&x| !distribution.logpdf(x).is_finite())
+    {
+        return Err(FitError::NonConvergent(
+            "Trapezoid MLE is not representable with finite parameters and log densities".into(),
+        ));
+    }
+    Ok(distribution)
+}
+
 fn compensated_mean(values: impl Iterator<Item = f64>, count: usize) -> f64 {
     let mut mean = 0.0;
     let mut correction = 0.0;
@@ -1728,4 +1889,55 @@ where
         FitError::NonConvergent("MLE parameters are not finite or are outside their domains".into())
     })?;
     finish(values, result.nit, result.nfev)
+}
+
+#[cfg(test)]
+mod location_scale_fit_tests {
+    use super::*;
+    use crate::{Landau, Trapezoid};
+
+    #[test]
+    fn landau_mle_rejects_undefined_and_unbounded_samples() {
+        assert!(matches!(
+            Landau::try_fit(&[]),
+            Err(FitError::InsufficientData { .. })
+        ));
+        assert!(matches!(
+            Landau::try_fit(&[0.0, f64::NAN]),
+            Err(FitError::UnsupportedData(_))
+        ));
+        for sample in [&[2.0, 2.0][..], &[0.0, 0.0, 1.0][..]] {
+            assert!(matches!(
+                Landau::try_fit(sample),
+                Err(FitError::NonConvergent(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn trapezoid_mle_includes_uniform_support_boundary() {
+        let fitted = Trapezoid::try_fit(&[0.0, 0.0, 1.0, 1.0]).unwrap();
+        assert_eq!(fitted.c, 0.0);
+        assert_eq!(fitted.d, 1.0);
+        assert_eq!(fitted.loc, 0.0);
+        assert_eq!(fitted.scale, 1.0);
+        assert_eq!(fitted.logpdf(0.0), 0.0);
+        assert_eq!(fitted.logpdf(1.0), 0.0);
+    }
+
+    #[test]
+    fn trapezoid_log_likelihood_survives_density_overflow_and_underflow() {
+        let tiny = Trapezoid::new(0.25, 0.75, 0.0, 1.0e-310);
+        assert!(tiny.pdf(0.5e-310).is_infinite());
+        let expected = (4.0_f64 / 3.0).ln() - tiny.scale.ln();
+        assert!((tiny.logpdf(0.5e-310) - expected).abs() < 1.0e-12);
+
+        let huge = Trapezoid::new(0.5, 0.5, 0.0, 1.0e308);
+        assert_eq!(huge.pdf(1.0e-100), 0.0);
+        let expected = 4.0_f64.ln() + 1.0e-100_f64.ln() - 2.0 * huge.scale.ln();
+        assert!((huge.logpdf(1.0e-100) - expected).abs() < 1.0e-12);
+        let uniform = Trapezoid::new(0.0, 1.0, 0.0, 1.0e308);
+        assert_eq!(uniform.logpdf(-1.0e-100), f64::NEG_INFINITY);
+        assert!(uniform.logpdf(f64::NAN).is_nan());
+    }
 }

@@ -10,11 +10,12 @@ use std::process::Command;
 use fsci_runtime::RuntimeMode;
 use fsci_stats::{
     Alpha, Argus, BetaDist, Burr3, Burr12, CensoredData, Chi, ChiSquared, ContinuousDistribution,
-    CrystalBall, DiscreteDistribution, ExponWeibull, FDistribution, FitError, FoldedCauchy, GammaDist,
-    JohnsonSU, Kappa3, LocationScale, LogSeries, Lognormal, Mielke, MleOptions, MleParameter, MleResult,
-    Nakagami, NormInvGauss, Normal, RDist, RandInt, Rice, SkewCauchy, StatsError, TruncNormal, TruncPareto,
-    TruncWeibullMin, Weibull, Zipfian, fit_mle, fit_mle_censored, fit_mle_location_scale,
-    fit_mle_location_scale_censored, with_hardened_stats_caps, with_stats_runtime_mode,
+    CrystalBall, DiscreteDistribution, ExponWeibull, FDistribution, FitError, FoldedCauchy,
+    GammaDist, JohnsonSU, Kappa3, Landau, LocationScale, LogSeries, Lognormal, Mielke, MleOptions,
+    MleParameter, MleResult, Nakagami, NormInvGauss, Normal, RDist, RandInt, Rice, SkewCauchy,
+    StatsError, Trapezoid, TruncNormal, TruncPareto, TruncWeibullMin, Weibull, Zipfian, fit_mle,
+    fit_mle_censored, fit_mle_location_scale, fit_mle_location_scale_censored,
+    with_hardened_stats_caps, with_stats_runtime_mode,
 };
 use rand::{SeedableRng, rngs::StdRng};
 
@@ -77,6 +78,306 @@ fn likelihood<D: ContinuousDistribution>(distribution: &D, data: &[f64]) -> f64 
 
 fn discrete_likelihood<D: DiscreteDistribution>(distribution: &D, data: &[i64]) -> f64 {
     -data.iter().map(|&x| distribution.logpmf(x)).sum::<f64>()
+}
+
+#[test]
+fn landau_and_trapezoid_mle_preserve_location_scale_equivariance() {
+    let landau = Landau::new(2.0, 1.7);
+    let trapezoid = Trapezoid::new(0.15, 0.65, -2.0, 4.0);
+    let landau_data: Vec<_> = (0..256)
+        .map(|i| landau.ppf((i as f64 + 0.5) / 256.0))
+        .collect();
+    let trapezoid_data: Vec<_> = (0..256)
+        .map(|i| trapezoid.ppf((i as f64 + 0.5) / 256.0))
+        .collect();
+    let landau_fit = Landau::try_fit(&landau_data).unwrap();
+    let trapezoid_fit = Trapezoid::try_fit(&trapezoid_data).unwrap();
+    assert!(likelihood(&landau_fit, &landau_data) <= likelihood(&landau, &landau_data));
+    assert!(likelihood(&trapezoid_fit, &trapezoid_data) <= likelihood(&trapezoid, &trapezoid_data));
+    assert!((landau_fit.loc - 2.0).abs() < 0.1);
+    assert!((landau_fit.scale - 1.7).abs() < 0.1);
+    assert!((trapezoid_fit.c - 0.15).abs() < 0.1);
+    assert!((trapezoid_fit.d - 0.65).abs() < 0.1);
+
+    for factor in [1.0e-150_f64, 1.0e150] {
+        let offset = -4.0 * factor;
+        let scaled_landau: Vec<_> = landau_data
+            .iter()
+            .map(|&x| factor.mul_add(x, offset))
+            .collect();
+        let scaled_trapezoid: Vec<_> = trapezoid_data
+            .iter()
+            .map(|&x| factor.mul_add(x, offset))
+            .collect();
+        let fitted_landau = Landau::try_fit(&scaled_landau).unwrap();
+        let fitted_trapezoid = Trapezoid::try_fit(&scaled_trapezoid).unwrap();
+        for (actual, expected) in [
+            (fitted_landau.loc / factor + 4.0, landau_fit.loc),
+            (fitted_landau.scale / factor, landau_fit.scale),
+            (fitted_trapezoid.loc / factor + 4.0, trapezoid_fit.loc),
+            (fitted_trapezoid.scale / factor, trapezoid_fit.scale),
+            (fitted_trapezoid.c, trapezoid_fit.c),
+            (fitted_trapezoid.d, trapezoid_fit.d),
+        ] {
+            assert!(
+                (actual - expected).abs() <= 2.0e-6 * expected.abs().max(1.0),
+                "factor={factor}: fitted parameter {actual} != {expected}"
+            );
+        }
+        let jacobian = landau_data.len() as f64 * factor.ln();
+        assert!(
+            (likelihood(&fitted_landau, &scaled_landau)
+                - likelihood(&landau_fit, &landau_data)
+                - jacobian)
+                .abs()
+                < 1.0e-8
+        );
+        assert!(
+            (likelihood(&fitted_trapezoid, &scaled_trapezoid)
+                - likelihood(&trapezoid_fit, &trapezoid_data)
+                - jacobian)
+                .abs()
+                < 1.0e-8
+        );
+    }
+}
+
+#[test]
+fn landau_and_trapezoid_mle_reject_invalid_samples_and_honor_caps() {
+    for data in [&[][..], &[1.0][..]] {
+        assert!(matches!(
+            Landau::try_fit(data),
+            Err(FitError::InsufficientData { .. })
+        ));
+        assert!(matches!(
+            Trapezoid::try_fit(data),
+            Err(FitError::InsufficientData { .. })
+        ));
+    }
+    for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(matches!(
+            Landau::try_fit(&[0.0, invalid]),
+            Err(FitError::UnsupportedData(_))
+        ));
+        assert!(matches!(
+            Trapezoid::try_fit(&[0.0, invalid]),
+            Err(FitError::UnsupportedData(_))
+        ));
+    }
+    for data in [[0.0, 0.0], [1.0e300, 1.0e300]] {
+        assert!(matches!(
+            Landau::try_fit(&data),
+            Err(FitError::NonConvergent(_))
+        ));
+        assert!(matches!(
+            Trapezoid::try_fit(&data),
+            Err(FitError::NonConvergent(_))
+        ));
+    }
+    // Landau's infinite right-tail variance is not a failure. A repeated
+    // minimum is different: its likelihood is unbounded when its multiplicity
+    // is more than half the sample, so a shrinking scale is not a valid fit.
+    assert!(matches!(
+        Landau::try_fit(&[0.0, 0.0, 1.0]),
+        Err(FitError::NonConvergent(_))
+    ));
+    assert!(matches!(
+        Trapezoid::try_fit(&[-f64::MAX, f64::MAX]),
+        Err(FitError::NonConvergent(_))
+    ));
+    with_stats_runtime_mode(RuntimeMode::Hardened, || {
+        with_hardened_stats_caps(2, 2, || {
+            assert!(matches!(
+                Landau::try_fit(&[0.0, 1.0, 2.0]),
+                Err(FitError::ResourceExhausted { .. })
+            ));
+            assert!(matches!(
+                Trapezoid::try_fit(&[0.0, 1.0, 2.0]),
+                Err(FitError::ResourceExhausted { .. })
+            ));
+        });
+    });
+}
+
+#[test]
+fn landau_and_trapezoid_mle_reuse_exact_parameter_masks() {
+    let landau = Landau::new(-3.0, 2.0);
+    let data: Vec<_> = (0..256)
+        .map(|i| landau.ppf((i as f64 + 0.5) / 256.0))
+        .collect();
+    let result = fit_mle(
+        &data,
+        &[MleParameter::Fixed(-3.0), MleParameter::Positive(1.0)],
+        |p| {
+            Some(Landau {
+                loc: p[0],
+                scale: p[1],
+            })
+        },
+        MleOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(result.parameters[0], -3.0);
+    assert!((result.parameters[1] - 2.0).abs() < 0.1);
+    for multiplier in [0.9, 1.1] {
+        let perturbed = Landau::new(-3.0, result.distribution.scale * multiplier);
+        assert!(result.negative_log_likelihood < likelihood(&perturbed, &data));
+    }
+
+    let trapezoid = Trapezoid::new(0.2, 0.8, -2.0, 4.0);
+    let data: Vec<_> = (0..256)
+        .map(|i| trapezoid.ppf((i as f64 + 0.5) / 256.0))
+        .collect();
+    let result = fit_mle(
+        &data,
+        &[
+            MleParameter::Fixed(0.2),
+            MleParameter::Fixed(0.8),
+            MleParameter::Fixed(-2.0),
+            MleParameter::Positive(4.5),
+        ],
+        |p| {
+            Some(Trapezoid {
+                c: p[0],
+                d: p[1],
+                loc: p[2],
+                scale: p[3],
+            })
+        },
+        MleOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(&result.parameters[..3], &[0.2, 0.8, -2.0]);
+    assert!((result.parameters[3] - 4.0).abs() < 0.1);
+    for multiplier in [0.99, 1.01] {
+        let perturbed = Trapezoid::new(0.2, 0.8, -2.0, result.distribution.scale * multiplier);
+        assert!(result.negative_log_likelihood < likelihood(&perturbed, &data));
+    }
+}
+
+const AFFINE_FIT_ORACLE: &str = r#"
+import os
+import numpy as np
+import scipy
+from scipy import stats
+
+print('versions', scipy.__version__, np.__version__)
+if os.environ.get('FSCI_REQUIRE_SCIPY_ORACLE') == '1':
+    assert (scipy.__version__, np.__version__) == ('1.17.1', '2.4.3')
+
+cases = [
+    ('landau', stats.landau, [
+        (0.0, 1.0), (-20.0, 0.03), (1e6, 25.0), (3.0, 1e-8)]),
+    ('trapezoid', stats.trapezoid, [
+        (0.2, 0.8, 3.0, 2.0), (0.1, 0.3, -5.0, 0.25),
+        (0.7, 0.9, 12.0, 7.0), (0.0, 1.0, 0.0, 1.0),
+        (0.5, 0.5, 0.0, 1.0), (0.0, 0.5, 0.0, 1.0), (0.5, 1.0, 0.0, 1.0)]),
+]
+for name, dist, parameters in cases:
+    for case_index, p in enumerate(parameters):
+        seed = (42000 if name == 'landau' else 41000) + case_index
+        data = dist.rvs(*p[:-2], loc=p[-2], scale=p[-1], size=2000,
+                        random_state=np.random.default_rng(seed))
+        fitted = dist.fit(data)
+        nll = -np.sum(dist.logpdf(data, *fitted[:-2], loc=fitted[-2], scale=fitted[-1]))
+        true_nll = -np.sum(dist.logpdf(data, *p[:-2], loc=p[-2], scale=p[-1]))
+        assert np.isfinite(nll) and np.isfinite(true_nll), (name, case_index)
+        print(name, case_index, len(fitted), *(format(x, '.17g') for x in fitted),
+              format(nll, '.17g'), format(true_nll, '.17g'))
+        print(' '.join(format(x, '.17g') for x in data))
+"#;
+
+#[test]
+fn landau_and_trapezoid_mle_match_live_scipy() {
+    let python = std::env::var("FSCI_PYTHON").unwrap_or_else(|_| "python3".into());
+    let required = std::env::var("FSCI_REQUIRE_SCIPY_ORACLE").as_deref() == Ok("1");
+    let available = Command::new(&python)
+        .args(["-c", "import numpy; import scipy"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !available {
+        assert!(
+            !required,
+            "required Landau/Trapezoid SciPy oracle is unavailable"
+        );
+        eprintln!("SKIP Landau/Trapezoid MLE: SciPy unavailable; compared cases = 0");
+        return;
+    }
+    let output = Command::new(&python)
+        .env("OPENBLAS_NUM_THREADS", "1")
+        .env("OMP_NUM_THREADS", "1")
+        .args(["-c", AFFINE_FIT_ORACLE])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "affine-fit oracle failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut lines = stdout.lines();
+    let versions = lines.next().expect("oracle version metadata");
+    assert!(versions.starts_with("versions "));
+    if required {
+        assert_eq!(versions, "versions 1.17.1 2.4.3");
+    }
+    eprintln!("Landau/Trapezoid MLE oracle {versions}");
+    let mut compared = [0; 2];
+    while let Some(header) = lines.next() {
+        let mut fields = header.split_whitespace();
+        let family = fields.next().unwrap();
+        let case = fields.next().unwrap();
+        let parameter_count: usize = fields.next().unwrap().parse().unwrap();
+        let expected: Vec<f64> = fields
+            .by_ref()
+            .take(parameter_count)
+            .map(|value| value.parse().unwrap())
+            .collect();
+        let expected_nll: f64 = fields.next().unwrap().parse().unwrap();
+        let true_nll: f64 = fields.next().unwrap().parse().unwrap();
+        assert!(fields.next().is_none());
+        assert!(expected_nll.is_finite() && true_nll.is_finite());
+        let data: Vec<f64> = lines
+            .next()
+            .expect("oracle observation row")
+            .split_whitespace()
+            .map(|value| value.parse().unwrap())
+            .collect();
+        assert_eq!(data.len(), 2000);
+        let (actual, nll) = match family {
+            "landau" => {
+                let fitted = Landau::try_fit(&data).expect("Landau MLE");
+                compared[0] += 1;
+                (vec![fitted.loc, fitted.scale], likelihood(&fitted, &data))
+            }
+            "trapezoid" => {
+                let fitted = Trapezoid::try_fit(&data).expect("Trapezoid MLE");
+                assert!(fitted.c >= 0.0 && fitted.c <= fitted.d && fitted.d <= 1.0);
+                compared[1] += 1;
+                (
+                    vec![fitted.c, fitted.d, fitted.loc, fitted.scale],
+                    likelihood(&fitted, &data),
+                )
+            }
+            _ => panic!("unexpected affine-fit family: {family}"),
+        };
+        assert_eq!(actual.len(), expected.len());
+        assert!(nll.is_finite());
+        for reference in [expected_nll, true_nll] {
+            assert!(
+                nll <= reference + 1.0e-6 * reference.abs().max(1.0),
+                "{family}/{case}: NLL {nll} > {reference}; fsci={actual:?}, SciPy={expected:?}"
+            );
+        }
+        eprintln!(
+            "{family}/{case}: fsci={actual:?} scipy={expected:?}; NLL fsci={nll:.12e} scipy={expected_nll:.12e}"
+        );
+    }
+    assert_eq!(
+        compared,
+        [4, 7],
+        "all eleven seeded affine fits must be compared"
+    );
 }
 
 #[test]
@@ -185,7 +486,10 @@ fn discrete_mle_matches_live_scipy_on_seeded_fits() {
         .output()
         .is_ok_and(|output| output.status.success());
     if !available {
-        assert!(!required, "required discrete-fit SciPy oracle is unavailable");
+        assert!(
+            !required,
+            "required discrete-fit SciPy oracle is unavailable"
+        );
         eprintln!("SKIP discrete MLE: SciPy oracle unavailable; compared cases = 0");
         return;
     }
@@ -256,7 +560,10 @@ fn discrete_mle_matches_live_scipy_on_seeded_fits() {
         );
         compared += 1;
     }
-    assert_eq!(compared, 12, "all discrete-fit oracle cases must be compared");
+    assert_eq!(
+        compared, 12,
+        "all discrete-fit oracle cases must be compared"
+    );
     eprintln!("discrete MLE compared cases = {compared}");
 }
 

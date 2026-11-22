@@ -8306,10 +8306,7 @@ impl ContinuousDistribution for Logistic {
             loc: (mean - beta / tau).mul_add(radius, center),
             scale: radius / tau,
         };
-        if !converged
-            || !fitted.loc.is_finite()
-            || !fitted.scale.is_finite()
-            || fitted.scale <= 0.0
+        if !converged || !fitted.loc.is_finite() || !fitted.scale.is_finite() || fitted.scale <= 0.0
         {
             return Err(FitError::NonConvergent(
                 "Logistic MLE has no converged finite positive-scale solution".into(),
@@ -17061,8 +17058,7 @@ impl DiscreteDistribution for LogSeries {
             if t < 1.0e-3 {
                 t * (0.5
                     + t * (1.0 / 6.0
-                        + t * (1.0 / 24.0
-                            + t * (1.0 / 120.0 + t * (1.0 / 720.0 + t / 5040.0)))))
+                        + t * (1.0 / 24.0 + t * (1.0 / 120.0 + t * (1.0 / 720.0 + t / 5040.0)))))
             } else {
                 p / ((1.0 - p) * t) - 1.0
             }
@@ -17079,8 +17075,7 @@ impl DiscreteDistribution for LogSeries {
         for _ in 0..128 {
             let p = lower + 0.5 * (upper - lower);
             if p == lower || p == upper {
-                let p = if (mean_excess(lower) - target).abs()
-                    < (mean_excess(upper) - target).abs()
+                let p = if (mean_excess(lower) - target).abs() < (mean_excess(upper) - target).abs()
                 {
                     lower
                 } else {
@@ -18497,6 +18492,55 @@ impl ContinuousDistribution for Trapezoid {
             height * (1.0 - z) / (1.0 - self.d)
         };
         standard_pdf / self.scale
+    }
+
+    fn logpdf(&self, x: f64) -> f64 {
+        let difference = x - self.loc;
+        if difference < 0.0 || (difference.is_finite() && difference > self.scale) {
+            return f64::NEG_INFINITY;
+        }
+        let z = if difference.is_infinite() && x.is_finite() {
+            x / self.scale - self.loc / self.scale
+        } else {
+            difference / self.scale
+        };
+        if z.is_nan() {
+            return f64::NAN;
+        }
+        if !(0.0..=1.0).contains(&z) {
+            return f64::NEG_INFINITY;
+        }
+        let log_scale = self.scale.ln();
+        let log_height = std::f64::consts::LN_2 - (1.0 + self.d - self.c).ln() - log_scale;
+        if z < self.c {
+            // Form the logarithm before dividing: a finite observation can
+            // have a standardized value too small for an ordinary f64.
+            let log_fraction = if difference.is_finite() {
+                difference.ln() - log_scale
+            } else {
+                z.ln()
+            };
+            log_height + log_fraction - self.c.ln()
+        } else if z <= self.d {
+            log_height
+        } else {
+            let log_fraction = if difference.is_finite() {
+                (self.scale - difference).ln() - log_scale
+            } else {
+                (-z).ln_1p()
+            };
+            log_height + log_fraction - (-self.d).ln_1p()
+        }
+    }
+
+    /// Fit both plateau shapes, location, and scale by maximum likelihood.
+    ///
+    /// The ordered shape constraints and the sample's enclosing support are
+    /// enforced throughout the search. Deterministic starts include the
+    /// uniform and triangular boundary models. This is a local numerical MLE,
+    /// like `scipy.stats.trapezoid.fit`, not a global-optimum certificate.
+    fn try_fit(data: &[f64]) -> Result<Self, FitError> {
+        mle::trapezoid_mle(data)
     }
 
     fn cdf(&self, x: f64) -> f64 {
@@ -22673,7 +22717,10 @@ pub struct Zipfian {
 impl Zipfian {
     #[must_use]
     pub fn new(a: f64, n: u32) -> Self {
-        assert!(a >= 0.0 && a.is_finite(), "a must be nonnegative and finite");
+        assert!(
+            a >= 0.0 && a.is_finite(),
+            "a must be nonnegative and finite"
+        );
         assert!(n >= 1, "n must be at least 1");
         Self { a, n }
     }
@@ -22762,7 +22809,8 @@ impl Zipfian {
         }
         if log_moments(upper).0 > target {
             return Err(FitError::NonConvergent(
-                "Zipfian likelihood score could not be bracketed within its iteration budget".into(),
+                "Zipfian likelihood score could not be bracketed within its iteration budget"
+                    .into(),
             ));
         }
         let mut shape = lower + 0.5 * (upper - lower);
@@ -22947,10 +22995,14 @@ impl DiscreteDistribution for Zipfian {
     /// Use [`Zipfian::try_fit_with_n`] when the support endpoint is known.
     fn try_fit(data: &[i64]) -> Result<Self, FitError> {
         validate_discrete_fit_data(data)?;
-        let maximum = data.iter().copied().max().ok_or(FitError::InsufficientData {
-            required: 1,
-            actual: 0,
-        })?;
+        let maximum = data
+            .iter()
+            .copied()
+            .max()
+            .ok_or(FitError::InsufficientData {
+                required: 1,
+                actual: 0,
+            })?;
         let n = u32::try_from(maximum).map_err(|_| {
             FitError::UnsupportedData(
                 "Zipfian observations require an upper endpoint representable as u32".into(),
@@ -26686,6 +26738,16 @@ impl ContinuousDistribution for Landau {
     /// SciPy's `log(_pdf(z)) - log(scale)`.
     fn logpdf(&self, x: f64) -> f64 {
         log_probability(landau::landau_pdf((x - self.loc) / self.scale)) - self.scale.ln()
+    }
+
+    /// Maximum-likelihood location and scale, matching `scipy.stats.landau.fit`.
+    ///
+    /// Initialization uses quantiles, since Landau has no finite mean or
+    /// variance. Constant samples and samples whose minimum occurs in more
+    /// than half the observations have unbounded likelihood as scale tends
+    /// to zero; these return [`FitError::NonConvergent`].
+    fn try_fit(data: &[f64]) -> Result<Self, FitError> {
+        mle::landau_mle(data)
     }
 
     fn cdf(&self, x: f64) -> f64 {
@@ -87819,12 +87881,18 @@ mod tests {
         let fixed = Zipfian::try_fit_with_n(&sample, 30).unwrap();
         assert_eq!(fixed.n, 30);
         assert!((fixed.a - 1.851_682_467_267_154_3).abs() < 3.0e-14);
-        assert_eq!(Zipfian::try_fit(&[8, 9, 10]).unwrap(), Zipfian::new(0.0, 10));
+        assert_eq!(
+            Zipfian::try_fit(&[8, 9, 10]).unwrap(),
+            Zipfian::new(0.0, 10)
+        );
         assert_eq!(Zipfian::try_fit(&[1]).unwrap(), Zipfian::new(0.0, 1));
         let uniform = Zipfian::new(0.0, 4);
         assert_eq!(uniform.pmf(2), 0.25);
         assert_eq!(uniform.cdf(2), 0.5);
-        assert_eq!(RandInt::try_fit(&[-7, 3, 0, -2]).unwrap(), RandInt::new(-7, 4));
+        assert_eq!(
+            RandInt::try_fit(&[-7, 3, 0, -2]).unwrap(),
+            RandInt::new(-7, 4)
+        );
     }
 
     #[test]
