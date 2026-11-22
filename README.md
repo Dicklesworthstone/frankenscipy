@@ -88,15 +88,15 @@ Three other crates ship rule-based selectors that share the CASP name but not it
 
 ## Workspace at a Glance
 
-FrankenSciPy is a Cargo workspace of **19<!-- fact:crates --> crates** spanning ~738,000<!-- fact:total_src_lines --> lines under `crates/*/src` (implementation plus the inline `#[cfg(test)]` suites, which are the bulk of the larger crates; 10,921<!-- fact:all_tests --> `#[test]` functions in all, 8,494<!-- fact:inline_tests --> of them inline), plus 848<!-- fact:conf_test_files --> conformance integration-test files and the fixture tree in `fsci-conformance`. The line counts below are `wc -l` over each crate's `src/`, verified in CI by `scripts/readme_facts.py --check`.
+FrankenSciPy is a Cargo workspace of **19<!-- fact:crates --> crates** spanning ~753,000<!-- fact:total_src_lines --> lines under `crates/*/src` (implementation plus the inline `#[cfg(test)]` suites, which are the bulk of the larger crates; 11,458<!-- fact:all_tests --> `#[test]` functions in all, 8,856<!-- fact:inline_tests --> of them inline), plus 848<!-- fact:conf_test_files --> conformance integration-test files and the fixture tree in `fsci-conformance`. The line counts below are `wc -l` over each crate's `src/`, verified in CI by `scripts/readme_facts.py --check`.
 
 | Crate | Lines | Surface |
 |---|---|---|
 | [`fsci-linalg`](crates/fsci-linalg/) | ~72,600<!-- fact:src_lines_fsci_linalg --> | Dense and structured linear algebra; CASP solver selection; LU / QR / Cholesky / SVD / LDL / Schur / Hessenberg / QZ; `expm`, `logm`, `sqrtm`, `funm`, `signm`; Sylvester, Lyapunov, continuous and discrete Riccati; banded specialists; subspace and polar decompositions; **complex128** (`fsci_linalg::complex`): solve / lu / lu_factor / det / inv / cholesky / qr / hessenberg / schur / eig / eigvals / eigh / svd / lstsq / pinv / norm / expm / sqrtm / logm on complex matrices, and `logm_real` / `sqrtm_real` returning SciPy's complex result for a real matrix with a negative eigenvalue |
 | [`fsci-sparse`](crates/fsci-sparse/) | ~91,200<!-- fact:src_lines_fsci_sparse --> | CSR/CSC/COO/BSR/DIA/DOK/LIL formats; `spsolve`/`splu`/`spilu`; CG, GMRES (Arnoldi + Givens with adaptive restart tolerance), LGMRES, BiCG, BiCGSTAB, CGS, QMR, MINRES, LSQR, LSMR (with a rule-based iterative-solver selector); `eigs` via implicitly-restarted Krylov-Schur; `eigsh` via thick-restart Lanczos (Wu & Simon) over `ncv = min(n, max(2k+1, 20))`; `svds`; Dijkstra, Bellman-Ford, MST, BFS/DFS, connected components, PageRank, Reverse Cuthill-McKee, centrality |
-| [`fsci-integrate`](crates/fsci-integrate/) | ~43,200<!-- fact:src_lines_fsci_integrate --> | `solve_ivp` (RK23 / RK45 / DOP853 / BDF / Radau / LSODA); `odeint`; `solve_bvp` (collocation, as SciPy); `quad` as QUADPACK (qagse/qagie/qagpe and the weighted qawoe/qawfe/qawse/qawce); `dblquad`, `tplquad`, `nquad`, `cubature`; Romberg; Monte Carlo and QMC quadrature; sample-form rules |
+| [`fsci-integrate`](crates/fsci-integrate/) | ~50,200<!-- fact:src_lines_fsci_integrate --> | `solve_ivp` (RK23 / RK45 / DOP853 / BDF / Radau / LSODA); `odeint`; `solve_bvp` (collocation, as SciPy); `quad` as QUADPACK (qagse/qagie/qagpe and the weighted qawoe/qawfe/qawse/qawce); `dblquad`, `tplquad`, `nquad`, `cubature`; Romberg; Monte Carlo and QMC quadrature; sample-form rules |
 | [`fsci-interpolate`](crates/fsci-interpolate/) | ~28,100<!-- fact:src_lines_fsci_interpolate --> | `interp1d`, `CubicSpline`, `CubicHermiteSpline`, `BSpline`, `Akima`, `PCHIP`; `RegularGridInterpolator`, `griddata`, `interpn`; Krogh, barycentric, polynomial helpers; `make_lsq_spline` for k = 1/3/5 |
-| [`fsci-opt`](crates/fsci-opt/) | ~70,200<!-- fact:src_lines_fsci_opt --> | `minimize` methods: Nelder-Mead, BFGS, CG, Powell, L-BFGS-B, Newton-CG, TNC, SLSQP, trust-ncg, dogleg, trust-exact, trust-krylov, trust-constr (SLSQP takes equality/inequality constraints — dicts, `LinearConstraint`, `NonlinearConstraint` — and bounds through `MinimizeOptions`; so does trust-constr, which also takes `LinearConstraint` / `NonlinearConstraint` natively through `trust_constr_full`; COBYLA, the same constraints and bounds, also as `fmin_cobyla`); `root` family: brentq, brenth, ridder, toms748, newton, halley, secant, broyden1/2, anderson, fsolve, lm_root; `curve_fit`, `least_squares` (TRF and Dogbox with bounds, robust losses, parameter scales, analytic CSR Jacobians and grouped sparse finite differences through LSMR; LM; dense analytic Jacobians for all three methods); `lsq_linear_with_options` (bounded linear TRF with CSR or matrix-free LSMR), NNLS, isotonic regression; global: DE, basinhopping, dual annealing, SHGO, PSO, brute; LP/MILP; `linear_sum_assignment` |
+| [`fsci-opt`](crates/fsci-opt/) | ~74,200<!-- fact:src_lines_fsci_opt --> | `minimize` methods: Nelder-Mead, BFGS, CG, Powell, L-BFGS-B, Newton-CG, TNC, SLSQP, trust-ncg, dogleg, trust-exact, trust-krylov, trust-constr (SLSQP takes equality/inequality constraints — dicts, `LinearConstraint`, `NonlinearConstraint` — and bounds through `MinimizeOptions`; so does trust-constr, which also takes `LinearConstraint` / `NonlinearConstraint` natively through `trust_constr_full`; COBYLA, the same constraints and bounds, also as `fmin_cobyla`); `root` family: brentq, brenth, ridder, toms748, newton, halley, secant, broyden1/2, anderson, fsolve, lm_root; `curve_fit`, `least_squares` (TRF and Dogbox with bounds, robust losses, parameter scales, analytic CSR Jacobians and grouped sparse finite differences through LSMR; LM; dense analytic Jacobians for all three methods); `lsq_linear_with_options` (bounded linear TRF with CSR or matrix-free LSMR), NNLS, isotonic regression; global: DE, basinhopping, dual annealing, SHGO, PSO, brute; LP/MILP; `linear_sum_assignment` |
 | [`fsci-fft`](crates/fsci-fft/) | ~14,200<!-- fact:src_lines_fsci_fft --> | Mixed radix 2/3/4/5/7/11/13/17, direct DFT for primes ≤ 61, Rader and Bluestein for the rest; `rfft`/`irfft`; n-D transforms (`fftn`/`ifftn`/`rfftn`/`irfftn`); DCT/DST I–IV in 1-D, type II in n-D; Hilbert analytic signal; FHT; legacy `scipy.fftpack` pseudo-differential operators (`fftpack::diff`, `tilbert`, `itilbert`, `hilbert`, `ihilbert`, `cs_diff`, `sc_diff`, `ss_diff`, `cc_diff`, `shift`); plan cache keyed by (kind, shape, axes, normalization, real input) |
 | [`fsci-signal`](crates/fsci-signal/) | ~41,700<!-- fact:src_lines_fsci_signal --> | Windows (Hann, Hamming, Kaiser, Tukey, Blackman, Taylor, exponential, general-Hamming…); filter design (`butter` / `cheby1` / `cheby2` / `ellip` / `bessel`, ZPK and BA forms, full `lp2{lp,hp,bp,bs}` and `lp2{lp,hp,bp,bs}_zpk` transforms, `bilinear` / `bilinear_zpk`); filter-order helpers `buttord` / `cheb1ord` / `cheb2ord` / `ellipord`; analog prototypes `buttap` and `cheb1ap`; `firwin`, `firls`, `remez`; `lfilter`, `filtfilt`, SOS application; `welch`, `periodogram`, `csd`, `coherence`; `find_peaks` with SciPy's full condition set (height, threshold, distance, prominence, width, wlen, rel_height, plateau_size) and properties; CWT; Daubechies / Morlet / Ricker wavelets; MFCC, mel filterbank, chroma |
 | [`fsci-spatial`](crates/fsci-spatial/) | ~20,200<!-- fact:src_lines_fsci_spatial --> | KDTree / cKDTree (`query`, `query_pairs`, `count_neighbors`); `pdist` / `cdist` / `distance_matrix` (Euclidean, Manhattan, Chebyshev, Minkowski, Mahalanobis, Hausdorff, weighted variants); ConvexHull, Delaunay and Voronoi in 2-D; HalfspaceIntersection (full metadata in 2-D) |
@@ -118,15 +118,15 @@ For per-symbol parity assessment see [`docs/planning/FEATURE_PARITY.md`](docs/pl
 
 ## Quick Example
 
-Add the crates you need (published on crates.io at 0.4.0; the examples below use `fsci-runtime` for `RuntimeMode` and `SolverPortfolio`):
+Add the crates you need (published on crates.io at 0.5.0; the examples below use `fsci-runtime` for `RuntimeMode` and `SolverPortfolio`):
 
 ```toml
 [dependencies]
-fsci-runtime    = "0.4"
-fsci-linalg     = "0.4"
-fsci-stats      = "0.4"
-fsci-special    = "0.4"
-fsci-integrate  = "0.4"
+fsci-runtime    = "0.5"
+fsci-linalg     = "0.5"
+fsci-stats      = "0.5"
+fsci-special    = "0.5"
+fsci-integrate  = "0.5"
 ```
 
 To track `main` instead, use `{ git = "https://github.com/Dicklesworthstone/frankenscipy" }` for each crate.
@@ -661,7 +661,7 @@ V1.0 is gated on the following items. Items 2, 4 and 6 are complete; 1, 3, 5 and
 3. **CI that stays green.** The workflow was restructured on 2026-09-03 (`frankenscipy-liel6`); the first fully green fan-out was run [`34180840286`](https://github.com/Dicklesworthstone/frankenscipy/actions/runs/34180840286) on 2026-09-08 (43/43 jobs). Subsequent full fan-outs passed on 2026-09-25 ([`36123052714`](https://github.com/Dicklesworthstone/frankenscipy/actions/runs/36123052714), 45/45 jobs) and 2026-09-28 (`37116491361`, G3 green); sustaining streak stability is tracked under `frankenscipy-zbtht`.
 4. **Array API role decided (descoped from V1.0 blocker).** `fsci-arrayapi` serves as the reference backend-negotiation and broadcasting specification for conformance validation (`frankenscipy-0cxgm`); canonical container migration across domain crates is deferred post-V1.0 to preserve bit-identity and stability contracts.
 5. **Extend CASP beyond `fsci-linalg`.** Opt-in portfolio types exist for sparse, optimize, ODE and hypergeometric selection (`SparseSolverPortfolio`, `OptSolverPortfolio`, `OdeSolverPortfolio`, `HyperSolverPortfolio`). Audited entry points exist for dense solve (`solve_with_casp` / `solve_with_audit`), sparse (`spsolve_with_casp` / `spsolve_with_audit`), optimize (`minimize_with_casp_portfolio_and_audit`), ODE (`solve_ivp_with_casp_portfolio_and_audit`) and hypergeometric selection (`select_hypergeometric_branch_with_casp_and_audit`). The non-linalg portfolios' features are mostly caller-supplied, their loss matrices are hand-set, and no default entry point uses them; making them evidence-driven, empirically calibrated and auto-extracted is tracked under `frankenscipy-xzuno` and the `frankenscipy-7tb8d` epic (including `frankenscipy-7tb8d.3`). The strict/hardened split with `HARDENED_MAX_DIM` is real in `fsci-linalg` and in one entry point each of signal, ndimage, interpolate, spatial, cluster and io (see **Participating Crates**).
-6. **Tagged 0.x release with publish-to-crates.io workflow.** Completed with Git tag `v0.2.0`; all workspace crates (`fsci-linalg`, `fsci-sparse`, `fsci-opt`, `fsci-integrate`, `fsci-fft`, `fsci-special`, `fsci-runtime`, `fsci-stats`, etc.) are now published on crates.io at version `0.4.0` with full `#![forbid(unsafe_code)]` compliance.
+6. **Tagged 0.x release with publish-to-crates.io workflow.** Completed with Git tag `v0.2.0`; all workspace crates (`fsci-linalg`, `fsci-sparse`, `fsci-opt`, `fsci-integrate`, `fsci-fft`, `fsci-special`, `fsci-runtime`, `fsci-stats`, etc.) are now published on crates.io at version `0.5.0` with full `#![forbid(unsafe_code)]` compliance.
 7. **Converge the artifact topology.** Both the legacy `P2C-*` tree and the flat `FSCI-P2C-*` tree are present in `crates/fsci-conformance/fixtures/artifacts/`; migration is tracked under `frankenscipy-icmu7`.
 
 `optimize.direct`, `stats.CensoredData` and `stats.Covariance` are implemented. The open work toward V1.0 is tracked in beads labelled `reality-check-2026-09-23` (capstone `frankenscipy-tit1y`); run `bv --robot-triage` for the live picture.
@@ -1767,7 +1767,7 @@ The active beads tracker (`.beads/issues.jsonl`) is the internal-state-of-truth 
 
 ## Installation
 
-FrankenSciPy is pre-1.0. Every `fsci-*` crate is published on crates.io at 0.4.0 (tags `v0.1.0` through `v0.4.0`); `main` moves ahead of the last release, so use a Git dependency to track it.
+FrankenSciPy is pre-1.0. Every `fsci-*` crate is published on crates.io at 0.5.0 (tags `v0.1.0` through `v0.5.0`); `main` moves ahead of the last release, so use a Git dependency to track it.
 
 ### Prerequisites
 
@@ -1780,8 +1780,8 @@ FrankenSciPy is pre-1.0. Every `fsci-*` crate is published on crates.io at 0.4.0
 ```toml
 # Cargo.toml of your project
 [dependencies]
-fsci-linalg = "0.4"
-fsci-stats  = "0.4"
+fsci-linalg = "0.5"
+fsci-stats  = "0.5"
 ```
 
 ### Per-crate, as a Git dependency (tracks `main`)
@@ -1790,7 +1790,7 @@ fsci-stats  = "0.4"
 [dependencies]
 fsci-linalg = { git = "https://github.com/Dicklesworthstone/frankenscipy" }
 fsci-stats  = { git = "https://github.com/Dicklesworthstone/frankenscipy" }
-# or pin: { git = "...", tag = "v0.4.0" } / { git = "...", rev = "<commit-sha>" }
+# or pin: { git = "...", tag = "v0.5.0" } / { git = "...", rev = "<commit-sha>" }
 ```
 
 ### From source (workspace clone)
@@ -2069,7 +2069,7 @@ The `fsci-conformance` writer for `parity_report.{json,raptorq.json,decode_proof
 
 FrankenSciPy is pre-1.0. The following are intentional and tracked:
 
-- **Tagged release available.** The workspace is released at `0.4.0` across all crates on crates.io with strict `#![forbid(unsafe_code)]` enforcement.
+- **Tagged release available.** The workspace is released at `0.5.0` across all crates on crates.io with strict `#![forbid(unsafe_code)]` enforcement.
 - **Name coverage vs behavioural parity.** Across 33<!-- fact:census_modules --> `scipy.*` modules (`1,555`<!-- fact:census_scipy --> public symbols; `17`<!-- fact:census_na --> N/A; `1,538`<!-- fact:census_applicable --> applicable), `scripts/symbol_census.py` counts **`1,498`<!-- fact:census_declared --> declared (`97.4%`)**, **`1,531`<!-- fact:census_real --> real (`99.5%`)**, and **`904`<!-- fact:census_compared --> differentially compared (`58.8%`)** (see [`docs/planning/PARITY-COVERAGE.md`](docs/planning/PARITY-COVERAGE.md) and [`docs/planning/symbol_census.json`](docs/planning/symbol_census.json)). The 7 missing symbols are recorded in `docs/planning/census_dispositions.toml`. The earlier 1,300-symbol census listed `optimize.direct`, `stats.CensoredData` and `stats.Covariance` as residual focus areas; they are implemented and are not in that missing list.
 - **No GPU or distributed backends.** All kernels are single-process CPU.
 - **No FFI to BLAS / LAPACK.** All linear algebra is implemented in safe Rust; we lose hand-tuned-vendor-kernel performance for the largest matrices in exchange for memory safety and embeddability. Profile-first optimization closes this gap routine by routine.

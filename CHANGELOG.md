@@ -2,21 +2,56 @@
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-11-22
+
 ### Added
 
-- Sparse nonlinear least squares in `fsci-opt`: TRF and Dogbox accept analytic
-  CSR Jacobians through `LeastSquaresJacobian::new_sparse` and numerical
-  dependency patterns through `JacobianSparsity::from_rows` or `from_csr`.
-  Grouped two-point and three-point differences share residual evaluations
-  between independent columns, including bound-aware one-sided stencils.
-- Sparse Jacobians stay compressed through robust losses, parameter scaling,
-  active-variable selection, and LSMR trust-region subproblems. Automatic
-  solver selection uses Exact for dense Jacobians and LSMR for sparse ones.
-  CSR rows are normalized before use, including unsorted and duplicate entries.
-- Sparse derivatives integrate with weighted `curve_fit`. Diagonal weights
-  preserve CSR storage; full covariance whitening expands the numerical
-  dependency pattern and can make analytic derivatives dense. Parameter
-  covariance remains a dense output and requires a dense Jacobian copy.
+- **Sparse and matrix-free least squares in `fsci-opt`:**
+  - TRF and Dogbox accept analytic CSR Jacobians through
+    `LeastSquaresJacobian::new_sparse`, matrix-free Jacobian operators, and
+    numerical dependency patterns through `JacobianSparsity::from_rows` or
+    `from_csr`, with grouped two-point and three-point finite differences and
+    bound-aware one-sided stencils.
+  - Sparse Jacobians stay compressed through robust losses, parameter scaling,
+    active-variable selection, and LSMR trust-region subproblems, and integrate
+    with weighted `curve_fit` and bounded linear least squares
+    (`lsq_linear_with_options`, CSR or matrix-free LSMR).
+  - Least-squares iteration callbacks and cancellation support; bounded Dogbox
+    solver; parameter scales and dense analytic Jacobians across TRF, Dogbox,
+    and LM.
+- **Global & mixed-integer optimization in `fsci-opt`:**
+  - Mixed-integer differential evolution (`dbaf8d792`), semi-continuous and
+    semi-integer MILP variable domains (`ed68fc5b4`), and LP equilibration
+    preserving user units (`ba8c9c50d`).
+- **Sparse & banded ODE/IVP and quadrature in `fsci-integrate`:**
+  - Analytic and sparse Jacobians with sparse Newton factorizations in BDF and
+    Radau (`2564a5739`, `829f32298`, `615ac6afb`), compact banded Jacobians
+    and pivoted solves in LSODA (`f0ebdb34a`), and sparse-structure CASP
+    diagnostics (`86dcd5af8`).
+  - Callable `nquad` integration ranges and per-variable options (`084fef5c0`),
+    plus endpoint event ordering and dense-output event coverage.
+- **Expanded statistical estimation and UNU.RAN sampling in `fsci-stats`:**
+  - Maximum-likelihood fitting across continuous location-scale families,
+    censored observations (`f670fc661`), truncated normal / Weibull / Pareto
+    families, heavy-tailed and bounded-support families (Landau, trapezoid,
+    Rice, normal inverse Gaussian, beta-prime, logistic, ExponWeibull profile
+    MLE, Mielke profile MLE, Gompertz, generalized logistic, fixed-scale
+    Nakagami), and discrete families (`LogSeries`, `RandInt`, `Zipfian`, plus
+    `NchypergeomWallenius::try_fit_odds` for known urn dimensions; resolves
+    [#14](https://github.com/Dicklesworthstone/frankenscipy/issues/14)).
+  - UNU.RAN-style numerical inversion and ratio-of-uniforms samplers:
+    `FastGeneratorInversion`, `NumericalInversePolynomial`, and
+    `SimpleRatioUniforms`.
+- **Sparse linear algebra, ODR, and I/O:**
+  - `fsci-sparse`: SciPy LSMR controls and diagnostics (`1181cd6fc`), refined
+    `svds` smallest singular triplets (`7726a7e77`, `f194f4dc5`), 1-norm
+    condition estimate and transpose SPLU solve (`7034edf0d`), and stable
+    sparse grouping in COO addition (`bc756c5fb`).
+  - `fsci-odr`: implicit model fitting with constrained continuation
+    (`182d896b5`) and mixed-magnitude scaling preserving covariance units.
+  - `fsci-io`: NetCDF unlimited record variable read/write (`4c341fcb1`).
+  - `fsci-runtime`: opt-in `bench-harness` feature and recalibrated CASP solver
+    loss matrix with refreshed RaptorQ sidecar and decode proof.
 
 ### Changed (breaking)
 
@@ -27,6 +62,94 @@
   `TrustRegionSolver::Auto`. Dense inputs retain the previous Exact route.
   Explicit Exact and LM reject sparse Jacobians; LM also rejects numerical
   sparsity patterns. Struct literals can use `..Default::default()`.
+
+### Fixed
+
+- **Build, test, formatting, Clippy, and integrity gates ([#20](https://github.com/Dicklesworthstone/frankenscipy/issues/20)):**
+  - Fixed the five-family oracle comparator unit test in `fsci-conformance` and
+    aligned `diff_io_loadmat_corpus` (`ArffAttribute::name()`) and
+    `diff_stats_mstats_trimmed_mean` (`FastGeneratorInversion`,
+    `NumericalInversePolynomial`, `SimpleRatioUniforms`) with current crate APIs.
+  - Updated `FDistribution::logpdf_many` / `pdf_many` to match the log-space
+    `logpdf` / `pdf` formulation byte-for-byte, raised `kstwo_raw_moments_12`
+    global panel limit after `quad_vec`'s global-panel enforcement, added
+    tail-scaled interval refinement in `NumericalInverseHermite` with SciPy's
+    combined `min(abs, rel)` `x_error` metric in `FastGeneratorInversion::evaluate_error`,
+    and aligned stale `fsci-stats` (`Fisk`/`InverseGamma`/`InvWeibull` MLE,
+    `TruncWeibullMin` closed `[a, b]` support) and `fsci-integrate` Radau
+    sparse CSC LU unit/integration assertions with current SciPy 1.17.1 parity.
+  - Added SciPy 1.17.1's unit-zoom early exit (`gh-20999`) to
+    `fsci_ndimage::zoom` and aligned `fsci-ndimage` order-3 `Reflect` identity
+    metamorphic assertions with SciPy 1.17.1's `_init_causal_reflect` boundary
+    contract (`c2e093d0c`), while preserving exact `1e-12` identity checks for
+    `Mirror` (orders 0/1/3) and `Reflect` (orders 0/1).
+  - Updated `fsci-runtime` `calibrated_ranking_holds` for the recalibrated
+    `DiagonalFastPath` near-singular failure mass, aligned the
+    `FSCI-P2C-013` `ivp_solve_linear_growth_terminal_event` fixture and
+    `scipy_integrate_oracle.py` with `fd907a7d9` and SciPy 1.17.1's exact
+    terminal-event `t_eval` cutoff, refreshed the
+    `artifacts/casp-calibration-solver.json` RaptorQ sidecar, anchored
+    `diff_integrate_solve_ivp_dense_events.rs` in `tolerance_baseline.json`,
+    annotated all `status_literal_guard.py` convergence literals, updated
+    `README.md` fact counts, and cleared all `rustfmt` and `-D warnings` Clippy
+    lints across all 19 crates.
+- **High-concurrency `fsci-sparse` test deadlock ([#19](https://github.com/Dicklesworthstone/frankenscipy/issues/19)):**
+  - Removed the separate `BANDED_TOGGLE_LOCK` mutex and unified
+    `RestoreBandedToggle` under `PERF_TOGGLE_TEST_LOCK` (snapshotting and
+    restoring `SPLU_BANDED_ENABLE` strictly inside the lock), eliminating the
+    AB/BA lock-order inversion at `--test-threads=32`.
+- **Minimizer audit fingerprints ([#5](https://github.com/Dicklesworthstone/frankenscipy/issues/5)):**
+  - `feed_minimize_options` now hashes every field of `MinimizeMethodOptions`
+    with explicit option-presence flags, IEEE-754 bit fidelity, and row/column
+    framing for `initial_simplex` and `direc`.
+- **Workspace crates.io publisher ([#8](https://github.com/Dicklesworthstone/frankenscipy/issues/8)):**
+  - Rewrote `scripts/publish_crates_io.sh` to derive package names, versions,
+    and a leaves-first topological order from locked `cargo metadata`, verify
+    exact crates.io version presence, require verified publishing by default,
+    continue cleanly across all 19 crates, and emit a per-package summary.
+- **Numerical robustness across crates:**
+  - Dense fast-path solve certification (`1b9c5ec00`), Jacobi SVD scaling
+    (`bdf87c589`), Frechet derivative scaling (`c44c46be9`), global quadrature
+    error control and stable sampled Simpson/tanh-sinh integration (`61293f1ae`,
+    `2ccc36628`, `477efa9ab`, `df8e3a0eb`, `c7b336e11`), extreme-scale root
+    finding (`6bc448117`, `e69088208`), LSQR/LSMR scaling and stationarity
+    (`1f808c95a`, `81b747b5b`, `fb87df460`), and robust least-squares scaling
+    (`fabc9b03d`, `8c98147cf`, `c47e207d1`, `e4b4c022d`, `40899bb16`,
+    `ab6595534`).
+- **Dependencies and security audit:**
+  - Upgraded `asupersync` 0.6.2 -> 0.7.0, `ftui` 0.9.0 -> 0.11.0, `zip` 9.0.3
+    -> 9.8.1 (fixes `RUSTSEC-2026-0548`), `toml` 1.1.8 -> 1.2.2, `rand` 0.10.3
+    -> 0.10.4, `arbitrary` 1.4.2 -> 1.5.0 (in `fuzz/`), and refreshed
+    transitive lockfiles (`ctutils` 0.4.8 fixing `RUSTSEC-2026-0385`, `rustix`
+    1.1.6 fixing `RUSTSEC-2026-0486`, `chacha20` 0.10.2 replacing yanked
+    versions). Both root `Cargo.lock` and `fuzz/Cargo.lock` pass `cargo audit`
+    with 0 vulnerabilities and 0 warnings while preserving the default Linux
+    Tokio ban.
+
+### Known limits
+
+- **Platform dependencies:** registry metadata still includes a conditional
+  Tokio edge under `wasm-bindgen-futures`' unstable Emscripten configuration,
+  inactive on default Linux and macOS graphs
+  ([#15](https://github.com/Dicklesworthstone/frankenscipy/issues/15)).
+- **Earlier follow-up design work:** broader N-D geometry above dimension 8
+  ([#2](https://github.com/Dicklesworthstone/frankenscipy/issues/2)),
+  full scale-invariant `Covariance` decomposition parity
+  ([#3](https://github.com/Dicklesworthstone/frankenscipy/issues/3)),
+  high-dimensional extreme-concentration `VonMisesFisher` sampling
+  ([#4](https://github.com/Dicklesworthstone/frankenscipy/issues/4)),
+  configurable aggregate MAT memory policies
+  ([#6](https://github.com/Dicklesworthstone/frankenscipy/issues/6)),
+  `sha2` 0.11 formatting migration for optional perf/ELF probes
+  ([#9](https://github.com/Dicklesworthstone/frankenscipy/issues/9)),
+  documented exact/integer oracle contract for `chisquare`/Benford
+  ([#16](https://github.com/Dicklesworthstone/frankenscipy/issues/16)),
+  non-AVX-512 BLAS-order status differences in `diff_opt_cobyla_minimize` `hs7`
+  ([#17](https://github.com/Dicklesworthstone/frankenscipy/issues/17)),
+  `diff_sparse_lobpcg` review tracking
+  ([#18](https://github.com/Dicklesworthstone/frankenscipy/issues/18)),
+  and historical credential-owner revocation
+  ([#1](https://github.com/Dicklesworthstone/frankenscipy/issues/1)) remain open.
 
 ## [0.4.0] — 2026-10-14
 

@@ -23,7 +23,7 @@ neg_cmp_op_on_partial_ord = "allow"
 approx_constant = "allow"
 
 [dependencies]
-arbitrary = { version = "1.4.2", features = ["derive"] }
+arbitrary = { version = "1.5.0", features = ["derive"] }
 fsci-cluster = { path = "../crates/fsci-cluster" }
 fsci-conformance = { path = "../crates/fsci-conformance", default-features = false }
 fsci-datasets = { path = "../crates/fsci-datasets" }
@@ -41,9 +41,9 @@ fsci-special = { path = "../crates/fsci-special" }
 fsci-sparse = { path = "../crates/fsci-sparse" }
 fsci-stats = { path = "../crates/fsci-stats" }
 libfuzzer-sys = "0.4.13"
-rand = "0.10.1"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = { version = "1.0.149", features = ["preserve_order", "float_roundtrip"] }
+rand = "0.10.4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order", "float_roundtrip"] }
 
 [[bin]]
 name = "p2c001_validate_tol"
