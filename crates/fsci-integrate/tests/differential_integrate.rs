@@ -789,6 +789,94 @@ for kind in range(3):
     eprintln!("sampled Simpson: {compared} cases, 180 routine comparisons against SciPy 1.17.1");
 }
 
+/// A nonmonotonic grid can have a tiny net span despite large individual
+/// spacings. Compare relative errors so cancellation is not hidden by an
+/// absolute tolerance larger than the entire integral.
+#[test]
+fn sampled_simpson_retracing_scipy() {
+    use fsci_integrate::{cumulative_simpson, simpson, simpson_irregular};
+    use std::process::Command;
+
+    let python = std::env::var("FSCI_PYTHON")
+        .or_else(|_| std::env::var("SCIPY_PYTHON"))
+        .unwrap_or_else(|_| "python3".into());
+    let script = r#"
+import json
+import numpy as np
+import scipy
+from scipy.integrate import simpson
+assert scipy.__version__ == '1.17.1', scipy.__version__
+assert np.__version__ == '2.4.3', np.__version__
+delta = 2.**-50
+cases = []
+for kind in range(4):
+    t = np.array([0., 3., delta]) if kind < 3 else np.array([-1., 0., 3., delta])
+    values = t**kind if kind < 3 else np.array([0., 0., 0., delta])
+    for exponent in [-20, 0, 20]:
+        scale = 2.**exponent
+        for sign in [-1., 1.]:
+            for reversed in [False, True]:
+                x, y = sign*scale*t, values/scale
+                if reversed:
+                    x, y = x[::-1], y[::-1]
+                cases.append(dict(id=len(cases), kind=kind, exponent=exponent,
+                                  sign=sign, reversed=reversed, x=x.tolist(), y=y.tolist(),
+                                  expected=float(simpson(y, x=x))))
+print(json.dumps(dict(scipy=scipy.__version__, numpy=np.__version__, cases=cases)))
+"#;
+    let output = Command::new(&python)
+        .args(["-c", script])
+        .env("OPENBLAS_NUM_THREADS", "1")
+        .env("OMP_NUM_THREADS", "1")
+        .output();
+    let required = std::env::var("FSCI_REQUIRE_SCIPY_ORACLE").as_deref() == Ok("1");
+    let output = match output {
+        Ok(output) if output.status.success() => output,
+        other => {
+            assert!(!required, "required pinned SciPy oracle failed: {other:?}");
+            eprintln!("SKIP sampled_simpson_retracing_scipy: pinned oracle unavailable: {other:?}");
+            return;
+        }
+    };
+    let oracle: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("oracle emits JSON");
+    assert_eq!(oracle["scipy"].as_str(), Some("1.17.1"));
+    assert_eq!(oracle["numpy"].as_str(), Some("2.4.3"));
+    let cases = oracle["cases"].as_array().expect("oracle case list");
+    assert_eq!(cases.len(), 48, "every declared case must be compared");
+    for (index, case) in cases.iter().enumerate() {
+        assert_eq!(case["id"].as_u64(), Some(index as u64));
+        let x: Vec<_> = case["x"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_f64().unwrap())
+            .collect();
+        let y: Vec<_> = case["y"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_f64().unwrap())
+            .collect();
+        let expected = case["expected"].as_f64().unwrap();
+        assert!(expected.is_finite() && expected != 0.0, "{case}");
+        for (name, actual) in [
+            ("simpson", simpson(&y, &x).expect("finite grid").integral),
+            ("simpson_irregular", simpson_irregular(&y, &x)),
+        ] {
+            assert!(
+                actual.is_finite() && (actual / expected - 1.0).abs() <= 16.0 * f64::EPSILON,
+                "{name}: {actual:e} != {expected:e}, case={case}"
+            );
+        }
+        assert!(
+            cumulative_simpson(&y, &x).is_err(),
+            "cumulative Simpson requires increasing coordinates: {case}"
+        );
+    }
+    eprintln!("sampled Simpson retracing: 48 cases, 96 value comparisons against SciPy 1.17.1");
+}
+
 /// Exercise the public quadrature API against a required, versioned SciPy
 /// process. The large-scale references are evaluated in normalized coordinates
 /// so the oracle's own intermediate sum does not overflow.

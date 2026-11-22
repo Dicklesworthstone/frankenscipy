@@ -1482,7 +1482,15 @@ fn simpson_nonuniform_odd(y: &[f64], x: &[f64]) -> f64 {
             let scale = h0.abs().max(h1.abs());
             let u = h0 / scale;
             let v = h1 / scale;
-            let sum = u + v;
+            // On a retracing grid, subtract the original spacings before
+            // scaling: subtracting separately rounded u and v can erase a
+            // substantial fraction of the small net span. Same-sign widths
+            // are added after scaling so their sum cannot overflow.
+            let sum = if h0.is_sign_negative() == h1.is_sign_negative() {
+                u + v
+            } else {
+                (h0 + h1) / scale
+            };
             let weights = [
                 (sum / 6.0) * (2.0 - v / u),
                 (sum / 6.0) * (sum / u) * (sum / v),
@@ -3400,7 +3408,12 @@ fn cumulative_simpson_left_interval(y0: f64, y1: f64, y2: f64, h0: f64, h1: f64)
         let scale = h0.abs().max(h1.abs());
         let u = h0 / scale;
         let v = h1 / scale;
-        let fraction = u / (u + v);
+        let sum = if h0.is_sign_negative() == h1.is_sign_negative() {
+            u + v
+        } else {
+            (h0 + h1) / scale
+        };
+        let fraction = u / sum;
         let ratio = (u / v) * fraction;
         sampled_simpson_weighted_sum(
             h0,
@@ -3421,7 +3434,12 @@ fn cumulative_simpson_right_interval(y0: f64, y1: f64, y2: f64, h0: f64, h1: f64
         let scale = h0.abs().max(h1.abs());
         let u = h0 / scale;
         let v = h1 / scale;
-        let fraction = v / (u + v);
+        let sum = if h0.is_sign_negative() == h1.is_sign_negative() {
+            u + v
+        } else {
+            (h0 + h1) / scale
+        };
+        let fraction = v / sum;
         let ratio = (v / u) * fraction;
         sampled_simpson_weighted_sum(
             h1,
@@ -9080,6 +9098,65 @@ mod tests {
                     assert!(
                         (actual - expected).abs() <= 2e-13 * expected,
                         "{name}, scale={scale:e}, n={n}: {actual} != {expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn simpson_nearly_retracing_grids_preserve_small_spans() {
+        let delta = 2.0_f64.powi(-50);
+        let grid = [0.0, 3.0, delta];
+        for scale in [2.0_f64.powi(-500), 1.0, 2.0_f64.powi(500)] {
+            for degree in 0..=2 {
+                for sign in [-1.0, 1.0] {
+                    for reversed in [false, true] {
+                        let mut x: Vec<_> = grid.iter().map(|t| sign * scale * t).collect();
+                        let mut y: Vec<_> = grid.iter().map(|t| t.powi(degree) / scale).collect();
+                        let mut expected = sign * delta.powi(degree + 1) / f64::from(degree + 1);
+                        if reversed {
+                            x.reverse();
+                            y.reverse();
+                            expected = -expected;
+                        }
+                        // Simpson is exact for these polynomials. The small
+                        // integral must retain relative accuracy even though
+                        // the path almost returns to its starting point.
+                        for (name, actual) in [
+                            ("simpson", simpson(&y, &x).unwrap().integral),
+                            ("simpson_irregular", simpson_irregular(&y, &x)),
+                        ] {
+                            assert!(
+                                (actual / expected - 1.0).abs() <= 16.0 * f64::EPSILON,
+                                "{name}, degree={degree}, scale={scale:e}, sign={sign}, \
+                                 reversed={reversed}: {actual:e} != {expected:e}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn simpson_cartwright_handles_nearly_retracing_final_interval() {
+        let delta = 2.0_f64.powi(-50);
+        for scale in [2.0_f64.powi(-500), 1.0, 2.0_f64.powi(500)] {
+            for sign in [-1.0, 1.0] {
+                let x = [-sign * scale, 0.0, sign * scale * 3.0, sign * scale * delta];
+                let y = [0.0, 0.0, 0.0, delta / scale];
+                // The first panel contributes zero. Integrating the last
+                // ordinate's Lagrange basis on the final interval gives this
+                // expression without subtracting large nearly equal terms.
+                let expected = sign * (-1.5 - delta / 2.0 + delta * delta / 3.0);
+                for (name, actual) in [
+                    ("simpson", simpson(&y, &x).unwrap().integral),
+                    ("simpson_irregular", simpson_irregular(&y, &x)),
+                ] {
+                    assert!(
+                        (actual / expected - 1.0).abs() <= 16.0 * f64::EPSILON,
+                        "{name}, scale={scale:e}, sign={sign}: {actual:e} != {expected:e}"
                     );
                 }
             }
