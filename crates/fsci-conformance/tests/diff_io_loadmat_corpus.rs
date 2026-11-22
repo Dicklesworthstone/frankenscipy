@@ -1259,11 +1259,7 @@ fn diff_io_arff_and_wavfile() {
 
     let arff_text = "@relation sample\n@attribute x numeric\n@attribute y numeric\n@data\n1.5, -2.25\n3.0, 4.5\n";
     let parsed = read_arff(arff_text).expect("read_arff valid");
-    let attr_names: Vec<&str> = parsed
-        .attributes
-        .iter()
-        .map(|a: &ArffAttribute| a.name.as_str())
-        .collect();
+    let attr_names: Vec<&str> = parsed.attributes.iter().map(ArffAttribute::name).collect();
     let want_names: Vec<&str> = oracle["names"]
         .as_array()
         .expect("names")

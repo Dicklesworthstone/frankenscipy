@@ -426,33 +426,30 @@ fn implicit_jacobian_sparsity_reduces_rhs_calls_with_identical_solutions() {
             };
             let (dense, dense_calls) = run(None);
             let (grouped, grouped_calls) = run(Some(&pattern));
-            if method == SolverKind::Bdf {
-                // CSC LU changes the elimination order. Preserve every result
-                // field other than the trajectory bits, and admit only roundoff
-                // there; the independent analytical error bound below is unchanged.
-                assert_eq!(dense.t, grouped.t);
-                assert_eq!(dense.sol, grouped.sol);
-                assert_eq!(dense.t_events, grouped.t_events);
-                assert_eq!(dense.y_events, grouped.y_events);
-                assert_eq!(dense.message, grouped.message);
-                assert_eq!(dense.success, grouped.success);
-                assert_eq!(
-                    (dense.nfev, dense.njev, dense.nlu, dense.status),
-                    (grouped.nfev, grouped.njev, grouped.nlu, grouped.status)
-                );
-                let within_roundoff = |a: f64, b: f64| {
-                    (a - b).abs() <= 8.0 * f64::EPSILON * a.abs().max(b.abs()).max(1.0)
-                };
-                assert!(!within_roundoff(1.0, 1.0 + 32.0 * f64::EPSILON));
-                assert_eq!(dense.y.len(), grouped.y.len());
-                for (dense_row, sparse_row) in dense.y.iter().zip(&grouped.y) {
-                    assert_eq!(dense_row.len(), sparse_row.len());
-                    for (&a, &b) in dense_row.iter().zip(sparse_row) {
-                        assert!(within_roundoff(a, b), "dense={a}, sparse={b}");
-                    }
+            // Both BDF and Radau factor sparse Jacobians via CSC LU, which changes
+            // the elimination order. Preserve every result field other than the
+            // trajectory bits, and admit only roundoff there; the independent
+            // analytical error bound below is unchanged.
+            assert_eq!(dense.t, grouped.t);
+            assert_eq!(dense.sol, grouped.sol);
+            assert_eq!(dense.t_events, grouped.t_events);
+            assert_eq!(dense.y_events, grouped.y_events);
+            assert_eq!(dense.message, grouped.message);
+            assert_eq!(dense.success, grouped.success);
+            assert_eq!(
+                (dense.nfev, dense.njev, dense.nlu, dense.status),
+                (grouped.nfev, grouped.njev, grouped.nlu, grouped.status)
+            );
+            let within_roundoff = |a: f64, b: f64| {
+                (a - b).abs() <= 8.0 * f64::EPSILON * a.abs().max(b.abs()).max(1.0)
+            };
+            assert!(!within_roundoff(1.0, 1.0 + 32.0 * f64::EPSILON));
+            assert_eq!(dense.y.len(), grouped.y.len());
+            for (dense_row, sparse_row) in dense.y.iter().zip(&grouped.y) {
+                assert_eq!(dense_row.len(), sparse_row.len());
+                for (&a, &b) in dense_row.iter().zip(sparse_row) {
+                    assert!(within_roundoff(a, b), "{method:?}: dense={a}, sparse={b}");
                 }
-            } else {
-                assert_eq!(dense, grouped, "Radau retains dense Jacobian arithmetic");
             }
             assert!(
                 dense_calls - grouped_calls >= (n - pattern.group_count()) * grouped.njev,

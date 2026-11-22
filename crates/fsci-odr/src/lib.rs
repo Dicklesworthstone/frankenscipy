@@ -4182,12 +4182,14 @@ mod tests {
     #[test]
     fn implicit_circle_and_ellipse_match_live_scipy() -> Result<(), OdrError> {
         let required = std::env::var_os("FSCI_REQUIRE_SCIPY_ORACLE").is_some();
-        let python = match std::env::var_os("SCIPY_PYTHON") {
+        let python = match std::env::var_os("SCIPY_PYTHON")
+            .or_else(|| std::env::var_os("FSCI_PYTHON"))
+        {
             Some(path) => path,
             None if required => "python3".into(),
             None => {
                 eprintln!(
-                    "implicit ODR live oracle skipped: set SCIPY_PYTHON to enable the pinned comparison"
+                    "implicit ODR live oracle skipped: set SCIPY_PYTHON or FSCI_PYTHON to enable the pinned comparison"
                 );
                 return Ok(());
             }

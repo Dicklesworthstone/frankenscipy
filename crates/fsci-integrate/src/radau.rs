@@ -320,7 +320,7 @@ impl NewtonFactors {
                 if solution.iter().any(|v| !v.is_finite()) {
                     return false;
                 }
-                for (value, pair) in b.iter_mut().zip(solution.chunks_exact(2)) {
+                for (value, pair) in b.iter_mut().zip(solution.as_chunks::<2>().0) {
                     *value = Complex::new(pair[0], pair[1]);
                 }
                 true

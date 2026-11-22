@@ -10879,6 +10879,11 @@ pub fn zoom(
         ));
     }
 
+    if zoom_factors.iter().all(|&z| z == 1.0) {
+        // SciPy 1.17.1 early-exit (gh-20999): unit zoom with prefiltering returns a copy of input.
+        return Ok(input.clone());
+    }
+
     let new_shape: Vec<usize> = input
         .shape
         .iter()
@@ -25088,6 +25093,7 @@ mod van22_knob_read_is_per_transform {
     }
 
     #[test]
+    #[allow(clippy::excessive_precision)]
     fn rotate_order3_reflect_matches_scipy_1_17_1() {
         let arr = NdArray::new((0..25).map(|i| i as f64).collect(), vec![5, 5]).unwrap();
         let rot_30_false = [

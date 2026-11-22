@@ -7036,7 +7036,7 @@ fn one_sided_jacobi_svd_tall(
             }
         }
         if !rotated {
-            // A full sweep found every nonzero pair orthogonal to the relative tolerance.
+            // status: a full sweep found every nonzero pair orthogonal to the relative tolerance
             converged = true;
             break;
         }

@@ -315,32 +315,32 @@ fn validate_matrix_document(
             errors.push(format!("{label}:{tid}: invalid likelihood '{lik}'"));
         }
 
-        if let Some(mit) = tobj.get("mitigation").and_then(Value::as_str) {
-            if !mit.contains("status: undefended") {
-                match parse_defending_fn_ref(mit) {
-                    None => errors.push(format!(
-                        "{label}:{tid}: defended row mitigation must cite 'crates/<crate>/src/<file>.rs:<line> (<fn_name>)' or 'status: undefended'"
-                    )),
-                    Some((file_rel, line_no, fn_name)) => {
-                        let fpath = root.join(&file_rel);
-                        match fs::read_to_string(&fpath) {
-                            Err(_) => errors.push(format!(
-                                "{label}:{tid}: defending file '{file_rel}' does not exist"
-                            )),
-                            Ok(content) => {
-                                let line_count = content.lines().count();
-                                if line_no == 0 || line_no > line_count {
-                                    errors.push(format!(
-                                        "{label}:{tid}: line {line_no} out of range (1..={line_count}) in '{file_rel}'"
-                                    ));
-                                }
-                                let fn_pat1 = format!("fn {fn_name}(");
-                                let fn_pat2 = format!("fn {fn_name}<");
-                                if !content.contains(&fn_pat1) && !content.contains(&fn_pat2) {
-                                    errors.push(format!(
-                                        "{label}:{tid}: defending function '{fn_name}' not found in '{file_rel}'"
-                                    ));
-                                }
+        if let Some(mit) = tobj.get("mitigation").and_then(Value::as_str)
+            && !mit.contains("status: undefended")
+        {
+            match parse_defending_fn_ref(mit) {
+                None => errors.push(format!(
+                    "{label}:{tid}: defended row mitigation must cite 'crates/<crate>/src/<file>.rs:<line> (<fn_name>)' or 'status: undefended'"
+                )),
+                Some((file_rel, line_no, fn_name)) => {
+                    let fpath = root.join(&file_rel);
+                    match fs::read_to_string(&fpath) {
+                        Err(_) => errors.push(format!(
+                            "{label}:{tid}: defending file '{file_rel}' does not exist"
+                        )),
+                        Ok(content) => {
+                            let line_count = content.lines().count();
+                            if line_no == 0 || line_no > line_count {
+                                errors.push(format!(
+                                    "{label}:{tid}: line {line_no} out of range (1..={line_count}) in '{file_rel}'"
+                                ));
+                            }
+                            let fn_pat1 = format!("fn {fn_name}(");
+                            let fn_pat2 = format!("fn {fn_name}<");
+                            if !content.contains(&fn_pat1) && !content.contains(&fn_pat2) {
+                                errors.push(format!(
+                                    "{label}:{tid}: defending function '{fn_name}' not found in '{file_rel}'"
+                                ));
                             }
                         }
                     }

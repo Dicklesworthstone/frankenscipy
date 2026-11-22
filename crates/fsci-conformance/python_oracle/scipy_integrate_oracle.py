@@ -453,19 +453,6 @@ def _run_case(case: Dict[str, Any], integrate: Any, np: Any) -> Dict[str, Any]:
             else:
                 t_out = [float(v) for v in res.t.tolist()]
                 y_out = [[float(v) for v in row] for row in res.y.tolist()]
-                if (
-                    res.status == 1
-                    and t_eval is not None
-                    and len(t_out) < len(t_eval)
-                    and res.t_events
-                    and len(res.t_events[0]) > 0
-                ):
-                    t_ev = float(res.t_events[0][-1])
-                    y_ev = [float(v) for v in res.y_events[0][-1].tolist()]
-                    if abs(t_ev - t_eval[len(t_out)]) <= 1e-9:
-                        t_out.append(t_ev)
-                        for idx, val in enumerate(y_ev):
-                            y_out[idx].append(val)
             return _ok(
                 case_id,
                 "ivp_result",

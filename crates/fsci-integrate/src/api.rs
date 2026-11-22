@@ -3215,7 +3215,7 @@ mod tests {
             for reverse_registration in [false, true] {
                 // Two roots lie after the terminal event, including another terminal
                 // event. Registration order must not override integration order.
-                let mut cases = vec![
+                let mut cases = [
                     (EventSpec::new(after), None),
                     (EventSpec::terminal(at_half), Some(0.5)),
                     (

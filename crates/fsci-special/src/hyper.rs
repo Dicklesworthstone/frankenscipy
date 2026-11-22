@@ -3765,6 +3765,7 @@ fn hyp2f1_one_minus_z_near_integer(a: f64, b: f64, c: f64, z: f64, m: f64, eps: 
         let term = s_pow * coef * e_j;
         tail += term;
         if j > 2 && term.abs() <= 1.0e-17 * tail.abs() {
+            // status: paired series term fell below 1e-17 relative to accumulated tail
             converged = true;
             break;
         }

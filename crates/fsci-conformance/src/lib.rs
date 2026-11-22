@@ -26333,12 +26333,15 @@ Path(args.output).write_text(json.dumps(payload))
     #[test]
     fn f3gh7_five_family_oracle_comparators_use_captured_oracle_values_and_reject_drift() {
         use super::{
-            IntegrateArgs, IntegrateCase, IntegrateExpected, LinalgCase, LinalgExpectedOutcome,
-            OptimizeCase, OptimizeExpectedOutcome, OracleCaseOutput, SparseCase,
-            SparseExpectedOutcome, SpecialCase, SpecialCaseFunction, SpecialExpectedOutcome,
-            compare_integrate_case_against_oracle, compare_linalg_case_against_oracle,
-            compare_optimize_case_against_oracle, compare_sparse_case_against_oracle,
-            compare_special_case_against_oracle,
+            FixtureMatrixAssumption, IntegrateArgs, IntegrateCase, IntegrateExpected, LinalgCase,
+            LinalgExpectedOutcome, OptimizeCase, OptimizeExpectedOutcome, OptimizeRootObjective,
+            OracleCaseOutput, SparseCase, SparseExpectedOutcome, SparseInputFormat,
+            SparseOperation, SpecialArgument, SpecialCase, SpecialCaseFunction,
+            SpecialExpectedOutcome, compare_integrate_case_against_oracle,
+            compare_linalg_case_against_oracle, compare_optimize_case_against_oracle,
+            compare_sparse_case_against_oracle, compare_special_case_against_oracle,
+            execute_integrate_case, execute_linalg_case, execute_optimize_case,
+            execute_sparse_case, execute_special_case,
         };
 
         // 1. linalg: Solve case where embedded fixture expected is wrong (999.0),
@@ -26348,16 +26351,18 @@ Path(args.output).write_text(json.dumps(payload))
             mode: RuntimeMode::Strict,
             a: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
             b: vec![1.0, 2.0],
-            assume_a: fsci_linalg::AssumeA::Gen,
-            transposed: false,
-            check_finite: true,
-            lower: false,
+            assume_a: Some(FixtureMatrixAssumption::General),
+            transposed: Some(false),
+            check_finite: Some(true),
+            lower: Some(false),
             expected: LinalgExpectedOutcome::Vector {
                 values: vec![999.0, 999.0],
                 atol: 1.0e-12,
                 rtol: 1.0e-12,
+                expect_warning_ill_conditioned: None,
             },
         };
+        let linalg_observed = execute_linalg_case(&linalg_case);
         let linalg_oracle_ok = OracleCaseOutput {
             case_id: "f3gh7_linalg_solve".to_owned(),
             status: "ok".to_owned(),
@@ -26366,7 +26371,7 @@ Path(args.output).write_text(json.dumps(payload))
             error: None,
         };
         let (passed, msg, _, _) =
-            compare_linalg_case_against_oracle(&linalg_case, &linalg_oracle_ok);
+            compare_linalg_case_against_oracle(&linalg_case, &linalg_oracle_ok, &linalg_observed);
         assert!(passed, "linalg oracle comparator should pass: {msg}");
 
         let linalg_oracle_bad = OracleCaseOutput {
@@ -26374,7 +26379,7 @@ Path(args.output).write_text(json.dumps(payload))
             ..linalg_oracle_ok
         };
         let (passed, _, _, _) =
-            compare_linalg_case_against_oracle(&linalg_case, &linalg_oracle_bad);
+            compare_linalg_case_against_oracle(&linalg_case, &linalg_oracle_bad, &linalg_observed);
         assert!(
             !passed,
             "linalg oracle comparator must reject drifted oracle value"
@@ -26387,18 +26392,20 @@ Path(args.output).write_text(json.dumps(payload))
             category: "differential".to_owned(),
             mode: RuntimeMode::Strict,
             method: fsci_opt::RootMethod::Brentq,
-            objective: super::RootObjectiveKind::CubicMinusTwo,
+            objective: OptimizeRootObjective::CubicMinusTwo,
             bracket: [1.0, 2.0],
             xtol: Some(1.0e-12),
             rtol: Some(1.0e-12),
             maxiter: Some(100),
             expected: OptimizeExpectedOutcome::RootValue {
                 root: 999.0,
-                atol: 1.0e-9,
-                rtol: 1.0e-9,
+                atol: Some(1.0e-9),
+                rtol: Some(1.0e-9),
+                require_converged: Some(true),
                 contract_ref: None,
             },
         };
+        let opt_observed = execute_optimize_case(&opt_case);
         let opt_oracle_ok = OracleCaseOutput {
             case_id: "f3gh7_opt_root".to_owned(),
             status: "ok".to_owned(),
@@ -26406,35 +26413,43 @@ Path(args.output).write_text(json.dumps(payload))
             result: serde_json::json!({ "root": true_root, "converged": true }),
             error: None,
         };
-        let (passed, msg, _, _) = compare_optimize_case_against_oracle(&opt_case, &opt_oracle_ok);
+        let (passed, msg, _, _) =
+            compare_optimize_case_against_oracle(&opt_case, &opt_oracle_ok, &opt_observed);
         assert!(passed, "optimize oracle comparator should pass: {msg}");
 
         let opt_oracle_bad = OracleCaseOutput {
             result: serde_json::json!({ "root": true_root + 0.1, "converged": true }),
             ..opt_oracle_ok
         };
-        let (passed, _, _, _) = compare_optimize_case_against_oracle(&opt_case, &opt_oracle_bad);
+        let (passed, _, _, _) =
+            compare_optimize_case_against_oracle(&opt_case, &opt_oracle_bad, &opt_observed);
         assert!(
             !passed,
             "optimize oracle comparator must reject drifted oracle value"
         );
 
         // 3. sparse: spsolve case where embedded expected is [999.0, 999.0].
-        let sparse_case: SparseCase = serde_json::from_value(serde_json::json!({
-            "operation": "spsolve",
-            "case_id": "f3gh7_sparse_spsolve",
-            "mode": "Strict",
-            "shape": [2, 2],
-            "triplets": [[0, 0, 2.0], [1, 1, 4.0]],
-            "b": [2.0, 8.0],
-            "expected": {
-                "kind": "vector",
-                "values": [999.0, 999.0],
-                "atol": 1.0e-12,
-                "rtol": 1.0e-12
-            }
-        }))
-        .expect("deserialize sparse case");
+        let sparse_case = SparseCase {
+            case_id: "f3gh7_sparse_spsolve".to_owned(),
+            category: "differential".to_owned(),
+            mode: RuntimeMode::Strict,
+            operation: SparseOperation::Spsolve,
+            format: SparseInputFormat::Coo,
+            rows: 2,
+            cols: 2,
+            data: vec![2.0, 4.0],
+            row_indices: vec![0, 1],
+            col_indices: vec![0, 1],
+            rhs: Some(vec![2.0, 8.0]),
+            scalar: None,
+            k: None,
+            expected: SparseExpectedOutcome::Vector {
+                values: vec![999.0, 999.0],
+                atol: Some(1.0e-12),
+                rtol: Some(1.0e-12),
+            },
+        };
+        let sparse_observed = execute_sparse_case(&sparse_case);
         let sparse_oracle_ok = OracleCaseOutput {
             case_id: "f3gh7_sparse_spsolve".to_owned(),
             status: "ok".to_owned(),
@@ -26443,7 +26458,7 @@ Path(args.output).write_text(json.dumps(payload))
             error: None,
         };
         let (passed, msg, _, _) =
-            compare_sparse_case_against_oracle(&sparse_case, &sparse_oracle_ok);
+            compare_sparse_case_against_oracle(&sparse_case, &sparse_oracle_ok, &sparse_observed);
         assert!(passed, "sparse oracle comparator should pass: {msg}");
 
         let sparse_oracle_bad = OracleCaseOutput {
@@ -26451,7 +26466,7 @@ Path(args.output).write_text(json.dumps(payload))
             ..sparse_oracle_ok
         };
         let (passed, _, _, _) =
-            compare_sparse_case_against_oracle(&sparse_case, &sparse_oracle_bad);
+            compare_sparse_case_against_oracle(&sparse_case, &sparse_oracle_bad, &sparse_observed);
         assert!(
             !passed,
             "sparse oracle comparator must reject drifted oracle value"
@@ -26463,7 +26478,7 @@ Path(args.output).write_text(json.dumps(payload))
             category: "differential".to_owned(),
             mode: RuntimeMode::Strict,
             function: SpecialCaseFunction::Gamma,
-            args: vec![super::SpecialCaseArg::Scalar(5.0)],
+            args: vec![SpecialArgument::RealScalar(5.0)],
             expected: SpecialExpectedOutcome::Scalar {
                 value: 999.0,
                 atol: Some(1.0e-12),
@@ -26471,6 +26486,7 @@ Path(args.output).write_text(json.dumps(payload))
                 contract_ref: None,
             },
         };
+        let special_observed = execute_special_case(&special_case);
         let special_oracle_ok = OracleCaseOutput {
             case_id: "f3gh7_special_gamma".to_owned(),
             status: "ok".to_owned(),
@@ -26478,16 +26494,22 @@ Path(args.output).write_text(json.dumps(payload))
             result: serde_json::json!({ "value": 24.0 }),
             error: None,
         };
-        let (passed, msg, _, _) =
-            compare_special_case_against_oracle(&special_case, &special_oracle_ok);
+        let (passed, msg, _, _) = compare_special_case_against_oracle(
+            &special_case,
+            &special_oracle_ok,
+            &special_observed,
+        );
         assert!(passed, "special oracle comparator should pass: {msg}");
 
         let special_oracle_bad = OracleCaseOutput {
             result: serde_json::json!({ "value": 25.0 }),
             ..special_oracle_ok
         };
-        let (passed, _, _, _) =
-            compare_special_case_against_oracle(&special_case, &special_oracle_bad);
+        let (passed, _, _, _) = compare_special_case_against_oracle(
+            &special_case,
+            &special_oracle_bad,
+            &special_observed,
+        );
         assert!(
             !passed,
             "special oracle comparator must reject drifted oracle value"
@@ -26503,60 +26525,35 @@ Path(args.output).write_text(json.dumps(payload))
                 y: Some(vec![0.0, 2.0]),
                 x: Some(vec![0.0, 1.0]),
                 dx: None,
-                initial: None,
+                n: None,
+                func: None,
+                a: None,
+                b: None,
+                lower: None,
+                upper: None,
+                atol: None,
+                rtol: None,
+                first_step: None,
+                max_step: None,
+                max_subdivisions: None,
+                points: None,
                 rhs: None,
                 t_span: None,
                 y0: None,
-                t_eval: None,
-                dense_t_eval: None,
-                rtol: None,
-                atol: None,
-                first_step: None,
-                max_step: None,
-                n: None,
-                n_estimates: None,
-                n_points: None,
-                lower: None,
-                upper: None,
-                max_subdivisions: None,
-                epsabs: None,
-                epsrel: None,
-                limit: None,
-                integrand: None,
-                a: None,
-                b: None,
-                points: None,
-                events: None,
                 method: None,
-                jac_sparsity: None,
-                bc_kind: None,
-                x_mesh: None,
-                y_guess: None,
-                max_nodes: None,
-                ode_system: None,
-                t0: None,
-                t_bound: None,
-                max_steps: None,
-                gfun: None,
-                hfun: None,
-                qfun: None,
-                rfun: None,
-                ranges: None,
-                weight: None,
-                wvar: None,
-                wopts: None,
-                f_data: None,
+                t_eval: None,
+                event: None,
+                dense_t_eval: None,
             },
             expected: IntegrateExpected {
                 kind: "scalar".to_owned(),
                 value: Some(serde_json::json!(999.0)),
-                values: None,
-                error: None,
                 atol: Some(1.0e-12),
                 rtol: Some(1.0e-12),
                 contract_ref: "fsci_integrate::trapezoid".to_owned(),
             },
         };
+        let integrate_observed = execute_integrate_case(&integrate_case);
         let integrate_oracle_ok = OracleCaseOutput {
             case_id: "f3gh7_integrate_trapz".to_owned(),
             status: "ok".to_owned(),
@@ -26564,16 +26561,22 @@ Path(args.output).write_text(json.dumps(payload))
             result: serde_json::json!({ "value": 1.0 }),
             error: None,
         };
-        let (passed, msg, _, _) =
-            compare_integrate_case_against_oracle(&integrate_case, &integrate_oracle_ok);
+        let (passed, msg, _, _) = compare_integrate_case_against_oracle(
+            &integrate_case,
+            &integrate_oracle_ok,
+            &integrate_observed,
+        );
         assert!(passed, "integrate oracle comparator should pass: {msg}");
 
         let integrate_oracle_bad = OracleCaseOutput {
             result: serde_json::json!({ "value": 2.0 }),
             ..integrate_oracle_ok
         };
-        let (passed, _, _, _) =
-            compare_integrate_case_against_oracle(&integrate_case, &integrate_oracle_bad);
+        let (passed, _, _, _) = compare_integrate_case_against_oracle(
+            &integrate_case,
+            &integrate_oracle_bad,
+            &integrate_observed,
+        );
         assert!(
             !passed,
             "integrate oracle comparator must reject drifted oracle value"

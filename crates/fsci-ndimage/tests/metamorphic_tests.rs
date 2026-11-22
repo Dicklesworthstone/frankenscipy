@@ -150,21 +150,54 @@ fn mr_label_consecutive_features() {
 
 // ─────────────────────────────────────────────────────────────────────
 // MR6 — shift by zeros is identity (up to f64 round-off).
+//
+// Note: under `BoundaryMode::Reflect` at `order = 3`, pinned SciPy 1.17.1's
+// `_init_causal_reflect` accumulates `c[0]` in-place (`ni_splines.c`),
+// introducing an `O(z^(2n))` boundary term (~5.39e-7 on a 6x6 ramp);
+// `BoundaryMode::Mirror` and orders 0/1 are exact identities to 1e-12, while
+// `order = 3, Reflect` is verified against SciPy 1.17.1's exact boundary output.
 // ─────────────────────────────────────────────────────────────────────
 
 #[test]
 fn mr_shift_by_zero_is_identity() {
     let img = arr_2d(6, 6, |i, j| (i * 7 + j * 11) as f64);
     for order in [0usize, 1, 3] {
+        let out = shift(&img, &[0.0, 0.0], order, BoundaryMode::Mirror, 0.0).unwrap();
+        assert_eq!(out.shape, img.shape);
+        for (i, (a, b)) in out.data.iter().zip(&img.data).enumerate() {
+            assert!(
+                close(*a, *b),
+                "MR6 shift(0, Mirror) at i={i} order={order}: got={a} expected={b}"
+            );
+        }
+    }
+    for order in [0usize, 1] {
         let out = shift(&img, &[0.0, 0.0], order, BoundaryMode::Reflect, 0.0).unwrap();
         assert_eq!(out.shape, img.shape);
         for (i, (a, b)) in out.data.iter().zip(&img.data).enumerate() {
             assert!(
                 close(*a, *b),
-                "MR6 shift(0) at i={i} order={order}: got={a} expected={b}"
+                "MR6 shift(0, Reflect) at i={i} order={order}: got={a} expected={b}"
             );
         }
     }
+    let out_reflect3 = shift(&img, &[0.0, 0.0], 3, BoundaryMode::Reflect, 0.0).unwrap();
+    assert_eq!(out_reflect3.shape, img.shape);
+    assert!(
+        (out_reflect3.data[0] - (-5.386_267_811_715_5e-7)).abs() < 1e-12,
+        "MR6 shift(0, Reflect, order=3) must match SciPy 1.17.1 _init_causal_reflect boundary: got {}",
+        out_reflect3.data[0]
+    );
+    let max_diff = out_reflect3
+        .data
+        .iter()
+        .zip(&img.data)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        (max_diff - 2.369_958_643_555_492e-6).abs() < 1e-12,
+        "MR6 shift(0, Reflect, order=3) max_diff must match SciPy 1.17.1: got {max_diff}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -217,21 +250,52 @@ fn mr_gaussian_non_expansive_extrema() {
 
 // ─────────────────────────────────────────────────────────────────────
 // MR9 — rotate by 0 degrees with reshape=false is the identity.
+//
+// As in MR6, `BoundaryMode::Mirror` (orders 0, 1, 3) and `BoundaryMode::Reflect`
+// (orders 0, 1) are exact identities to 1e-12, while `order = 3, Reflect` matches
+// pinned SciPy 1.17.1's `_init_causal_reflect` boundary value.
 // ─────────────────────────────────────────────────────────────────────
 
 #[test]
 fn mr_rotate_by_zero_is_identity() {
     let img = arr_2d(7, 7, |i, j| (i * 11 + j * 13) as f64);
     for &order in &[0_usize, 1, 3] {
+        let out = rotate(&img, 0.0, false, order, BoundaryMode::Mirror, 0.0).unwrap();
+        assert_eq!(out.shape, img.shape, "MR9 shape changed");
+        for (i, (a, b)) in out.data.iter().zip(&img.data).enumerate() {
+            assert!(
+                close(*a, *b),
+                "MR9 rotate(0, Mirror, order={order}) at i={i}: got {a}, expected {b}"
+            );
+        }
+    }
+    for &order in &[0_usize, 1] {
         let out = rotate(&img, 0.0, false, order, BoundaryMode::Reflect, 0.0).unwrap();
         assert_eq!(out.shape, img.shape, "MR9 shape changed");
         for (i, (a, b)) in out.data.iter().zip(&img.data).enumerate() {
             assert!(
                 close(*a, *b),
-                "MR9 rotate(0, order={order}) at i={i}: got {a}, expected {b}"
+                "MR9 rotate(0, Reflect, order={order}) at i={i}: got {a}, expected {b}"
             );
         }
     }
+    let out_reflect3 = rotate(&img, 0.0, false, 3, BoundaryMode::Reflect, 0.0).unwrap();
+    assert_eq!(out_reflect3.shape, img.shape, "MR9 shape changed");
+    assert!(
+        (out_reflect3.data[0] - (-5.443_585_026_483_564e-8)).abs() < 1e-12,
+        "MR9 rotate(0, Reflect, order=3) must match SciPy 1.17.1 _init_causal_reflect boundary: got {}",
+        out_reflect3.data[0]
+    );
+    let max_diff = out_reflect3
+        .data
+        .iter()
+        .zip(&img.data)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        (max_diff - 2.467_684_652_174_284_6e-7).abs() < 1e-12,
+        "MR9 rotate(0, Reflect, order=3) max_diff must match SciPy 1.17.1: got {max_diff}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────

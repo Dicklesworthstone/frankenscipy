@@ -3541,10 +3541,10 @@ impl DeEndpointTail {
                 self.next = self.nearest;
                 self.nearest = Some((distance, magnitude));
             }
-            Some((nearest, _)) if distance > nearest => {
-                if self.next.is_none_or(|(next, _)| distance < next) {
-                    self.next = Some((distance, magnitude));
-                }
+            Some((nearest, _))
+                if distance > nearest && self.next.is_none_or(|(next, _)| distance < next) =>
+            {
+                self.next = Some((distance, magnitude));
             }
             _ => {}
         }
@@ -3592,10 +3592,10 @@ impl DeTransformedTail {
                 self.next = self.outer;
                 self.outer = Some((distance, magnitude));
             }
-            Some((outer, _)) if distance < outer => {
-                if self.next.is_none_or(|(next, _)| distance > next) {
-                    self.next = Some((distance, magnitude));
-                }
+            Some((outer, _))
+                if distance < outer && self.next.is_none_or(|(next, _)| distance > next) =>
+            {
+                self.next = Some((distance, magnitude));
             }
             _ => {}
         }

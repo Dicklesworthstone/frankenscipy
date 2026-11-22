@@ -271,7 +271,7 @@ enum NewtonFactor {
     /// `I − c·J` is exactly banded: GEPP restricted to the band (see [`BandedLu`]).
     Banded(BandedLu),
     /// A user-supplied or numerically computed sparse Jacobian stays sparse.
-    Sparse(SparseLuFactorization),
+    Sparse(Box<SparseLuFactorization>),
     /// Singular or overflowing sparse Newton systems request the normal Jacobian
     /// refresh / step reduction, without allocating a dense fallback.
     SparseUnusable,
@@ -1122,7 +1122,7 @@ impl BdfSolver {
                             ) {
                                 Ok(factor) => {
                                     self.sparse_factorizations += 1;
-                                    NewtonFactor::Sparse(factor)
+                                    NewtonFactor::Sparse(Box::new(factor))
                                 }
                                 Err(
                                     SparseError::SingularMatrix { .. }

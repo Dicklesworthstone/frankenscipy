@@ -1279,19 +1279,25 @@ fn portfolio_default_loss_matrix_shape() {
     }
 }
 
-/// The ranking the calibration measured (frankenscipy-7tb8d.2), state by state: LU no costlier
-/// than QR, QR cheaper than the SVD, the diagonal and triangular fast paths no costlier than
-/// LU, and every loss at least its action's flop cost (LU 1, QR 2, SVD 31.5).
+/// The ranking the calibration measured (frankenscipy-7tb8d.2 and the recalibration in
+/// `artifacts/casp-calibration-solver.json`), state by state: LU no costlier than QR, QR cheaper
+/// than the SVD, the triangular and symmetric fast paths no costlier than LU, the diagonal fast
+/// path no costlier than LU on well/moderate/ill-conditioned matrices while carrying its measured
+/// near-singular failure mass between LU and SVD, and every loss at least its action's flop cost
+/// (LU 1, QR 2, SVD 31.5).
 fn calibrated_ranking_holds(m: &[[f64; 4]; 6]) -> bool {
     (0..4).all(|s| {
         m[0][s] <= m[1][s]
             && m[1][s] < m[2][s]
-            && m[3][s] <= m[0][s]
             && m[4][s] <= m[0][s]
+            && m[5][s] <= m[0][s]
             && m[0][s] >= 1.0
             && m[1][s] >= 2.0
             && m[2][s] >= 31.5
-    }) && m.iter().flatten().all(|v| v.is_finite() && *v >= 0.0)
+    }) && (0..3).all(|s| m[3][s] <= m[0][s])
+        && m[3][3] > m[0][3]
+        && m[3][3] < m[2][3]
+        && m.iter().flatten().all(|v| v.is_finite() && *v >= 0.0)
 }
 
 #[test]

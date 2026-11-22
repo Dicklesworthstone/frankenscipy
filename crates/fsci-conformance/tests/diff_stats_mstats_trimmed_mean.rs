@@ -358,26 +358,26 @@ fn diff_stats_sampling_unuran() {
 
     let fgi = FastGeneratorInversion::new(Normal::standard(), Some((-3.0, 3.0))).expect("fgi");
     for (u, want) in oracle.us.iter().zip(&oracle.fgi_ppf) {
-        let got = fgi.ppf(*u).expect("fgi ppf");
+        let got = fgi.ppf(*u);
         let pass = (got - want).abs() <= 1e-6;
         ledger.compared("FastGeneratorInversion", &format!("u={u}"), pass);
     }
 
     let pinv = NumericalInversePolynomial::new(
         |x: f64| (-0.5 * x * x).exp(),
-        Some(0.0),
+        0.0,
         Some((-5.0, 5.0)),
         5,
         1e-10,
     )
     .expect("pinv");
     for (u, want) in oracle.us.iter().zip(&oracle.pinv_ppf) {
-        let got = pinv.ppf(*u).expect("pinv ppf");
+        let got = pinv.ppf(*u);
         let pass = (got - want).abs() <= 1e-5;
         ledger.compared("NumericalInversePolynomial", &format!("ppf_u={u}"), pass);
     }
     for (x, want) in oracle.xs.iter().zip(&oracle.pinv_cdf) {
-        let got = pinv.cdf(*x).expect("pinv cdf");
+        let got = pinv.cdf(*x);
         let pass = (got - want).abs() <= 1e-5;
         ledger.compared("NumericalInversePolynomial", &format!("cdf_x={x}"), pass);
     }
@@ -389,15 +389,9 @@ fn diff_stats_sampling_unuran() {
         Some(0.5),
     )
     .expect("sru");
-    let mut rng_state = 12345_u64;
-    let samples = sru
-        .sample(4000, &mut || {
-            rng_state = rng_state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            ((rng_state >> 11) as f64) / ((1u64 << 53) as f64)
-        })
-        .expect("sru sample");
+    use rand::SeedableRng;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(12345);
+    let samples = sru.sample(4000, &mut rng).expect("sru sample");
     let mean = samples.iter().sum::<f64>() / (samples.len() as f64);
     let var =
         samples.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / ((samples.len() - 1) as f64);
@@ -413,10 +407,8 @@ fn diff_stats_sampling_unuran() {
         (std - oracle.sru_std).abs() <= 0.1,
     );
 
-    let zero_res =
-        NumericalInversePolynomial::new(|_: f64| 0.0, Some(0.0), Some((-1.0, 1.0)), 5, 1e-10);
-    let err_matches =
-        oracle.unuran_err && matches!(zero_res, Err(StatsError::InvalidArgument { .. }));
+    let zero_res = NumericalInversePolynomial::new(|_: f64| 0.0, 0.0, Some((-1.0, 1.0)), 5, 1e-10);
+    let err_matches = oracle.unuran_err && matches!(zero_res, Err(StatsError::InvalidArgument(_)));
     ledger.compared("UNURANError", "zero_pdf", err_matches);
 
     ledger.finish(1);

@@ -3979,6 +3979,7 @@ mod tests {
     /// - At `t = 0`: 3 unrecovered exceedances -> `(3 + 1) / 20 = 0.20 > 0.10`.
     /// - At `t = 1e-12`: 2 unrecovered exceedances (`1e-8`, `1e-4`) -> `(2 + 1) / 20 = 0.15 > 0.10`.
     /// - At `t = 1e-8`: 1 unrecovered exceedance (`1e-4`) -> `(1 + 1) / 20 = 0.10 <= 0.10`.
+    ///
     /// Hence `t_hat = 1e-8` and `Rhat_19(t_hat) = 1 / 19` exactly.
     #[test]
     fn crc_threshold_selection_matches_hand_computed_n19_alpha01() {

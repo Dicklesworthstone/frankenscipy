@@ -4,8 +4,7 @@
 //! Set FSCI_REQUIRE_SCIPY_ORACLE=1 to require pinned SciPy 1.17.1 / NumPy 2.4.3.
 
 use fsci_opt::{
-    LeastSquaresMatrix, LinearLeastSquaresOptions, OptError, lsq_linear,
-    lsq_linear_with_options,
+    LeastSquaresMatrix, LinearLeastSquaresOptions, OptError, lsq_linear, lsq_linear_with_options,
 };
 use fsci_sparse::{CsrMatrix, DenseLinearOperator, LinearOperator, Shape2D, SparseResult};
 
@@ -247,7 +246,13 @@ fn linear_trf_reports_limits_and_rejects_invalid_or_partial_products() {
 
     let partial = LeastSquaresMatrix::from_operator(PartialProduct);
     assert!(matches!(
-        lsq_linear_with_options(&partial, &[1.0; 2], &[0.0; 2], &[1.0; 2], Default::default()),
+        lsq_linear_with_options(
+            &partial,
+            &[1.0; 2],
+            &[0.0; 2],
+            &[1.0; 2],
+            Default::default()
+        ),
         Err(OptError::NonFiniteInput { .. })
     ));
 }
@@ -340,7 +345,13 @@ fn linear_trf_sparse_and_operator_against_live_scipy() {
                 .map(|i| 3.0 * ((i + seed + 1) as f64 * 0.71).cos())
                 .collect(),
             lower: (0..n)
-                .map(|j| if (j + seed) % 3 == 0 { None } else { Some(-0.2) })
+                .map(|j| {
+                    if (j + seed) % 3 == 0 {
+                        None
+                    } else {
+                        Some(-0.2)
+                    }
+                })
                 .collect(),
             upper: (0..n)
                 .map(|j| if (j + seed) % 4 == 0 { None } else { Some(0.6) })
@@ -389,8 +400,7 @@ print(json.dumps(dict(scipy=scipy.__version__, numpy=np.__version__, rows=rows),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let oracle: Oracle =
-        serde_json::from_slice(&output.stdout).expect("linear TRF reference JSON");
+    let oracle: Oracle = serde_json::from_slice(&output.stdout).expect("linear TRF reference JSON");
     if required {
         assert_eq!((&*oracle.scipy, &*oracle.numpy), ("1.17.1", "2.4.3"));
     }
@@ -448,19 +458,13 @@ print(json.dumps(dict(scipy=scipy.__version__, numpy=np.__version__, rows=rows),
                 );
                 if case.unique {
                     assert!(
-                        (value - reference.x[j]).abs()
-                            < 2e-6 * (1.0 + reference.x[j].abs()),
+                        (value - reference.x[j]).abs() < 2e-6 * (1.0 + reference.x[j].abs()),
                         "{}[{representation}][{j}]: {value:e} != {:e}",
                         case.name,
                         reference.x[j]
                     );
                 }
-                let gradient: f64 = case
-                    .a
-                    .iter()
-                    .zip(&fit.fun)
-                    .map(|(row, r)| row[j] * r)
-                    .sum();
+                let gradient: f64 = case.a.iter().zip(&fit.fun).map(|(row, r)| row[j] * r).sum();
                 let violation = if value <= lower[j] + 1e-7 {
                     -gradient
                 } else if value >= upper[j] - 1e-7 {

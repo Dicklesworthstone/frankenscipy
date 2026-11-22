@@ -6495,7 +6495,9 @@ pub fn read_netcdf_classic(bytes: &[u8]) -> Result<NetcdfFile, IoError> {
         for (header, layout) in variable_headers.iter().zip(&layouts) {
             if !layout.is_record {
                 let fixed_end = header.begin.checked_add(layout.padded_len).ok_or_else(|| {
-                    IoError::InvalidFormat("NetCDF fixed payload offset overflowed usize".to_string())
+                    IoError::InvalidFormat(
+                        "NetCDF fixed payload offset overflowed usize".to_string(),
+                    )
                 })?;
                 // Classic writers ordinarily put fixed data before records,
                 // but SciPy can put a scalar after the complete record area.

@@ -11,8 +11,8 @@
 use crate::OptError;
 use crate::lsq_matrix::LeastSquaresMatrix;
 use crate::trf::{
-    build_quadratic_1d, cl_scaling_vector, evaluate_quadratic, find_active_constraints,
-    in_bounds, make_strictly_feasible, minimize_quadratic_1d, step_size_to_bound,
+    build_quadratic_1d, cl_scaling_vector, evaluate_quadratic, find_active_constraints, in_bounds,
+    make_strictly_feasible, minimize_quadratic_1d, step_size_to_bound,
 };
 use crate::trf_lsmr::AugmentedJacobian;
 use fsci_runtime::RuntimeMode;
@@ -100,7 +100,9 @@ fn optimality(x: &[f64], g: &[f64], lb: &[f64], ub: &[f64]) -> Result<f64, OptEr
     let (v, _) = cl_scaling_vector(x, g, lb, ub);
     let scaled: Vec<f64> = g.iter().zip(v).map(|(gi, vi)| gi * vi).collect();
     finite(&scaled, "scaled gradient")?;
-    Ok(scaled.iter().fold(0.0_f64, |acc, value| acc.max(value.abs())))
+    Ok(scaled
+        .iter()
+        .fold(0.0_f64, |acc, value| acc.max(value.abs())))
 }
 
 /// Reflect into each interval. At extreme ranges where the period is not
@@ -243,7 +245,9 @@ pub fn lsq_linear_with_options(
     let (m, n) = (shape.rows, shape.cols);
     if m == 0 || b.len() != m || lb.len() != n || ub.len() != n || m.checked_add(n).is_none() {
         return Err(OptError::InvalidArgument {
-            detail: String::from("lsq_linear: A must have rows and consistent A/b/bounds dimensions"),
+            detail: String::from(
+                "lsq_linear: A must have rows and consistent A/b/bounds dimensions",
+            ),
         });
     }
     if let Some(rows) = a.as_dense()
@@ -360,9 +364,7 @@ pub fn lsq_linear_with_options(
                 let actual_step: Vec<f64> =
                     trial.iter().zip(&x).map(|(new, old)| new - old).collect();
                 let reduction = -evaluate_quadratic(a, &g, &actual_step, None)?;
-                if reduction.is_finite()
-                    && reduction > 0.0
-                    && actual_step.iter().any(|s| *s != 0.0)
+                if reduction.is_finite() && reduction > 0.0 && actual_step.iter().any(|s| *s != 0.0)
                 {
                     accepted = Some((trial, reduction));
                     break;

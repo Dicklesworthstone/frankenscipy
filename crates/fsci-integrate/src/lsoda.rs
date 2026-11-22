@@ -1853,7 +1853,6 @@ mod tests {
         solver.el0 = 1.0;
         solver.ewt.fill(1.0);
         solver.y.fill(1.0);
-        solver.yh[..n].fill(1.0);
         let mut calls = 0;
         let mut rhs = |_t: f64, y: &[f64]| {
             calls += 1;
@@ -1865,6 +1864,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
+        solver.yh[..n].fill(1.0);
         solver.savf = rhs(0.0, &solver.y);
         solver.prja(&mut rhs).unwrap();
         assert_eq!(calls, 4, "one baseline plus three disjoint column groups");
