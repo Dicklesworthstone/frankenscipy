@@ -3692,6 +3692,9 @@ fn de_weighted_term(h: f64, jac: f64, fx: f64) -> f64 {
 /// `node(t)` maps a quadrature parameter `t ∈ ℝ` to `Some((x, jac))` — the
 /// abscissa `x` and the full weight `jac = (dx/dt)·W(t)` — or `None` when the
 /// node has run off the (possibly infinite) interval and should be skipped.
+/// `endpoints` names finite endpoints in transformed-tail order (`t → -∞`,
+/// `t → +∞`), not physical left-to-right order. In particular, mirrored
+/// exp-sinh approaches its finite upper endpoint as `t → -∞`.
 /// Integral ≈ `h · Σ_j jac_j · f(x_j)`. Abscissae are reused across levels
 /// (halving the step only adds odd indices). The inter-level error estimate is
 /// bounded below by roundoff and the outermost retained terms, so a stable
@@ -3804,14 +3807,19 @@ where
         };
         let roundoff =
             (f64::EPSILON * sum.absolute).max(if cur == 0.0 { 0.0 } else { f64::from_bits(1) });
-        last_err = last_err
-            .max(roundoff)
-            .max(sum.outer_terms[0])
-            .max(sum.outer_terms[1])
-            .max(sum.endpoints[0].error())
-            .max(sum.endpoints[1].error())
-            .max(sum.transformed_tails[0].error())
-            .max(sum.transformed_tails[1].error());
+        // The three indicators on one side estimate the same omitted tail,
+        // so keep their maximum. The two sides are disjoint contributions:
+        // their absolute errors add, even when the retained sums have stopped
+        // changing. Taking one maximum across both can certify half of the
+        // actual missing mass for two same-sign endpoint singularities.
+        let tail_error: f64 = (0..2)
+            .map(|side| {
+                sum.outer_terms[side]
+                    .max(sum.endpoints[side].error())
+                    .max(sum.transformed_tails[side].error())
+            })
+            .sum();
+        last_err = last_err.max(roundoff).max(tail_error);
         if level >= 2 && last_err.is_finite() && last_err <= atol + rtol * cur.abs() {
             return QuadResult {
                 integral: cur,
@@ -3964,7 +3972,7 @@ where
             }
             Some((x, jac))
         };
-        de_quadrature(&f, &node, [None, Some(hi)], atol, rtol, max_level)
+        de_quadrature(&f, &node, [Some(hi), None], atol, rtol, max_level)
     } else if lo == f64::NEG_INFINITY && hi == f64::INFINITY {
         // Doubly-infinite (−∞, ∞): sinh-sinh, x = sinh((π/2)·sinh t).
         let node = |t: f64| -> Option<(f64, f64)> {
@@ -8602,6 +8610,54 @@ mod tests {
                 result.error >= actual_error,
                 "{result:?}, error={actual_error}"
             );
+        }
+    }
+
+    #[test]
+    fn tanhsinh_two_unresolved_endpoint_tails_are_additive() {
+        // Each endpoint loses about 69.7 for exponent -0.99, or 964.6 for
+        // -0.999. The old maximum certified atol=100 / 1000 even though
+        // the total missing mass was about 138.6 / 1928.0, respectively.
+        for (exponent, atol) in [(-0.99_f64, 100.0), (-0.999, 1000.0)] {
+            let exact = 2.0 / (1.0 + exponent);
+            for (a, b, sign) in [(1.0, 2.0, 1.0), (2.0, 1.0, -1.0)] {
+                let result = tanhsinh(
+                    |x| (x - 1.0).powf(exponent) + (2.0 - x).powf(exponent),
+                    a,
+                    b,
+                    atol,
+                    1e-12,
+                    10,
+                );
+                let actual_error = (result.integral - sign * exact).abs();
+                assert!(actual_error > atol, "must exercise both unresolved tails");
+                assert!(!result.converged, "exponent={exponent}: {result:?}");
+                assert!(result.integral.is_finite() && result.error.is_finite());
+                assert!(
+                    result.error >= actual_error,
+                    "exponent={exponent}: {result:?}, actual_error={actual_error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tanhsinh_mirrored_infinite_endpoints_share_error_estimates() {
+        // Mirrored exp-sinh has its finite physical upper endpoint on the
+        // negative transformed tail. Combining tail indicators must preserve
+        // reflection symmetry instead of counting that endpoint twice.
+        for exponent in [-0.5, -0.99] {
+            let integrand = |distance: f64| (-distance).exp() * distance.powf(exponent);
+            let upper = tanhsinh(|x| integrand(x - 1.0), 1.0, f64::INFINITY, 0.0, 1e-12, 10);
+            let lower = tanhsinh(
+                |x| integrand(-x - 1.0),
+                f64::NEG_INFINITY,
+                -1.0,
+                0.0,
+                1e-12,
+                10,
+            );
+            assert_eq!(upper, lower, "exponent={exponent}");
         }
     }
 

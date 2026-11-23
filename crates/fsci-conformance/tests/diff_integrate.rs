@@ -887,3 +887,102 @@ print(json.dumps(dict(scipy=scipy.__version__, numpy=np.__version__, rows=rows))
     );
     ledger.finish(3);
 }
+
+#[test]
+fn diff_integrate_tanhsinh_combines_endpoint_errors() {
+    #[derive(Deserialize)]
+    struct Reference {
+        exponent: f64,
+        integral: f64,
+        error: f64,
+    }
+    #[derive(Deserialize)]
+    struct Capture {
+        scipy: String,
+        numpy: String,
+        rows: Vec<Reference>,
+    }
+    // QUADPACK's algebraic-weight rule resolves each endpoint analytically
+    // through its moments. It is an independent reference for the mass that
+    // an f64 tanh-sinh grid cannot sample at these nonzero endpoints.
+    let script = r#"
+import json
+import numpy as np
+import scipy
+from scipy.integrate import quad
+rows = []
+for exponent in (-0.99, -0.999):
+    left, left_error = quad(lambda x: 1., 1., 2., weight='alg',
+                            wvar=(exponent, 0.), epsabs=0., epsrel=1e-12)
+    right, right_error = quad(lambda x: 1., 1., 2., weight='alg',
+                              wvar=(0., exponent), epsabs=0., epsrel=1e-12)
+    rows.append(dict(exponent=exponent, integral=left+right,
+                     error=left_error+right_error))
+print(json.dumps(dict(scipy=scipy.__version__, numpy=np.__version__, rows=rows)))
+"#;
+    let required = std::env::var(REQUIRE_SCIPY_ENV).as_deref() == Ok("1");
+    let output = fsci_conformance::scipy_oracle_command()
+        .args(["-c", script])
+        .env("OPENBLAS_NUM_THREADS", "1")
+        .env("OMP_NUM_THREADS", "1")
+        .output();
+    let output = match output {
+        Ok(output) if output.status.success() => output,
+        other => {
+            assert!(!required, "required combined-tail oracle failed: {other:?}");
+            eprintln!("SKIP combined-tail oracle: {other:?}; compared cases = 0");
+            return;
+        }
+    };
+    let oracle: Capture =
+        serde_json::from_slice(&output.stdout).expect("complete combined-tail capture");
+    if required {
+        assert_eq!(oracle.scipy, "1.17.1");
+        assert_eq!(oracle.numpy, "2.4.3");
+    }
+    let cases = [(-0.99_f64, 100.0), (-0.999, 1000.0)];
+    assert_eq!(oracle.rows.len(), cases.len(), "partial oracle coverage");
+    let mut ledger = CompareLedger::new(
+        "diff_integrate_tanhsinh_combines_endpoint_errors",
+        &["forward", "reverse"],
+    );
+    for (&(exponent, atol), reference) in cases.iter().zip(&oracle.rows) {
+        assert_eq!(reference.exponent, exponent);
+        let exact = 2.0 / (1.0 + exponent);
+        assert!((reference.integral - exact).abs() <= 1e-12 * exact);
+        assert!(reference.error.is_finite() && reference.error >= 0.0);
+        for (a, b, sign, arm) in [(1.0, 2.0, 1.0, "forward"), (2.0, 1.0, -1.0, "reverse")] {
+            let actual = fsci_integrate::tanhsinh(
+                |x| (x - 1.0).powf(exponent) + (2.0 - x).powf(exponent),
+                a,
+                b,
+                atol,
+                1e-12,
+                10,
+            );
+            let actual_error = (actual.integral - sign * reference.integral).abs();
+            let tolerance = atol + 1e-12 * actual.integral.abs();
+            let pass = !actual.converged
+                && actual.neval > 0
+                && actual.integral.is_finite()
+                && actual.error.is_finite()
+                && actual.error > tolerance
+                && actual_error > tolerance
+                && actual_error <= actual.error + reference.error;
+            let name = format!("{arm}/exponent={exponent}");
+            eprintln!(
+                "{name}: SciPy={} error={}; Rust={actual:?}; actual_error={actual_error}",
+                sign * reference.integral,
+                reference.error
+            );
+            ledger.compared(arm, &name, pass);
+        }
+    }
+    eprintln!(
+        "combined-tail comparisons={}; scipy={} numpy={}",
+        2 * cases.len(),
+        oracle.scipy,
+        oracle.numpy
+    );
+    ledger.finish(2);
+}
