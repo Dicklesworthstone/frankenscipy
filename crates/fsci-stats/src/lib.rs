@@ -19474,6 +19474,27 @@ impl ExponNorm {
         assert!(k.is_finite() && k > 0.0, "k must be positive and finite");
         Self { k }
     }
+
+    fn log_exponential_component(&self, x: f64) -> f64 {
+        if x.is_nan() || !self.k.is_finite() || self.k <= 0.0 {
+            return f64::NAN;
+        }
+        if x.is_infinite() {
+            return f64::NEG_INFINITY;
+        }
+        let inv_k = self.k.recip();
+        if inv_k.is_infinite() {
+            return self.logpdf(x) + self.k.ln();
+        }
+        let a = inv_k - x;
+        if a >= 0.0 {
+            // This is log(k*pdf), computed directly: subtracting and then
+            // restoring log(k) can corrupt probabilities for a huge shape.
+            -0.5 * x * x - LN_2 + fsci_special::convenience::erfcx_scalar(a * FRAC_1_SQRT_2).ln()
+        } else {
+            inv_k * (0.5 * inv_k - x) + fsci_special::log_ndtr_scalar(-a)
+        }
+    }
 }
 
 impl ContinuousDistribution for ExponNorm {
@@ -19484,31 +19505,61 @@ impl ContinuousDistribution for ExponNorm {
     }
 
     fn pdf(&self, x: f64) -> f64 {
-        let inv_k = 1.0 / self.k;
-        let exp_arg = inv_k * (0.5 * inv_k - x);
-        (exp_arg + fsci_special::log_ndtr_scalar(x - inv_k)).exp() / self.k
+        self.logpdf(x).exp()
     }
 
     fn logpdf(&self, x: f64) -> f64 {
-        // exp_arg + logΦ(x−1/k) − ln(k); finite in the tail. frankenscipy-p82v7
+        if x.is_nan() || !self.k.is_finite() || self.k <= 0.0 {
+            return f64::NAN;
+        }
+        if x.is_infinite() {
+            return f64::NEG_INFINITY;
+        }
         let inv_k = 1.0 / self.k;
-        let exp_arg = inv_k * (0.5 * inv_k - x);
-        exp_arg + fsci_special::log_ndtr_scalar(x - inv_k) - self.k.ln()
+        let a = inv_k - x;
+        if a >= 32.0 {
+            // Φ(-a)/φ(a) = (1/a) * (1 - 1/a² + 3/a⁴ - ...).
+            // Cancel k*a = 1-k*x algebraically, before taking logs. This
+            // retains the normal limit even when 1/k or (1/k)² overflows.
+            let kx = self.k * x;
+            let log_denominator = if kx.is_finite() && kx < 1.0 {
+                (-kx).ln_1p()
+            } else {
+                self.k.ln() + a.ln()
+            };
+            let inverse_a = if inv_k.is_infinite() {
+                self.k / (1.0 - kx)
+            } else {
+                a.recip()
+            };
+            let squared_inverse = inverse_a * inverse_a;
+            let mut term = 1.0;
+            let mut correction = 0.0;
+            for order in 1..=8 {
+                term *= -f64::from(2 * order - 1) * squared_inverse;
+                correction += term;
+            }
+            -0.5 * x * x - 0.5 * (2.0 * PI).ln() - log_denominator + correction.ln_1p()
+        } else if a >= 0.0 {
+            // The direct exp_arg + logΦ form subtracts two O(1/k²)
+            // terms. erfcx removes that cancellation throughout the left
+            // tail, not only once ordinary probabilities underflow.
+            -0.5 * x * x - std::f64::consts::LN_2 - self.k.ln()
+                + fsci_special::convenience::erfcx_scalar(a * FRAC_1_SQRT_2).ln()
+        } else {
+            inv_k * (0.5 * inv_k - x) + fsci_special::log_ndtr_scalar(-a) - self.k.ln()
+        }
     }
 
     fn cdf(&self, x: f64) -> f64 {
-        let inv_k = 1.0 / self.k;
-        let exp_arg = inv_k * (0.5 * inv_k - x);
-        standard_normal_cdf(x) - (exp_arg + fsci_special::log_ndtr_scalar(x - inv_k)).exp()
+        (standard_normal_cdf(x) - self.log_exponential_component(x).exp()).clamp(0.0, 1.0)
     }
 
     fn sf(&self, x: f64) -> f64 {
         // sf = 1 − [Φ(x) − e^{exp_arg}Φ(x−1/k)] = Φ(−x) + e^{exp_arg}Φ(x−1/k);
         // the exponential-component term keeps the right tail accurate where
         // the default 1−cdf collapses to 0. frankenscipy-w3f6m
-        let inv_k = 1.0 / self.k;
-        let exp_arg = inv_k * (0.5 * inv_k - x);
-        standard_normal_cdf(-x) + (exp_arg + fsci_special::log_ndtr_scalar(x - inv_k)).exp()
+        (standard_normal_cdf(-x) + self.log_exponential_component(x).exp()).clamp(0.0, 1.0)
     }
 
     fn ppf(&self, q: f64) -> f64 {
@@ -19568,30 +19619,13 @@ impl ContinuousDistribution for ExponNorm {
         )
     }
 
+    /// Numerically fit the positive shape with location zero and scale one,
+    /// as in `scipy.stats.exponnorm.fit(data, floc=0, fscale=1)`.
+    /// Multiple likelihood basins are considered; the sample mean is only
+    /// an initializer. A maximum attained only at the excluded normal limit
+    /// `k=0`, or indistinguishable from it numerically, returns a typed error.
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        if data.len() < 2 {
-            return Err(FitError::InsufficientData {
-                required: 2,
-                actual: data.len(),
-            });
-        }
-        for &x in data {
-            if !x.is_finite() {
-                return Err(FitError::UnsupportedData(format!(
-                    "ExponNorm data contains non-finite value: {x}"
-                )));
-            }
-        }
-        // ExponNorm at standardized (loc=0, scale=1) has E[X] = k, so the
-        // method-of-moments shape estimator is just the sample mean. The
-        // shape parameter must be positive — reject non-positive means.
-        let mean: f64 = data.iter().sum::<f64>() / data.len() as f64;
-        if mean <= 0.0 || !mean.is_finite() {
-            return Err(FitError::UnsupportedData(format!(
-                "ExponNorm requires positive sample mean (k > 0); got {mean}"
-            )));
-        }
-        Ok(Self { k: mean })
+        mle::exponnorm_mle(data)
     }
 }
 
@@ -104287,7 +104321,7 @@ mod tests {
     fn expnorm_fit_recovers_synthetic_shape() {
         // Synthesize n=2000 samples from ExponNorm(k=1.2) via the
         // standardized inverse CDF (numerical via bisection in the impl);
-        // MoM (sample mean) recovers k within 5%.
+        // the standardized likelihood fit recovers k within 5%.
         let true_k = 1.2;
         let dist = ExponNorm::new(true_k);
         let n = 2000;
@@ -104308,8 +104342,7 @@ mod tests {
     #[test]
     fn expnorm_fit_metamorphic_var_relation() {
         // After fitting, the fitted distribution's variance should be
-        // approximately 1 + k² (since k = sample_mean, this just probes
-        // whether the sample variance lines up with that prediction).
+        // approximately 1 + k² for this synthetic quantile sample.
         let true_k = 0.7;
         let dist = ExponNorm::new(true_k);
         let n = 2000;
@@ -104330,10 +104363,10 @@ mod tests {
     }
 
     #[test]
-    fn expnorm_fit_rejects_non_positive_mean() {
-        let err =
-            ExponNorm::try_fit(&[-1.0, -2.0, -3.0]).expect_err("negative-mean must be rejected");
-        assert!(matches!(err, FitError::UnsupportedData(_)));
+    fn expnorm_fit_reports_the_excluded_normal_boundary() {
+        let err = ExponNorm::try_fit(&[-1.0, -2.0, -3.0])
+            .expect_err("all nonpositive observations favor the excluded normal boundary");
+        assert!(matches!(err, FitError::NonConvergent(_)));
     }
 
     #[test]

@@ -93,6 +93,7 @@ jobs:
               ;;
             distribution-fit)
               cargo test --locked -p fsci-stats --lib test_fit_cauchy -- --nocapture
+              cargo test --locked -p fsci-stats --lib expnorm_fit -- --nocapture
               cargo test --locked -p fsci-stats --lib discrete_likelihood_fits -- --nocapture
               cargo test --locked -p fsci-stats --lib randint_fitted_extreme_signed_intervals -- --nocapture
               cargo test --locked -p fsci-stats --test mle_scipy -- --nocapture

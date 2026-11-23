@@ -662,6 +662,109 @@ pub(crate) fn cauchy_mle(data: &[f64]) -> Result<crate::Cauchy, FitError> {
     Ok(distribution)
 }
 
+/// Standardized ExponNorm shape fitting. A geometric profile supplies starts
+/// for separated likelihood basins before the ordinary MLE driver refines
+/// them. Like that driver, this numerical search does not certify global
+/// optimality. The excluded k=0 normal boundary is compared explicitly.
+pub(crate) fn exponnorm_mle(data: &[f64]) -> Result<crate::ExponNorm, FitError> {
+    validate_shape_sample(data, 2, "ExponNorm")?;
+    if data.iter().all(|&x| x <= 0.0) {
+        // For x<=0 and y>0, phi(x-y)<phi(x). Every exponential mixture
+        // therefore has lower density than the k=0 normal limit.
+        return Err(FitError::NonConvergent(
+            "ExponNorm likelihood is maximized only at the excluded normal boundary k=0".into(),
+        ));
+    }
+    let normal_nll = compensated_mean(
+        data.iter()
+            .map(|&x| 0.5 * x * x + 0.5 * (2.0 * std::f64::consts::PI).ln()),
+        data.len(),
+    );
+    // A huge positive observation can have a finite exponential-tail
+    // likelihood even when its normal-boundary negative log density overflows.
+    let normal_nll = if normal_nll.is_finite() {
+        normal_nll
+    } else {
+        f64::INFINITY
+    };
+    // E[Y|X=x] for Y~Exp(mean=k) is the mean of N(x-1/k, 1)
+    // truncated below zero. It is less than max(x,0)+sqrt(2/pi).
+    // The shape score is (mean(E[Y|X])-k)/k², so no stationary
+    // maximum lies above this data-derived upper search limit.
+    let upper = compensated_mean(data.iter().map(|&x| x.max(0.0)), data.len())
+        + (2.0 / std::f64::consts::PI).sqrt();
+    if !upper.is_finite() || upper <= 0.0 {
+        // Even prescaled summation can overflow at the last representable
+        // value. In particular, infinity must never enter the halving loop.
+        return Err(FitError::NonConvergent(
+            "ExponNorm likelihood search scale is outside the finite numeric range".into(),
+        ));
+    }
+    let largest = data.iter().map(|x| x.abs()).fold(1.0_f64, f64::max);
+    let lower = f64::EPSILON.sqrt() / largest;
+    let tolerance = if normal_nll.is_finite() {
+        32.0 * f64::EPSILON * normal_nll.abs().max(1.0)
+    } else {
+        0.0
+    };
+    let mut profile = Vec::new();
+    let mut shape = upper;
+    loop {
+        let distribution = crate::ExponNorm { k: shape };
+        let nll = compensated_mean(data.iter().map(|&x| -distribution.logpdf(x)), data.len());
+        profile.push((shape, nll));
+        if shape <= lower {
+            break;
+        }
+        shape *= 0.5;
+    }
+    profile.push((0.0, normal_nll));
+    let mut starts = Vec::new();
+    if profile[0].1 <= profile[1].1 && profile[0].1 < normal_nll - tolerance {
+        starts.push(profile[0].0);
+    }
+    for points in profile.windows(3) {
+        let (shape, nll) = points[1];
+        if nll <= points[0].1 && nll <= points[2].1 && nll < normal_nll - tolerance {
+            starts.push(shape);
+        }
+    }
+    let mean = compensated_mean(data.iter().copied(), data.len());
+    if mean > 0.0 && mean.is_finite() {
+        starts.push(mean);
+    }
+    let mut best: Option<MleResult<crate::ExponNorm>> = None;
+    let mut failure = FitError::NonConvergent(
+        "ExponNorm likelihood has no distinguishable positive-shape maximum above the normal boundary"
+            .into(),
+    );
+    for initial in starts {
+        match fit_mle(
+            data,
+            &[MleParameter::Positive(initial)],
+            |p| Some(crate::ExponNorm { k: p[0] }),
+            MleOptions::default(),
+        ) {
+            Ok(candidate) => {
+                if best.as_ref().is_none_or(|previous| {
+                    candidate.negative_log_likelihood < previous.negative_log_likelihood
+                }) {
+                    best = Some(candidate);
+                }
+            }
+            Err(error) => failure = error,
+        }
+    }
+    let best = best.ok_or(failure)?;
+    if best.negative_log_likelihood / data.len() as f64 >= normal_nll - tolerance {
+        return Err(FitError::NonConvergent(
+            "ExponNorm likelihood is maximized at, or indistinguishable from, the excluded normal boundary k=0"
+                .into(),
+        ));
+    }
+    Ok(best.distribution)
+}
+
 /// The Landau law has no moments; quantile matching supplies a scale-equivariant
 /// start without letting a large right-tail observation dominate the search.
 pub(crate) fn landau_mle(data: &[f64]) -> Result<crate::Landau, FitError> {

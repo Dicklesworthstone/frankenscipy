@@ -1351,6 +1351,14 @@ Result<Self, FitError>`. Many types add a closed-form `mode()` accessor as
 an inherent method, and several bounded-support types add a `support() ->
 &[f64]` accessor.
 
+`Cauchy::try_fit` estimates location and scale by maximum likelihood.
+`ExponNorm::try_fit` estimates its positive shape with location fixed at zero
+and scale fixed at one, comparing multiple likelihood basins with the normal
+boundary. An unbounded likelihood or a maximum that exists only at an excluded
+boundary returns `FitError::NonConvergent`. For explicit fixed or bounded
+parameters, use `fit_mle`; use `fit_mle_location_scale` to fit shape parameters
+together with an affine location and scale.
+
 ### Migrating from `scipy.*` Python code
 
 The Rust API is shaped to look like SciPy when you squint. The recurring translation patterns:

@@ -8,7 +8,6 @@
 use std::process::Command;
 
 use fsci_runtime::RuntimeMode;
-use fsci_stats::Cauchy;
 use fsci_stats::{
     Alpha, Argus, BetaDist, Burr3, Burr12, CensoredData, Chi, ChiSquared, ContinuousDistribution,
     CrystalBall, DiscreteDistribution, ExponWeibull, FDistribution, FitError, FoldedCauchy,
@@ -18,6 +17,7 @@ use fsci_stats::{
     fit_mle_censored, fit_mle_location_scale, fit_mle_location_scale_censored,
     with_hardened_stats_caps, with_stats_runtime_mode,
 };
+use fsci_stats::{Cauchy, ExponNorm};
 use rand::{SeedableRng, rngs::StdRng};
 
 const ORACLE: &str = r#"
@@ -79,6 +79,256 @@ fn likelihood<D: ContinuousDistribution>(distribution: &D, data: &[f64]) -> f64 
 
 fn discrete_likelihood<D: DiscreteDistribution>(distribution: &D, data: &[i64]) -> f64 {
     -data.iter().map(|&x| distribution.logpmf(x)).sum::<f64>()
+}
+
+#[test]
+fn exponnorm_fit_optimizes_the_standardized_likelihood() {
+    let data = [-2.0, 0.3, 0.4, 1.0, 3.0, 9.0];
+    let fitted = ExponNorm::try_fit(&data).unwrap();
+    let mean = data.iter().sum::<f64>() / data.len() as f64;
+    assert!(likelihood(&ExponNorm::new(mean), &data) - likelihood(&fitted, &data) > 0.03);
+    assert_eq!(fitted, ExponNorm::fit(&data));
+    let step = 1e-5_f64;
+    let left = ExponNorm::new(fitted.k * (-step).exp());
+    let right = ExponNorm::new(fitted.k * step.exp());
+    let score = (likelihood(&right, &data) - likelihood(&left, &data)) / (2.0 * step);
+    assert!(score.abs() < 2e-6, "log-shape likelihood score={score}");
+
+    // A nonpositive mean does not rule out an interior shape maximum.
+    let negative_mean = [-10.0, 9.0];
+    let fitted = ExponNorm::try_fit(&negative_mean).unwrap();
+    assert!((fitted.k - 4.435_271_660_447_556).abs() < 2e-6);
+    assert!(
+        likelihood(&Normal::new(0.0, 1.0), &negative_mean) - likelihood(&fitted, &negative_mean)
+            > 30.0
+    );
+
+    // The normal-boundary likelihood can overflow while a finite interior
+    // exponential-tail likelihood remains well conditioned.
+    let huge = [1e155, 2e155];
+    let fitted = ExponNorm::try_fit(&huge).unwrap();
+    assert!((fitted.k / 1.5e155 - 1.0).abs() < 2e-6);
+    assert!(likelihood(&fitted, &huge).is_finite());
+}
+
+#[test]
+fn exponnorm_fit_selects_between_separated_likelihood_maxima() {
+    // Independently solved likelihood scores at 60 decimal digits (mpmath).
+    // The larger mode wins in the first sample; the smaller wins in the
+    // second. A sole mean start, or always choosing the largest root, fails.
+    for (zeros, outlier, expected, inferior) in [
+        (
+            1000,
+            20.0,
+            0.207_897_708_759_834_3,
+            0.013_782_264_693_285_957,
+        ),
+        (
+            500,
+            10.0,
+            0.011_241_494_870_528_716,
+            0.157_453_776_582_290_7,
+        ),
+    ] {
+        let mut data = vec![0.0; zeros];
+        data.push(outlier);
+        let fitted = ExponNorm::try_fit(&data).unwrap();
+        assert!(
+            (fitted.k - expected).abs() < 3e-6 * expected,
+            "zeros={zeros}, outlier={outlier}: {} vs {expected}",
+            fitted.k
+        );
+        assert!(likelihood(&ExponNorm::new(inferior), &data) - likelihood(&fitted, &data) > 2.0);
+    }
+}
+
+#[test]
+fn exponnorm_fit_handles_boundary_invalid_data_and_resource_caps() {
+    for data in [&[][..], &[1.0][..]] {
+        assert!(matches!(
+            ExponNorm::try_fit(data),
+            Err(FitError::InsufficientData { .. })
+        ));
+    }
+    for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(matches!(
+            ExponNorm::try_fit(&[1.0, invalid]),
+            Err(FitError::UnsupportedData(_))
+        ));
+    }
+    for data in [vec![0.0, 0.0], vec![-1.0, -2.0], vec![-0.1, 0.1]] {
+        assert!(matches!(
+            ExponNorm::try_fit(&data),
+            Err(FitError::NonConvergent(_))
+        ));
+    }
+    // MAX/3 rounds upward: summing the three prescaled observations can
+    // overflow. The profile must reject infinity instead of halving forever.
+    assert!(matches!(
+        ExponNorm::try_fit(&[f64::MAX; 3]),
+        Err(FitError::NonConvergent(_))
+    ));
+    with_stats_runtime_mode(RuntimeMode::Hardened, || {
+        with_hardened_stats_caps(2, 2, || {
+            assert!(matches!(
+                ExponNorm::try_fit(&[0.0, 1.0, 2.0]),
+                Err(FitError::ResourceExhausted { .. })
+            ));
+            assert!(ExponNorm::try_fit(&[1.0, 1.0]).is_ok());
+        });
+    });
+}
+
+#[test]
+fn exponnorm_density_and_probabilities_retain_the_normal_limit() {
+    let normal = Normal::new(0.0, 1.0);
+    for shape in [1e-50, 1e-200, f64::from_bits(1)] {
+        let distribution = ExponNorm::new(shape);
+        for x in [-20.0, -2.0, 0.0, 2.0, 20.0] {
+            assert!((distribution.logpdf(x) - normal.logpdf(x)).abs() < 1e-13);
+            for (actual, expected) in [
+                (distribution.pdf(x), normal.pdf(x)),
+                (distribution.cdf(x), normal.cdf(x)),
+                (distribution.sf(x), normal.sf(x)),
+            ] {
+                assert!((actual - expected).abs() <= 2e-13 * expected);
+            }
+        }
+        assert_eq!(distribution.logpdf(f64::NEG_INFINITY), f64::NEG_INFINITY);
+        assert_eq!(distribution.logpdf(f64::INFINITY), f64::NEG_INFINITY);
+        assert_eq!(distribution.cdf(f64::NEG_INFINITY), 0.0);
+        assert_eq!(distribution.cdf(f64::INFINITY), 1.0);
+        assert_eq!(distribution.sf(f64::NEG_INFINITY), 1.0);
+        assert_eq!(distribution.sf(f64::INFINITY), 0.0);
+    }
+    // 80-digit evaluation of the defining erfc expression. These values
+    // exercise the small-shape cancellation and both sides of a=32.
+    for (shape, x, expected) in [
+        (0.0001, -2.0, -2.919_138_523_203_34),
+        (0.0001, 0.0, -0.918_938_543_204_672_5),
+        (0.0001, 2.0, -2.918_738_523_206_006_6),
+        (0.01, 0.0, -0.919_038_508_216_997_3),
+        (0.03125, -2.0, -2.980_426_344_071_958_5),
+        (0.03125, 0.0, -0.919_912_722_925_647_6),
+        (0.03125, 2.0, -2.855_508_053_543_470_6),
+    ] {
+        let actual = ExponNorm::new(shape).logpdf(x);
+        assert!(
+            (actual - expected).abs() < 2e-14,
+            "k={shape}, x={x}: {actual}"
+        );
+    }
+    let distribution = ExponNorm::new(2.0);
+    assert!((distribution.logpdf(0.5) + 0.125 + 4.0_f64.ln()).abs() < 1e-15);
+    for shape in [1e100, 1e200, 1e308] {
+        let distribution = ExponNorm::new(shape);
+        for x in [-2.0, 0.0, 2.0] {
+            assert!((0.0..=1.0).contains(&distribution.cdf(x)));
+            assert!((0.0..=1.0).contains(&distribution.sf(x)));
+            assert!((distribution.cdf(x) + distribution.sf(x) - 1.0).abs() < 1e-15);
+        }
+    }
+}
+
+#[test]
+fn exponnorm_mle_matches_live_scipy_with_fixed_location_and_scale() {
+    let python = std::env::var("FSCI_PYTHON").unwrap_or_else(|_| "python3".into());
+    let required = std::env::var("FSCI_REQUIRE_SCIPY_ORACLE").as_deref() == Ok("1");
+    let available = Command::new(&python)
+        .args(["-c", "import numpy; import scipy"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !available {
+        assert!(
+            !required,
+            "required SciPy oracle is unavailable via {python}"
+        );
+        eprintln!("SKIP ExponNorm MLE: SciPy oracle unavailable; compared cases = 0");
+        return;
+    }
+    let script = r#"
+import os
+import numpy as np
+import scipy
+from scipy import stats, optimize
+print('versions', scipy.__version__, np.__version__)
+if os.environ.get('FSCI_REQUIRE_SCIPY_ORACLE') == '1':
+    assert (scipy.__version__, np.__version__) == ('1.17.1', '2.4.3')
+def accurate_fit(fun, start, args=(), disp=0):
+    return optimize.fmin(fun, start, args=args, disp=disp,
+                         xtol=1e-10, ftol=1e-10, maxiter=2000, maxfun=8000)
+datasets = [stats.exponnorm.rvs(k, size=2000,
+                              random_state=np.random.default_rng(78300 + case))
+            for case, k in enumerate([.15, .7, 3., 20.])]
+datasets.extend([np.array([-10., 9.]), np.r_[np.zeros(1000), 20.],
+                 np.r_[np.zeros(500), 10.]])
+for case, data in enumerate(datasets):
+    # The shape likelihood can have separated interior maxima. Give the
+    # independent SciPy optimizer starts on both sides of those basins.
+    candidates = [stats.exponnorm.fit(data, start, floc=0, fscale=1,
+                                      optimizer=accurate_fit)
+                  for start in [.01, .1, 1., 10.]]
+    fitted = min(candidates, key=lambda p: -stats.exponnorm.logpdf(data, *p).sum())
+    assert fitted[1:] == (0, 1)
+    nll = -stats.exponnorm.logpdf(data, *fitted).sum()
+    print(case, format(fitted[0], '.17g'), format(nll, '.17g'))
+    print(' '.join(format(x, '.17g') for x in data))
+"#;
+    let output = Command::new(&python).args(["-c", script]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "SciPy ExponNorm MLE oracle failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut lines = stdout.lines();
+    let versions = lines.next().expect("oracle version metadata");
+    eprintln!("ExponNorm MLE oracle {versions}");
+    if required {
+        assert_eq!(versions, "versions 1.17.1 2.4.3");
+    }
+    let mut compared = 0;
+    while let Some(header) = lines.next() {
+        let fields: Vec<_> = header.split_whitespace().collect();
+        let case: usize = fields[0].parse().unwrap();
+        let expected_shape: f64 = fields[1].parse().unwrap();
+        let expected_nll: f64 = fields[2].parse().unwrap();
+        let data: Vec<f64> = lines
+            .next()
+            .expect("oracle observations")
+            .split_whitespace()
+            .map(|value| value.parse().unwrap())
+            .collect();
+        assert_eq!(
+            data.len(),
+            if case < 4 {
+                2000
+            } else {
+                [2, 1001, 501][case - 4]
+            }
+        );
+        let fitted = ExponNorm::try_fit(&data).unwrap();
+        let nll = likelihood(&fitted, &data);
+        assert!(
+            (fitted.k - expected_shape).abs() <= 3e-6 * expected_shape,
+            "case {case}: shape {} vs {expected_shape}",
+            fitted.k
+        );
+        assert!(
+            (nll - expected_nll).abs() <= 1e-10 * expected_nll.abs().max(1.0),
+            "case {case}: NLL {nll} vs {expected_nll}"
+        );
+        eprintln!(
+            "ExponNorm/{case}: shape fsci={:.12e} SciPy={expected_shape:.12e}; NLL fsci={nll:.12e} SciPy={expected_nll:.12e}",
+            fitted.k
+        );
+        compared += 1;
+    }
+    assert_eq!(
+        compared, 7,
+        "all standardized ExponNorm fits must be compared"
+    );
+    eprintln!("ExponNorm MLE compared cases = {compared}");
 }
 
 #[test]
