@@ -92,6 +92,7 @@ jobs:
               cargo test --locked -p fsci-linalg --test differential_linalg default_fast_solve_matches_live_scipy -- --nocapture
               ;;
             distribution-fit)
+              cargo test --locked -p fsci-stats --lib test_fit_cauchy -- --nocapture
               cargo test --locked -p fsci-stats --lib discrete_likelihood_fits -- --nocapture
               cargo test --locked -p fsci-stats --lib randint_fitted_extreme_signed_intervals -- --nocapture
               cargo test --locked -p fsci-stats --test mle_scipy -- --nocapture

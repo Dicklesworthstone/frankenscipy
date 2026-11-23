@@ -18063,9 +18063,25 @@ impl ContinuousDistribution for Cauchy {
     }
 
     fn logpdf(&self, x: f64) -> f64 {
-        // −ln(π) − ln(scale) − ln(1+z²); finite in the heavy tail. frankenscipy-p82v7
-        let z = (x - self.loc) / self.scale;
-        -PI.ln() - self.scale.ln() - (1.0 + z * z).ln()
+        // log(scale) - log(pi) - log(scale² + (x-loc)²). Evaluating
+        // the sum in log space avoids squaring an extreme standardized
+        // residual or dividing by a very small fitted scale.
+        let difference = x - self.loc;
+        let log_distance = if difference.is_infinite() && x.is_finite() && self.loc.is_finite() {
+            // Opposite-sign finite inputs can overflow their subtraction.
+            let large = x.abs().max(self.loc.abs());
+            let small = x.abs().min(self.loc.abs());
+            large.ln() + (small / large).ln_1p()
+        } else {
+            difference.abs().ln()
+        };
+        let log_scale = self.scale.ln();
+        if log_distance > log_scale {
+            log_scale - PI.ln() - 2.0 * log_distance
+                - (2.0 * (log_scale - log_distance)).exp().ln_1p()
+        } else {
+            -log_scale - PI.ln() - (2.0 * (log_distance - log_scale)).exp().ln_1p()
+        }
     }
 
     fn cdf(&self, x: f64) -> f64 {
@@ -18166,47 +18182,19 @@ impl ContinuousDistribution for Cauchy {
     }
 
     fn fit(data: &[f64]) -> Self {
-        if data.is_empty() || data.iter().any(|&x| !x.is_finite()) {
-            return Self {
-                loc: f64::NAN,
-                scale: f64::NAN,
-            };
-        }
-
-        let qs = quantile(data, &[0.25, 0.5, 0.75]);
-        let loc = qs[1];
-        let scale = 0.5 * (qs[2] - qs[0]);
-        if !loc.is_finite() || !scale.is_finite() || scale <= 0.0 {
-            return Self {
-                loc: f64::NAN,
-                scale: f64::NAN,
-            };
-        }
-
-        Self { loc, scale }
+        Self::try_fit(data).unwrap_or(Self {
+            loc: f64::NAN,
+            scale: f64::NAN,
+        })
     }
 
+    /// Joint maximum-likelihood location and scale, matching
+    /// `scipy.stats.cauchy.fit(data)`. Quartiles initialize the likelihood
+    /// optimizer; they are not returned as a substitute for the MLE.
+    /// Repeated samples with an unbounded likelihood or only a zero-scale
+    /// supremum return a typed error rather than an arbitrary near-zero scale.
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        // [frankenscipy-sf2ax]: typed-error counterpart to fit().
-        if data.is_empty() {
-            return Err(FitError::InsufficientData {
-                required: 1,
-                actual: 0,
-            });
-        }
-        if data.iter().any(|&x| !x.is_finite()) {
-            return Err(FitError::UnsupportedData(
-                "Cauchy requires finite samples".into(),
-            ));
-        }
-        let fitted = Self::fit(data);
-        if !fitted.loc.is_finite() || !fitted.scale.is_finite() || fitted.scale <= 0.0 {
-            return Err(FitError::NonConvergent(
-                "Cauchy fit produced non-finite or non-positive parameters (degenerate quantiles)"
-                    .into(),
-            ));
-        }
-        Ok(fitted)
+        mle::cauchy_mle(data)
     }
 
     fn entropy(&self) -> f64 {
@@ -85031,7 +85019,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fit_cauchy_recovers_quartiles() {
+    fn test_fit_cauchy_solves_the_likelihood_scale_equation() {
         let reference = Cauchy::new(1.5, 0.8);
         let data = [
             reference.loc - 2.0 * reference.scale,
@@ -85041,8 +85029,12 @@ mod tests {
             reference.loc + 2.0 * reference.scale,
         ];
         let fitted = Cauchy::fit(&data);
-        assert_close(fitted.loc, reference.loc, 1e-12, "cauchy fit loc");
-        assert_close(fitted.scale, reference.scale, 1e-12, "cauchy fit scale");
+        // Symmetry fixes location. For residuals {-2,-1,0,1,2}, the
+        // scale score is 1 + 2t/(t+1) + 2t/(t+4) = 5/2, t=scale².
+        // Half the IQR is one, which does not solve this equation.
+        let scale = reference.scale * ((265.0_f64.sqrt() - 5.0) / 10.0).sqrt();
+        assert_close(fitted.loc, reference.loc, 1e-7, "cauchy MLE loc");
+        assert_close(fitted.scale, scale, 1e-7, "cauchy MLE scale");
     }
 
     #[test]

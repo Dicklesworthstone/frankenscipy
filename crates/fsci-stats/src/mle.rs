@@ -550,6 +550,118 @@ fn validate_shape_sample(
     crate::validate_finite_fit_data(data, minimum_sample, family)
 }
 
+/// Fit Cauchy location and scale. Quartiles provide only the initial guess;
+/// unlike the former estimator, the returned parameters maximize the actual
+/// likelihood. Work in interquartile-range units so an optimizer's absolute
+/// coordinate tolerance does not depend on the sample's physical units.
+pub(crate) fn cauchy_mle(data: &[f64]) -> Result<crate::Cauchy, FitError> {
+    validate_shape_sample(data, 2, "Cauchy")?;
+    let mut sorted = data.to_vec();
+    sorted.sort_unstable_by(f64::total_cmp);
+    let mut maximum_count = 1;
+    let mut count = 1;
+    let mut unique = 1;
+    for pair in sorted.windows(2) {
+        if pair[0] == pair[1] {
+            count += 1;
+            maximum_count = maximum_count.max(count);
+        } else {
+            count = 1;
+            unique += 1;
+        }
+    }
+    if maximum_count > data.len() - maximum_count {
+        // At a point repeated k times the likelihood grows as scale^(n-2k).
+        // A majority repeated value therefore gives an unbounded likelihood,
+        // not a valid MLE with an arbitrarily tiny positive scale.
+        return Err(FitError::NonConvergent(
+            "Cauchy likelihood is unbounded at a majority repeated observation".into(),
+        ));
+    }
+    let origin = crate::quantile_sorted(&sorted, 0.5);
+    let q25 = crate::quantile_sorted(&sorted, 0.25);
+    let q75 = crate::quantile_sorted(&sorted, 0.75);
+    let difference = q75 - q25;
+    let spread = if difference.is_finite() {
+        0.5 * difference
+    } else {
+        0.5 * q75 - 0.5 * q25
+    };
+    if !spread.is_finite() || spread <= 0.0 {
+        return Err(FitError::NonConvergent(
+            "Cauchy sample has no positive finite fitting scale".into(),
+        ));
+    }
+    if maximum_count == data.len() - maximum_count {
+        if unique == 2 {
+            // Equal mass at two distinct points has a continuum of maxima.
+            // The midpoint and half-distance select a deterministic member,
+            // including the ordinary two-observation case.
+            let lower = sorted[0];
+            let upper = sorted[sorted.len() - 1];
+            let difference = upper - lower;
+            let scale = if difference.is_finite() {
+                0.5 * difference
+            } else {
+                0.5 * upper - 0.5 * lower
+            };
+            if scale.is_finite() && scale > 0.0 {
+                return Ok(crate::Cauchy { loc: origin, scale });
+            }
+        }
+        // The joint score equation averages points on a unit circle to zero.
+        // Half the mass at one point requires the other half at a single
+        // opposite point. With more than two distinct values there is no
+        // stationary point at positive scale: only a boundary supremum.
+        return Err(FitError::NonConvergent(
+            "Cauchy likelihood has no finite positive-scale maximum for this repeated sample"
+                .into(),
+        ));
+    }
+    let standardized: Vec<_> = data
+        .iter()
+        .map(|&x| {
+            let difference = x - origin;
+            if difference.is_finite() {
+                difference / spread
+            } else {
+                x / spread - origin / spread
+            }
+        })
+        .collect();
+    if standardized.iter().any(|x| !x.is_finite()) {
+        return Err(FitError::NonConvergent(
+            "Cauchy sample range is not representable in fitting coordinates".into(),
+        ));
+    }
+    let fitted = fit_mle(
+        &standardized,
+        &[MleParameter::Free(0.0), MleParameter::Positive(1.0)],
+        |p| {
+            Some(crate::Cauchy {
+                loc: p[0],
+                scale: p[1],
+            })
+        },
+        MleOptions::default(),
+    )?
+    .distribution;
+    let distribution = crate::Cauchy {
+        loc: spread.mul_add(fitted.loc, origin),
+        scale: spread * fitted.scale,
+    };
+    if !distribution.loc.is_finite()
+        || !distribution.scale.is_finite()
+        || distribution.scale <= 0.0
+        || data.iter().any(|&x| !distribution.logpdf(x).is_finite())
+    {
+        return Err(FitError::NonConvergent(
+            "Cauchy MLE is not representable with finite parameters and log densities".into(),
+        ));
+    }
+    Ok(distribution)
+}
+
 /// The Landau law has no moments; quantile matching supplies a scale-equivariant
 /// start without letting a large right-tail observation dominate the search.
 pub(crate) fn landau_mle(data: &[f64]) -> Result<crate::Landau, FitError> {

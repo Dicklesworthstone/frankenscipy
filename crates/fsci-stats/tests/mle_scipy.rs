@@ -8,6 +8,7 @@
 use std::process::Command;
 
 use fsci_runtime::RuntimeMode;
+use fsci_stats::Cauchy;
 use fsci_stats::{
     Alpha, Argus, BetaDist, Burr3, Burr12, CensoredData, Chi, ChiSquared, ContinuousDistribution,
     CrystalBall, DiscreteDistribution, ExponWeibull, FDistribution, FitError, FoldedCauchy,
@@ -78,6 +79,229 @@ fn likelihood<D: ContinuousDistribution>(distribution: &D, data: &[f64]) -> f64 
 
 fn discrete_likelihood<D: DiscreteDistribution>(distribution: &D, data: &[i64]) -> f64 {
     -data.iter().map(|&x| distribution.logpmf(x)).sum::<f64>()
+}
+
+#[test]
+fn cauchy_fit_maximizes_likelihood_instead_of_returning_quartiles() {
+    let data = [-4.0, -1.0, 0.2, 0.4, 0.7, 2.0, 7.0];
+    let fitted = Cauchy::try_fit(&data).unwrap();
+    let quartiles = fsci_stats::quantile(&data, &[0.25, 0.5, 0.75]);
+    let initial = Cauchy::new(quartiles[1], 0.5 * (quartiles[2] - quartiles[0]));
+    assert!(likelihood(&initial, &data) - likelihood(&fitted, &data) > 0.005);
+    assert_eq!(fitted, Cauchy::fit(&data));
+
+    // Both likelihood scores must vanish. This fails for median/half-IQR
+    // even though that estimator can look plausible on a symmetric sample.
+    let mut location_score = 0.0;
+    let mut scale_score = 0.0;
+    for &x in &data {
+        let z = (x - fitted.loc) / fitted.scale;
+        location_score += 2.0 * z / (1.0 + z * z);
+        scale_score += (z * z - 1.0) / (1.0 + z * z);
+    }
+    assert!(location_score.abs() < 2.0e-6, "location score={location_score}");
+    assert!(scale_score.abs() < 2.0e-6, "scale score={scale_score}");
+
+    for factor in [1.0e-150_f64, 1.0e150] {
+        let offset = -3.0 * factor;
+        let transformed: Vec<_> = data.iter().map(|&x| factor.mul_add(x, offset)).collect();
+        let actual = Cauchy::try_fit(&transformed).unwrap();
+        assert!((actual.loc / factor + 3.0 - fitted.loc).abs() < 2.0e-6);
+        assert!((actual.scale / factor - fitted.scale).abs() < 2.0e-6);
+        let jacobian = data.len() as f64 * factor.ln();
+        assert!(
+            (likelihood(&actual, &transformed) - likelihood(&fitted, &data) - jacobian).abs()
+                < 1.0e-9
+        );
+    }
+}
+
+#[test]
+fn cauchy_fit_rejects_undefined_maxima_and_honors_sample_caps() {
+    for data in [&[][..], &[1.0][..]] {
+        assert!(matches!(
+            Cauchy::try_fit(data),
+            Err(FitError::InsufficientData { .. })
+        ));
+        assert!(Cauchy::fit(data).loc.is_nan());
+    }
+    for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(matches!(
+            Cauchy::try_fit(&[1.0, invalid]),
+            Err(FitError::UnsupportedData(_))
+        ));
+    }
+    for data in [
+        vec![1.0, 1.0],
+        vec![-1.0, 0.0, 0.0, 0.0, 2.0],
+        vec![0.0, 0.0, 1.0, 2.0],
+        vec![-2.0, -1.0, 0.0, 0.0],
+    ] {
+        assert!(matches!(
+            Cauchy::try_fit(&data),
+            Err(FitError::NonConvergent(_))
+        ));
+    }
+    // Equal mass on two distinct observations has nonunique finite maxima.
+    // Choose the midpoint / half-distance deterministically.
+    for data in [vec![1.0, 3.0], vec![1.0, 3.0, 1.0, 3.0]] {
+        assert_eq!(Cauchy::try_fit(&data).unwrap(), Cauchy::new(2.0, 1.0));
+    }
+    assert_eq!(
+        Cauchy::try_fit(&[-f64::MAX, f64::MAX]).unwrap(),
+        Cauchy::new(0.0, f64::MAX)
+    );
+    with_stats_runtime_mode(RuntimeMode::Hardened, || {
+        with_hardened_stats_caps(2, 2, || {
+            assert!(matches!(
+                Cauchy::try_fit(&[-1.0, 0.0, 1.0]),
+                Err(FitError::ResourceExhausted { .. })
+            ));
+            assert_eq!(Cauchy::try_fit(&[1.0, 3.0]).unwrap(), Cauchy::new(2.0, 1.0));
+        });
+    });
+}
+
+#[test]
+fn cauchy_log_likelihood_retains_extreme_finite_observations() {
+    let log_pi = std::f64::consts::PI.ln();
+    for (distribution, x, expected) in [
+        (Cauchy::default(), 1.0e300, -log_pi - 2.0 * 1.0e300_f64.ln()),
+        (
+            Cauchy::new(-1.0e308, 1.0),
+            1.0e308,
+            -log_pi - 2.0 * (1.0e308_f64.ln() + 2.0_f64.ln()),
+        ),
+        (
+            Cauchy::new(0.0, 1.0e-300),
+            1.0e300,
+            1.0e-300_f64.ln() - log_pi - 2.0 * 1.0e300_f64.ln(),
+        ),
+        (Cauchy::new(0.0, 1.0e300), 0.0, -log_pi - 1.0e300_f64.ln()),
+    ] {
+        let actual = distribution.logpdf(x);
+        assert!(actual.is_finite());
+        assert!((actual - expected).abs() < 1.0e-12, "{distribution:?}, x={x}");
+    }
+}
+
+#[test]
+fn cauchy_mle_matches_live_scipy_with_free_and_fixed_parameters() {
+    let python = std::env::var("FSCI_PYTHON").unwrap_or_else(|_| "python3".into());
+    let required = std::env::var("FSCI_REQUIRE_SCIPY_ORACLE").as_deref() == Ok("1");
+    let available = Command::new(&python)
+        .args(["-c", "import numpy; import scipy"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !available {
+        assert!(!required, "required SciPy oracle is unavailable via {python}");
+        eprintln!("SKIP Cauchy MLE: SciPy oracle unavailable; compared cases = 0");
+        return;
+    }
+    let script = r#"
+import os
+import numpy as np
+import scipy
+from scipy import stats, optimize
+print('versions', scipy.__version__, np.__version__)
+if os.environ.get('FSCI_REQUIRE_SCIPY_ORACLE') == '1':
+    assert (scipy.__version__, np.__version__) == ('1.17.1', '2.4.3')
+def accurate_fit(fun, start, args=(), disp=0):
+    return optimize.fmin(fun, start, args=args, disp=disp,
+                         xtol=1e-10, ftol=1e-10, maxiter=2000, maxfun=8000)
+for case, (loc, scale) in enumerate([(0., 1.), (3., .2), (-5., 4.)]):
+    data = stats.cauchy.rvs(loc=loc, scale=scale, size=2000,
+                            random_state=np.random.default_rng(71800 + case))
+    for kind, kwargs in [('free', {}), ('floc', {'floc': loc}),
+                         ('fscale', {'fscale': scale})]:
+        fitted = stats.cauchy.fit(data, optimizer=accurate_fit, **kwargs)
+        nll = -stats.cauchy.logpdf(data, *fitted).sum()
+        print(case, kind, *(format(x, '.17g') for x in fitted), format(nll, '.17g'))
+        print(' '.join(format(x, '.17g') for x in data))
+"#;
+    let output = Command::new(&python).args(["-c", script]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "SciPy Cauchy MLE oracle failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut lines = stdout.lines();
+    let versions = lines.next().expect("oracle version metadata");
+    eprintln!("Cauchy MLE oracle {versions}");
+    if required {
+        assert_eq!(versions, "versions 1.17.1 2.4.3");
+    }
+    let mut compared = 0;
+    while let Some(header) = lines.next() {
+        let fields: Vec<_> = header.split_whitespace().collect();
+        let case: usize = fields[0].parse().unwrap();
+        let kind = fields[1];
+        let expected_loc: f64 = fields[2].parse().unwrap();
+        let expected_scale: f64 = fields[3].parse().unwrap();
+        let expected_nll: f64 = fields[4].parse().unwrap();
+        let data: Vec<f64> = lines
+            .next()
+            .expect("oracle observations")
+            .split_whitespace()
+            .map(|value| value.parse().unwrap())
+            .collect();
+        assert_eq!(data.len(), 2000);
+        let fitted = if kind == "free" {
+            Cauchy::try_fit(&data).unwrap()
+        } else {
+            let quartiles = fsci_stats::quantile(&data, &[0.25, 0.5, 0.75]);
+            let parameters = [
+                if kind == "floc" {
+                    MleParameter::Fixed(expected_loc)
+                } else {
+                    MleParameter::Free(quartiles[1])
+                },
+                if kind == "fscale" {
+                    MleParameter::Fixed(expected_scale)
+                } else {
+                    MleParameter::Positive(0.5 * (quartiles[2] - quartiles[0]))
+                },
+            ];
+            fit_mle(
+                &data,
+                &parameters,
+                |p| {
+                    Some(Cauchy {
+                        loc: p[0],
+                        scale: p[1],
+                    })
+                },
+                MleOptions::default(),
+            )
+            .unwrap()
+            .distribution
+        };
+        let nll = likelihood(&fitted, &data);
+        assert!(nll <= expected_nll + 1.0e-8 * expected_nll.abs().max(1.0));
+        assert!(
+            (fitted.loc - expected_loc).abs() <= 2.0e-6 * expected_loc.abs().max(expected_scale),
+            "{case}/{kind}: location {} != {expected_loc}",
+            fitted.loc
+        );
+        assert!(
+            (fitted.scale - expected_scale).abs() <= 2.0e-6 * expected_scale,
+            "{case}/{kind}: scale {} != {expected_scale}",
+            fitted.scale
+        );
+        if kind == "floc" {
+            assert_eq!(fitted.loc.to_bits(), expected_loc.to_bits());
+        } else if kind == "fscale" {
+            assert_eq!(fitted.scale.to_bits(), expected_scale.to_bits());
+        }
+        eprintln!(
+            "Cauchy/{case}/{kind}: fsci=({:.12e},{:.12e}) SciPy=({expected_loc:.12e},{expected_scale:.12e}) NLL fsci={nll:.12e} SciPy={expected_nll:.12e}",
+            fitted.loc, fitted.scale
+        );
+        compared += 1;
+    }
+    assert_eq!(compared, 9, "all free/fixed Cauchy fits must be compared");
+    eprintln!("Cauchy MLE compared cases = {compared}; samples per case = 2000");
 }
 
 #[test]
