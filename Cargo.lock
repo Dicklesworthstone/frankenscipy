@@ -896,7 +896,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-arrayapi"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "criterion",
  "fsci-runtime",
@@ -908,7 +908,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-cluster"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "criterion",
  "fsci-linalg",
@@ -918,7 +918,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-conformance"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "asupersync",
  "blake3",
@@ -951,15 +951,15 @@ dependencies = [
 
 [[package]]
 name = "fsci-constants"
-version = "0.5.0"
+version = "0.5.1"
 
 [[package]]
 name = "fsci-datasets"
-version = "0.5.0"
+version = "0.5.1"
 
 [[package]]
 name = "fsci-fft"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "criterion",
  "fsci-runtime",
@@ -969,7 +969,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-integrate"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "criterion",
  "fsci-opt",
@@ -983,7 +983,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-interpolate"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "criterion",
  "fsci-fft",
@@ -996,7 +996,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-io"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "criterion",
  "fsci-runtime",
@@ -1007,7 +1007,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-linalg"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "criterion",
  "fsci-fft",
@@ -1022,7 +1022,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-ndimage"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "criterion",
  "fsci-fft",
@@ -1033,14 +1033,14 @@ dependencies = [
 
 [[package]]
 name = "fsci-odr"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "criterion",
 ]
 
 [[package]]
 name = "fsci-opt"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "criterion",
  "fsci-runtime",
@@ -1054,7 +1054,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-runtime"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "blake3",
  "criterion",
@@ -1065,7 +1065,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-signal"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "criterion",
  "fsci-fft",
@@ -1076,7 +1076,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-sparse"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "criterion",
  "fsci-linalg",
@@ -1093,7 +1093,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-spatial"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "criterion",
  "fsci-linalg",
@@ -1104,7 +1104,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-special"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "criterion",
  "fsci-integrate",
@@ -1115,7 +1115,7 @@ dependencies = [
 
 [[package]]
 name = "fsci-stats"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "criterion",
  "fsci-fft",

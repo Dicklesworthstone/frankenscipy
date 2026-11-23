@@ -2,6 +2,37 @@
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-11-23
+
+Supersedes the unpublished `v0.5.0` source tag (`95af13267`) as the live
+crates.io and GitHub Release for all 19 `fsci-*` crates.
+
+### Fixed
+
+- **Constrained differential evolution (`fsci-opt`, `3ef449521`):**
+  - Check constraint feasibility before evaluating differential-evolution
+    objectives and count actual objective calls including non-finite feasible
+    results.
+  - Replace the range-based stopping shortcut with a scaled population standard
+    deviation and an explicit validated absolute tolerance.
+- **Generalized Pareto MLE and tail stability (`fsci-stats`, `b33628b19`):**
+  - Replace the shape moment estimate with constrained fixed-location/scale MLE,
+    including explicit handling for unbounded or unidentifiable likelihoods.
+  - Correct finite-support density and survival endpoints, and evaluate CDF,
+    log probabilities, and inverse tails without small-shape cancellation or
+    avoidable product overflow.
+- **Narrow interval-censored likelihoods (`fsci-stats`, `1df61a5ea`):**
+  - Recover narrow interval mass with bounded, error-checked log-scaled density
+    quadrature when endpoint tail logarithms lose separation, preserve support
+    checks, reject invalid probability models, and factor the positive digamma
+    score solver for gamma-family fits.
+- **Workspace release-gate tests (`12a2c0a51`):**
+  - Import `rand::RngExt` in `diff_stats_genpareto.rs` for `rand 0.10.4`
+    compatibility under `-D warnings`.
+  - Serialize the 256×128 tall / 128×256 wide `pinv` certificate test in
+    `fsci-linalg` against `toggle_ab_pinv_cholesky::LOCK` so parallel test
+    threads do not race on global toggle hit counters.
+
 ## [0.5.0] — 2026-11-22
 
 ### Added
