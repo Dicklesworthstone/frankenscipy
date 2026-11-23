@@ -1638,8 +1638,12 @@ pub struct DifferentialEvolutionOptions {
     pub maxiter: usize,
     /// Population size multiplier (popsize * ndim = actual population).
     pub popsize: usize,
-    /// Convergence tolerance on function value spread.
+    /// Relative convergence tolerance on the population's objective values:
+    /// `std(fitness) <= atol + tol * abs(mean(fitness))`.
     pub tol: f64,
+    /// Absolute convergence tolerance on the same spread (default zero).
+    /// Infeasible members or nonfinite objective values prevent convergence.
+    pub atol: f64,
     /// Mutation factor (scaling of difference vectors), typically in [0.5, 2].
     pub mutation: f64,
     /// Crossover probability, typically in [0.5, 1.0].
@@ -1661,6 +1665,7 @@ impl Default for DifferentialEvolutionOptions {
             maxiter: 1000,
             popsize: 15,
             tol: 1e-8,
+            atol: 0.0,
             mutation: 0.8,
             recombination: 0.7,
             seed: None,
@@ -1717,8 +1722,33 @@ fn de_ranks_before(a: (f64, f64), b: (f64, f64)) -> bool {
     }
 }
 
+/// SciPy's population standard-deviation test, scaled before taking moments.
+/// Squaring raw energies can underflow for small objectives or overflow even
+/// when their standard deviation is representable. Normalizing also keeps an
+/// overflowing sum from turning a finite constant objective's mean into infinity.
+fn de_population_converged(fitness: &[f64], tol: f64, atol: f64) -> bool {
+    if fitness.iter().any(|value| !value.is_finite()) {
+        return false;
+    }
+    let scale = fitness
+        .iter()
+        .fold(0.0_f64, |scale, value| scale.max(value.abs()));
+    if scale == 0.0 {
+        return true;
+    }
+    let count = fitness.len() as f64;
+    let mean = fitness.iter().map(|value| value / scale).sum::<f64>() / count;
+    let variance = fitness
+        .iter()
+        .map(|value| (value / scale - mean).powi(2))
+        .sum::<f64>()
+        / count;
+    variance.sqrt() <= atol / scale + tol * mean.abs()
+}
+
 /// Differential evolution over `evaluate(x) = (objective, violation)`. Returns the result and
-/// the violation of the reported point.
+/// the violation of the reported point. The evaluator calls the objective only
+/// when the constraint violation is zero; infeasible points have infinite energy.
 fn differential_evolution_core<E>(
     evaluate: E,
     bounds: &[(f64, f64)],
@@ -1771,6 +1801,14 @@ where
     if !opts.tol.is_finite() || opts.tol < 0.0 {
         return Err(OptError::InvalidArgument {
             detail: format!("tol must be a finite non-negative value, got {}", opts.tol),
+        });
+    }
+    if !opts.atol.is_finite() || opts.atol < 0.0 {
+        return Err(OptError::InvalidArgument {
+            detail: format!(
+                "atol must be a finite non-negative value, got {}",
+                opts.atol
+            ),
         });
     }
     if !opts.mutation.is_finite() || opts.mutation < 0.0 {
@@ -1875,7 +1913,7 @@ where
     };
     let (mut fitness, mut violation): (Vec<f64>, Vec<f64>) =
         population.iter().map(|x| evaluate_point(x)).unzip();
-    let mut nfev = pop_count;
+    let mut nfev = violation.iter().filter(|&&value| value == 0.0).count();
 
     // Track best.
     let mut best_idx = 0;
@@ -1926,7 +1964,7 @@ where
 
             // Selection.
             let scored_trial = evaluate_point(&trial);
-            nfev += 1;
+            nfev += usize::from(scored_trial.1 == 0.0);
             if de_accepts(scored_trial, (fitness[i], violation[i])) {
                 population[i].copy_from_slice(&trial);
                 (fitness[i], violation[i]) = scored_trial;
@@ -1936,33 +1974,12 @@ where
             }
         }
 
-        // Check convergence: spread of fitness values.
-        let fmin = fitness
-            .iter()
-            .cloned()
-            .fold(f64::INFINITY, |a: f64, b: f64| {
-                if a.is_nan() || b.is_nan() {
-                    f64::NAN
-                } else {
-                    a.min(b)
-                }
-            });
-        let fmax = fitness
-            .iter()
-            .cloned()
-            .fold(f64::NEG_INFINITY, |a: f64, b: f64| {
-                if a.is_nan() || b.is_nan() {
-                    f64::NAN
-                } else {
-                    a.max(b)
-                }
-            });
         // As SciPy, whose infeasible members carry infinite energy: no spread test passes while
         // any member is infeasible.
         if violation.iter().all(|&v| v == 0.0)
-            && (fmax - fmin).abs() <= opts.tol * (1.0 + fmin.abs())
+            && de_population_converged(&fitness, opts.tol, opts.atol)
         {
-            // status: all members feasible and fitness spread ≤ tol·(1+|fmin|)
+            // status: all members feasible and std(fitness) ≤ atol + tol·|mean(fitness)|
             converged = true;
             break;
         }
@@ -2008,6 +2025,9 @@ where
 /// objective, infeasible ones by violation; the population converges only once every member is
 /// feasible. `maxcv` reports the violation of the returned point, and an infeasible point is
 /// never a success ("The solution does not satisfy the constraints, MAXCV = ...").
+/// The objective is evaluated only for feasible points, so it may be defined
+/// solely on the constraint domain. `nfev` counts actual objective calls; an
+/// entirely infeasible population returns an infinite objective and `nfev == 0`.
 ///
 /// This replaced a quadratic exterior penalty (br-7470), which could only discourage
 /// infeasibility: it put the optimum of `x^2` under `x >= 1` at `x = 1 - 1e-6` and reported
@@ -2024,14 +2044,17 @@ where
 {
     let scored = |x: &[f64]| {
         let v = constraint_violation(x);
-        (
-            func(x),
-            if v.is_nan() {
-                f64::INFINITY
-            } else {
-                v.max(0.0)
-            },
-        )
+        let violation = if v.is_nan() {
+            f64::INFINITY
+        } else {
+            v.max(0.0)
+        };
+        let objective = if violation == 0.0 {
+            func(x)
+        } else {
+            f64::INFINITY
+        };
+        (objective, violation)
     };
     let (mut result, violation) = differential_evolution_core(scored, bounds, opts)?;
     result.maxcv = Some(violation);
@@ -8008,6 +8031,159 @@ mod tests {
     }
 
     // ── Differential Evolution tests ───────────────────────────────
+
+    #[test]
+    fn de_small_objective_scale_does_not_cause_false_convergence() {
+        // Multiplying an objective by an exact power of two changes neither
+        // its minimizer nor the relative population spread. In particular a
+        // small objective must not gain an implicit absolute tolerance.
+        for scale in [2.0_f64.powi(-500), 1.0, 2.0_f64.powi(500)] {
+            let result = differential_evolution(
+                |x| scale * (x[0] - 0.25).powi(2),
+                &[(-5.0, 5.0)],
+                DifferentialEvolutionOptions {
+                    seed: Some(7),
+                    ..Default::default()
+                },
+            )
+            .expect("scaled objective");
+            assert!(result.success, "scale={scale:e}: {}", result.message);
+            assert!(
+                (result.x[0] - 0.25).abs() < 1e-10,
+                "scale={scale:e}: x={:?}, nit={}",
+                result.x,
+                result.nit
+            );
+            assert!(
+                result.nit > 1,
+                "a scattered initial population is not converged"
+            );
+        }
+    }
+
+    #[test]
+    fn de_constrained_only_evaluates_the_feasible_objective_domain() {
+        let objective_calls = std::cell::Cell::new(0);
+        let constraint_calls = std::cell::Cell::new(0);
+        let result = differential_evolution_constrained(
+            |x| {
+                assert!(x[0] >= 1.0, "infeasible objective evaluation at {x:?}");
+                objective_calls.set(objective_calls.get() + 1);
+                x[0].ln() + 1.0
+            },
+            &[(-2.0, 2.0)],
+            |x| {
+                constraint_calls.set(constraint_calls.get() + 1);
+                (1.0 - x[0]).max(0.0)
+            },
+            DifferentialEvolutionOptions {
+                seed: Some(7),
+                ..Default::default()
+            },
+        )
+        .expect("objective defined only on feasible points");
+        assert!(result.success, "{}", result.message);
+        assert!((result.x[0] - 1.0).abs() < 1e-6, "{:?}", result.x);
+        assert_eq!(result.maxcv, Some(0.0));
+        assert_eq!(result.nfev, objective_calls.get());
+        assert!(objective_calls.get() > 0);
+        assert!(constraint_calls.get() > objective_calls.get());
+    }
+
+    #[test]
+    fn de_infeasible_population_has_no_objective_evaluations() {
+        let result = differential_evolution_constrained(
+            |_| panic!("an infeasible problem must not evaluate the objective"),
+            &[(0.0, 2.0)],
+            |x| (3.0 - x[0]).max(0.0),
+            DifferentialEvolutionOptions {
+                maxiter: 30,
+                seed: Some(5),
+                ..Default::default()
+            },
+        )
+        .expect("infeasible problem");
+        assert!(!result.success);
+        assert_eq!(result.status, ConvergenceStatus::Infeasible);
+        assert_eq!(result.nfev, 0);
+        assert_eq!(result.fun, Some(f64::INFINITY));
+        assert!(result.maxcv.unwrap() > 0.0);
+    }
+
+    #[test]
+    fn de_nonfinite_feasible_objectives_are_still_counted() {
+        for value in [f64::INFINITY, f64::NAN] {
+            let calls = std::cell::Cell::new(0);
+            let result = differential_evolution_constrained(
+                |_| {
+                    calls.set(calls.get() + 1);
+                    value
+                },
+                &[(-1.0, 1.0)],
+                |_| 0.0,
+                DifferentialEvolutionOptions {
+                    maxiter: 2,
+                    seed: Some(7),
+                    ..Default::default()
+                },
+            )
+            .expect("feasible objective evaluations");
+            assert!(!result.success);
+            assert_eq!(result.nfev, calls.get());
+            assert_eq!(result.nfev, 45);
+        }
+    }
+
+    #[test]
+    fn de_population_stopping_uses_standard_deviation_without_range_loss() {
+        use crate::de_population_converged;
+
+        // Mean = 2/3, population std = sqrt(8/9): the standard-deviation
+        // criterion passes, whereas a maximum-minus-minimum test would fail.
+        assert!(de_population_converged(&[0.0, 0.0, 2.0], 1.5, 0.0));
+        assert!(!de_population_converged(&[0.0, 0.0, 2.0], 1.0, 0.0));
+        assert!(de_population_converged(&[0.0; 15], 0.0, 0.0));
+        assert!(de_population_converged(&[f64::MAX; 15], 1e-8, 0.0));
+        assert!(!de_population_converged(&[-f64::MAX, f64::MAX], 1e-8, 0.0));
+        assert!(de_population_converged(
+            &[-f64::MAX, f64::MAX],
+            0.0,
+            f64::MAX
+        ));
+        assert!(!de_population_converged(&[1e-300, 2e-300], 0.1, 0.0));
+        assert!(de_population_converged(&[1e-300, 2e-300], 0.0, 1e-300));
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(!de_population_converged(&[1.0, invalid], 1.0, 1.0));
+        }
+    }
+
+    #[test]
+    fn de_absolute_tolerance_is_explicit_and_validated_before_callbacks() {
+        let result = differential_evolution(
+            |x| 1e-20 * (x[0] - 0.25).powi(2),
+            &[(-5.0, 5.0)],
+            DifferentialEvolutionOptions {
+                atol: 1e-12,
+                seed: Some(7),
+                ..Default::default()
+            },
+        )
+        .expect("absolute tolerance");
+        assert!(result.success);
+        assert_eq!(result.nit, 1);
+        for atol in [-1.0, f64::NAN, f64::INFINITY] {
+            let error = differential_evolution(
+                |_| panic!("invalid tolerances must not reach the objective"),
+                &[(-1.0, 1.0)],
+                DifferentialEvolutionOptions {
+                    atol,
+                    ..Default::default()
+                },
+            )
+            .expect_err("invalid absolute tolerance");
+            assert!(matches!(error, OptError::InvalidArgument { .. }));
+        }
+    }
 
     #[test]
     fn de_mixed_integer_callbacks_and_solution_are_feasible() {
