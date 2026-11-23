@@ -15,9 +15,10 @@
 //! `method = Dogbox` uses Powell's dogleg path inside rectangular trust regions, intersected
 //! with the original bounds, with active variables excluded from the Gauss–Newton solve.
 
-use crate::curvefit::{LeastSquaresCallback, LeastSquaresIteration};
+use crate::curvefit::{LeastSquaresCallback, LeastSquaresIteration, LeastSquaresLoss};
 use crate::lsq_matrix::LeastSquaresMatrix;
 use crate::trf_lsmr::{self, TrustRegionSolver};
+use crate::types::OptError;
 use fsci_runtime::RuntimeMode;
 
 const EPS: f64 = f64::EPSILON;
@@ -206,6 +207,107 @@ impl Loss {
     }
 }
 
+/// Keep the built-in arithmetic (including its scale-aware fallbacks) separate
+/// from arbitrary user losses, whose values and derivatives must be validated.
+pub(crate) enum LossFunction {
+    Builtin(Loss),
+    Custom {
+        callback: LeastSquaresLoss,
+        f_scale: f64,
+    },
+}
+
+impl LossFunction {
+    fn rho(&self, f: &[f64]) -> Result<[Vec<f64>; 3], OptError> {
+        let (callback, f_scale) = match self {
+            Self::Builtin(loss) => return Ok(loss.rho(f)),
+            Self::Custom { callback, f_scale } => (callback, f_scale),
+        };
+        let z: Vec<f64> = f.iter().map(|value| (value / f_scale).powi(2)).collect();
+        if z.iter()
+            .zip(f)
+            .any(|(&z, &value)| !z.is_finite() || (z == 0.0 && value != 0.0))
+        {
+            // Unlike the named losses, an arbitrary callback has no known
+            // asymptotic form. Do not silently pass a rounded zero or infinity
+            // that changes the objective into a different fitting problem.
+            return Err(OptError::NonFiniteInput {
+                detail: String::from(
+                    "custom loss requires representable squared residuals divided by f_scale squared",
+                ),
+            });
+        }
+        let mut rho = callback.evaluate(&z)?;
+        let fs2 = f_scale * f_scale;
+        for i in 0..f.len() {
+            let value = rho[0][i] * fs2;
+            rho[0][i] = if fs2.is_normal() && value.is_finite() {
+                value
+            } else {
+                (rho[0][i] * f_scale) * f_scale
+            };
+        }
+        // Keep custom second derivatives in z coordinates. Dividing rho''
+        // by f_scale² and multiplying it by f² later can erase a finite
+        // curvature; rho'' * z evaluates the same quantity without that loss.
+        if rho.iter().flatten().any(|value| !value.is_finite()) {
+            return Err(OptError::NonFiniteInput {
+                detail: String::from(
+                    "f_scale produced nonfinite custom loss values or derivatives",
+                ),
+            });
+        }
+        Ok(rho)
+    }
+
+    fn initial_cost(&self, f: &[f64], rho: &[Vec<f64>; 3]) -> f64 {
+        match self {
+            Self::Builtin(loss) => loss.checked_cost(f, 0.5 * rho[0].iter().sum::<f64>()),
+            Self::Custom { .. } => Self::custom_cost(&rho[0]),
+        }
+    }
+
+    fn custom_cost(values: &[f64]) -> f64 {
+        let ordinary = 0.5 * values.iter().sum::<f64>();
+        if ordinary.is_finite() {
+            ordinary
+        } else {
+            // A finite cost need not have a representable unhalved sum.
+            values.iter().map(|value| 0.5 * value).sum()
+        }
+    }
+
+    fn cost(&self, f: &[f64]) -> Result<f64, OptError> {
+        match self {
+            Self::Builtin(loss) => Ok(loss.cost(f)),
+            Self::Custom { .. } => Ok(Self::custom_cost(&self.rho(f)?[0])),
+        }
+    }
+
+    fn linearized(&self, value: f64, first: f64, second: f64) -> Result<(f64, f64), OptError> {
+        match self {
+            Self::Builtin(loss) => Ok(loss.linearized(value, first, second)),
+            Self::Custom { f_scale, .. } => {
+                // Match SciPy's robust Gauss-Newton model: cap nonpositive
+                // curvature at epsilon, while retaining the exact loss score.
+                let z = (value / f_scale).powi(2);
+                let curvature = first + 2.0 * (second * z);
+                let row_scale = curvature.max(EPS).sqrt();
+                let mut residual = value * (first / row_scale);
+                if !residual.is_finite() || (residual == 0.0 && value != 0.0 && first != 0.0) {
+                    residual = (value * first) / row_scale;
+                }
+                if !curvature.is_finite() || !row_scale.is_finite() || !residual.is_finite() {
+                    return Err(OptError::NonFiniteInput {
+                        detail: String::from("custom loss produced a nonfinite local model"),
+                    });
+                }
+                Ok((row_scale, residual))
+            }
+        }
+    }
+}
+
 /// `x_scale`: fixed positive scales, or SciPy's `'jac'` (inverse column norms of J, never
 /// decreasing across iterations).
 #[derive(Debug, Clone, PartialEq)]
@@ -315,15 +417,21 @@ fn scale_for_robust_loss(
     j: &mut LeastSquaresMatrix,
     f: &mut [f64],
     rho: &[Vec<f64>; 3],
-    loss: &Loss,
-) {
+    loss: &LossFunction,
+) -> Result<(), OptError> {
     let mut row_scale = Vec::with_capacity(f.len());
     for (i, fi) in f.iter_mut().enumerate() {
-        let (js, residual) = loss.linearized(*fi, rho[1][i], rho[2][i]);
+        let (js, residual) = loss.linearized(*fi, rho[1][i], rho[2][i])?;
         *fi = residual;
         row_scale.push(js);
     }
     j.scale_rows(&row_scale);
+    if matches!(loss, LossFunction::Custom { .. }) && !j.all_finite() {
+        return Err(OptError::NonFiniteInput {
+            detail: String::from("custom loss produced a nonfinite scaled Jacobian"),
+        });
+    }
+    Ok(())
 }
 
 /// Thin SVD `J = U·diag(s)·Vᵀ` (singular values descending) by one-sided Jacobi. Returns
@@ -914,13 +1022,13 @@ pub(crate) fn trf<E>(
     gtol: f64,
     max_nfev: Option<usize>,
     x_scale: &XScale,
-    loss: Option<&Loss>,
+    loss: Option<&LossFunction>,
     solver: TrustRegionSolver,
     mode: RuntimeMode,
     callback: Option<&LeastSquaresCallback>,
 ) -> Result<TrfOutcome, E>
 where
-    E: From<NonFiniteJacobian> + From<fsci_sparse::SparseError>,
+    E: From<NonFiniteJacobian> + From<fsci_sparse::SparseError> + From<OptError>,
 {
     let bounded =
         lb.iter().any(|v| *v != f64::NEG_INFINITY) || ub.iter().any(|v| *v != f64::INFINITY);
@@ -934,9 +1042,9 @@ where
     let mut njev = 1;
     let mut cost = match loss {
         Some(l) => {
-            let rho = l.rho(&f);
-            let c = l.checked_cost(&f, 0.5 * rho[0].iter().sum::<f64>());
-            scale_for_robust_loss(&mut j, &mut f, &rho, l);
+            let rho = l.rho(&f)?;
+            let c = l.initial_cost(&f, &rho);
+            scale_for_robust_loss(&mut j, &mut f, &rho, l)?;
             c
         }
         None => linear_cost(&f),
@@ -1098,7 +1206,7 @@ where
                 continue;
             }
             cost_new = match loss {
-                Some(l) => l.cost(&f_new),
+                Some(l) => l.cost(&f_new)?,
                 None => linear_cost(&f_new),
             };
             if !cost_new.is_finite() {
@@ -1138,8 +1246,8 @@ where
             j = jac(&x, &f)?;
             njev += 1;
             if let Some(l) = loss {
-                let rho = l.rho(&f);
-                scale_for_robust_loss(&mut j, &mut f, &rho, l);
+                let rho = l.rho(&f)?;
+                scale_for_robust_loss(&mut j, &mut f, &rho, l)?;
             }
             g = compute_grad(&j, &f)?;
             if jac_scale {
@@ -1253,13 +1361,13 @@ pub(crate) fn dogbox<E>(
     gtol: f64,
     max_nfev: Option<usize>,
     x_scale: &XScale,
-    loss: Option<&Loss>,
+    loss: Option<&LossFunction>,
     solver: TrustRegionSolver,
     mode: RuntimeMode,
     callback: Option<&LeastSquaresCallback>,
 ) -> Result<TrfOutcome, E>
 where
-    E: From<NonFiniteJacobian> + From<fsci_sparse::SparseError>,
+    E: From<NonFiniteJacobian> + From<fsci_sparse::SparseError> + From<OptError>,
 {
     let n = x0.len();
     let mut x = x0.to_vec();
@@ -1270,9 +1378,9 @@ where
     let mut njev = 1;
     let mut cost = match loss {
         Some(l) => {
-            let rho = l.rho(&f);
-            let cost = l.checked_cost(&f, 0.5 * rho[0].iter().sum::<f64>());
-            scale_for_robust_loss(&mut j, &mut f, &rho, l);
+            let rho = l.rho(&f)?;
+            let cost = l.initial_cost(&f, &rho);
+            scale_for_robust_loss(&mut j, &mut f, &rho, l)?;
             cost
         }
         None => linear_cost(&f),
@@ -1395,7 +1503,7 @@ where
                 continue;
             }
             cost_new = match loss {
-                Some(l) => l.cost(&f_new),
+                Some(l) => l.cost(&f_new)?,
                 None => linear_cost(&f_new),
             };
             if !cost_new.is_finite() {
@@ -1443,7 +1551,7 @@ where
             j = jac(&x, &f)?;
             njev += 1;
             if let Some(l) = loss {
-                scale_for_robust_loss(&mut j, &mut f, &l.rho(&f_true), l);
+                scale_for_robust_loss(&mut j, &mut f, &l.rho(&f_true)?, l)?;
             }
             g = compute_grad(&j, &f)?;
             if jac_scale {
@@ -1484,7 +1592,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{Loss, LossKind, XScale, dogbox, svd_thin, trf};
+    use super::{Loss, LossFunction, LossKind, XScale, dogbox, svd_thin, trf};
     use crate::{
         LeastSquaresJacobian, LeastSquaresMatrix, LeastSquaresMethod, LeastSquaresOptions,
         OptError, TrustRegionLsmrOptions, TrustRegionSolver, least_squares,
@@ -1727,10 +1835,10 @@ mod tests {
         let initial = [0.0, 0.0, 1.0];
         let lower = [-10.0, -0.8, 0.0];
         let upper = [1.5, 10.0, 10.0];
-        let loss = Loss {
+        let loss = LossFunction::Builtin(Loss {
             kind: LossKind::SoftL1,
             f_scale: 0.2,
-        };
+        });
         for rectangular in [false, true] {
             for scale in [XScale::Jac, XScale::Fixed(vec![0.3, 2.0, 4.0])] {
                 let solve = if rectangular {

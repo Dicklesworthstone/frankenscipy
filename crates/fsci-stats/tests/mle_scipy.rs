@@ -99,7 +99,10 @@ fn cauchy_fit_maximizes_likelihood_instead_of_returning_quartiles() {
         location_score += 2.0 * z / (1.0 + z * z);
         scale_score += (z * z - 1.0) / (1.0 + z * z);
     }
-    assert!(location_score.abs() < 2.0e-6, "location score={location_score}");
+    assert!(
+        location_score.abs() < 2.0e-6,
+        "location score={location_score}"
+    );
     assert!(scale_score.abs() < 2.0e-6, "scale score={scale_score}");
 
     for factor in [1.0e-150_f64, 1.0e150] {
@@ -181,7 +184,10 @@ fn cauchy_log_likelihood_retains_extreme_finite_observations() {
     ] {
         let actual = distribution.logpdf(x);
         assert!(actual.is_finite());
-        assert!((actual - expected).abs() < 1.0e-12, "{distribution:?}, x={x}");
+        assert!(
+            (actual - expected).abs() < 1.0e-12,
+            "{distribution:?}, x={x}"
+        );
     }
 }
 
@@ -194,7 +200,10 @@ fn cauchy_mle_matches_live_scipy_with_free_and_fixed_parameters() {
         .output()
         .is_ok_and(|output| output.status.success());
     if !available {
-        assert!(!required, "required SciPy oracle is unavailable via {python}");
+        assert!(
+            !required,
+            "required SciPy oracle is unavailable via {python}"
+        );
         eprintln!("SKIP Cauchy MLE: SciPy oracle unavailable; compared cases = 0");
         return;
     }

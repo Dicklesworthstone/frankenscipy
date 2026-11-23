@@ -18077,7 +18077,9 @@ impl ContinuousDistribution for Cauchy {
         };
         let log_scale = self.scale.ln();
         if log_distance > log_scale {
-            log_scale - PI.ln() - 2.0 * log_distance
+            log_scale
+                - PI.ln()
+                - 2.0 * log_distance
                 - (2.0 * (log_scale - log_distance)).exp().ln_1p()
         } else {
             -log_scale - PI.ln() - (2.0 * (log_distance - log_scale)).exp().ln_1p()

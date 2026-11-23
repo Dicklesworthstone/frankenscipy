@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::FiniteDiffMethod;
 use crate::lsq_matrix::LeastSquaresMatrix;
-use crate::trf::{self, Loss, LossKind, XScale};
+use crate::trf::{self, Loss, LossFunction, LossKind, XScale};
 use crate::trf_lsmr::{TrustRegionLsmrOptions, TrustRegionSolver};
 use crate::types::OptError;
 use fsci_sparse::{CsrMatrix, LinearOperator, Shape2D};
@@ -153,6 +153,95 @@ impl LeastSquaresCallback {
 
     pub(crate) fn call(&self, iteration: LeastSquaresIteration<'_>) -> ControlFlow<()> {
         (self.callback)(&iteration)
+    }
+}
+
+/// A caller-defined robust loss for nonlinear least squares.
+///
+/// The callback receives `z[i] = (residual[i] / f_scale)^2` and returns three
+/// rows: `rho(z)`, its first derivative, and its second derivative with respect
+/// to `z`. Each row must contain exactly one finite value per residual. The
+/// solver applies `f_scale` itself, so callbacks return the unscaled loss.
+/// This is SciPy's callable `loss` contract. A vector callback can use different
+/// loss functions for observations and regularization residuals.
+///
+/// Set [`LeastSquaresOptions::custom_loss`] and leave `loss` as `Linear`.
+/// TRF and Dogbox support custom losses with dense, sparse, and matrix-free
+/// Jacobians; LM rejects them. Clones share the callback, which can be invoked
+/// concurrently by batched fits. Return an error from [`Self::new_fallible`]
+/// to abort the solve; malformed or nonfinite rows also return a typed error.
+/// If a nonzero residual's squared scaled value overflows or rounds to zero,
+/// the solve returns an error instead of feeding a different objective to the
+/// callback. Choose residual units and `f_scale` that keep this input representable.
+///
+/// ```
+/// use fsci_opt::{LeastSquaresLoss, LeastSquaresOptions, least_squares};
+///
+/// // A smooth loss distinct from the built-ins: rho(z) = 4*((1+z)^0.25-1).
+/// let loss = LeastSquaresLoss::new(|z| [
+///     z.iter().map(|&z| 4.0 * (0.25 * z.ln_1p()).exp_m1()).collect(),
+///     z.iter().map(|&z| (1.0 + z).powf(-0.75)).collect(),
+///     z.iter().map(|&z| -0.75 * (1.0 + z).powf(-1.75)).collect(),
+/// ]);
+/// let fit = least_squares(
+///     |x| vec![x[0] - 1.0, x[0] - 1.1, x[0] - 20.0],
+///     &[1.0],
+///     LeastSquaresOptions {
+///         custom_loss: Some(loss),
+///         f_scale: 0.1,
+///         ..LeastSquaresOptions::default()
+///     },
+/// ).unwrap();
+/// assert!(fit.success);
+/// assert!((fit.x[0] - 1.05).abs() < 0.01);
+/// ```
+#[derive(Clone)]
+pub struct LeastSquaresLoss {
+    callback: Arc<dyn Fn(&[f64]) -> Result<[Vec<f64>; 3], OptError> + Send + Sync>,
+}
+
+impl std::fmt::Debug for LeastSquaresLoss {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LeastSquaresLoss { callback }")
+    }
+}
+
+impl LeastSquaresLoss {
+    pub fn new<F>(callback: F) -> Self
+    where
+        F: Fn(&[f64]) -> [Vec<f64>; 3] + Send + Sync + 'static,
+    {
+        Self::new_fallible(move |z| Ok(callback(z)))
+    }
+
+    pub fn new_fallible<F>(callback: F) -> Self
+    where
+        F: Fn(&[f64]) -> Result<[Vec<f64>; 3], OptError> + Send + Sync + 'static,
+    {
+        Self {
+            callback: Arc::new(callback),
+        }
+    }
+
+    pub(crate) fn evaluate(&self, z: &[f64]) -> Result<[Vec<f64>; 3], OptError> {
+        let rho = (self.callback)(z)?;
+        for (order, row) in rho.iter().enumerate() {
+            if row.len() != z.len() {
+                return Err(OptError::InvalidArgument {
+                    detail: format!(
+                        "custom loss row {order} has {} values; expected {} residuals",
+                        row.len(),
+                        z.len()
+                    ),
+                });
+            }
+            if row.iter().any(|value| !value.is_finite()) {
+                return Err(OptError::NonFiniteInput {
+                    detail: format!("custom loss row {order} must not contain NaN or Inf"),
+                });
+            }
+        }
+        Ok(rho)
     }
 }
 
@@ -402,6 +491,10 @@ pub struct LeastSquaresOptions {
     pub jac_sparsity: Option<JacobianSparsity>,
     /// Robust loss (`Trf` and `Dogbox`).
     pub loss: LossKind,
+    /// A vectorized custom robust loss (`Trf` and `Dogbox`). Leave `loss` as
+    /// `Linear` when supplying this callback; specifying both is an error.
+    /// `f_scale` applies to the custom loss as it does to built-in robust losses.
+    pub custom_loss: Option<LeastSquaresLoss>,
     /// Soft margin between inlier and outlier residuals for a robust loss.
     pub f_scale: f64,
     /// Parameter scaling: fixed positive scales or `'jac'`. `None` uses unit
@@ -429,6 +522,7 @@ impl Default for LeastSquaresOptions {
             jac: None,
             jac_sparsity: None,
             loss: LossKind::Linear,
+            custom_loss: None,
             f_scale: 1.0,
             x_scale: None,
             callback: None,
@@ -855,7 +949,7 @@ where
             ),
         });
     }
-    if options.loss != LossKind::Linear {
+    if options.loss != LossKind::Linear || options.custom_loss.is_some() {
         return Err(OptError::InvalidArgument {
             detail: String::from("method 'lm' supports only loss='linear'"),
         });
@@ -1467,6 +1561,13 @@ where
             detail: String::from("f_scale must be positive and finite"),
         });
     }
+    if options.custom_loss.is_some() && options.loss != LossKind::Linear {
+        return Err(OptError::InvalidArgument {
+            detail: String::from(
+                "custom_loss and a non-linear built-in loss are mutually exclusive",
+            ),
+        });
+    }
     if options.max_nfev == Some(0) {
         return Err(OptError::InvalidArgument {
             detail: String::from("max_nfev must be positive"),
@@ -1585,10 +1686,17 @@ where
         }
         solver => solver,
     };
-    let loss = (options.loss != LossKind::Linear).then_some(Loss {
-        kind: options.loss,
-        f_scale: options.f_scale,
-    });
+    let loss = if let Some(callback) = &options.custom_loss {
+        Some(LossFunction::Custom {
+            callback: callback.clone(),
+            f_scale: options.f_scale,
+        })
+    } else {
+        (options.loss != LossKind::Linear).then_some(LossFunction::Builtin(Loss {
+            kind: options.loss,
+            f_scale: options.f_scale,
+        }))
+    };
     let mut fun = |x: &[f64]| -> Result<Vec<f64>, OptError> {
         let f = residuals(x);
         if f.len() != m {
@@ -2757,6 +2865,378 @@ mod tests {
     use fsci_sparse::{SparseError, SparseResult};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn custom_weighted_loss(weights: Vec<f64>) -> LeastSquaresLoss {
+        LeastSquaresLoss::new(move |z| {
+            assert_eq!(z.len(), weights.len());
+            [
+                z.iter().zip(&weights).map(|(z, w)| z * w).collect(),
+                weights.clone(),
+                vec![0.0; z.len()],
+            ]
+        })
+    }
+
+    #[test]
+    fn least_squares_custom_loss_uses_vector_values_and_exact_bounds() {
+        // Zero weight suppresses an outlier; the other two observations give
+        // x = (1*0 + 3*2)/(1+3) = 1.5. The constrained minimizer is x = 1.
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            for bounded in [false, true] {
+                let options = LeastSquaresOptions {
+                    method: Some(method),
+                    jac: Some(LeastSquaresJacobian::new(|_| vec![vec![1.0]; 3])),
+                    custom_loss: Some(custom_weighted_loss(vec![1.0, 3.0, 0.0])),
+                    f_scale: 0.2,
+                    gtol: 1e-12,
+                    ftol: 1e-12,
+                    xtol: 1e-12,
+                    ..LeastSquaresOptions::default()
+                };
+                let residuals = |x: &[f64]| vec![x[0], x[0] - 2.0, x[0] - 100.0];
+                let result = if bounded {
+                    least_squares_bounded(residuals, &[0.5], &[0.0], &[1.0], options)
+                } else {
+                    least_squares(residuals, &[0.5], options)
+                }
+                .unwrap();
+                assert!(result.success, "{method:?}, bounded={bounded}: {result:?}");
+                let expected_x = if bounded { 1.0 } else { 1.5 };
+                let expected_cost = if bounded { 2.0 } else { 1.5 };
+                assert!((result.x[0] - expected_x).abs() < 1e-10, "{result:?}");
+                assert!((result.cost - expected_cost).abs() < 1e-10, "{result:?}");
+                assert_eq!(result.active_mask, vec![if bounded { 1 } else { 0 }]);
+                assert!((result.grad[0] - if bounded { -2.0 } else { 0.0 }).abs() < 1e-9);
+                assert_eq!(result.fun[2], result.x[0] - 100.0);
+            }
+        }
+    }
+
+    #[test]
+    fn least_squares_custom_loss_scales_cost_gradient_and_jacobian() {
+        // rho(z)=z², C=2 gives cost=sum(f_i^4)/8,
+        // gradient=sum(f_i^3)/2 and robust J_i=sqrt(3/2)*|f_i|.
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            let result = least_squares(
+                |x| vec![x[0], x[0] - 3.0],
+                &[1.0],
+                LeastSquaresOptions {
+                    method: Some(method),
+                    jac: Some(LeastSquaresJacobian::new(|_| vec![vec![1.0]; 2])),
+                    custom_loss: Some(LeastSquaresLoss::new(|z| {
+                        assert_eq!(z, [0.25, 1.0]);
+                        [
+                            z.iter().map(|z| z * z).collect(),
+                            z.iter().map(|z| 2.0 * z).collect(),
+                            vec![2.0; z.len()],
+                        ]
+                    })),
+                    f_scale: 2.0,
+                    max_nfev: Some(1),
+                    ..LeastSquaresOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(result.status, 0);
+            assert_eq!(result.x, [1.0]);
+            assert_eq!(result.fun, [1.0, -2.0]);
+            assert_eq!(result.cost, 17.0 / 8.0);
+            assert!((result.grad[0] + 3.5).abs() < 1e-14);
+            let jac = result.jac.to_dense().unwrap();
+            assert!((jac[0][0] - 1.5_f64.sqrt()).abs() < 1e-14);
+            assert!((jac[1][0] - 6.0_f64.sqrt()).abs() < 1e-14);
+        }
+    }
+
+    #[test]
+    fn least_squares_custom_loss_preserves_finite_extreme_scale_models() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            for case in 0..3 {
+                let (residual, f_scale, expected_cost, expected_gradient, expected_jacobian) =
+                    match case {
+                        // Multiplying rho'' by two before z overflows, although
+                        // rho' + 2*rho''*z is approximately three.
+                        0 => (1e-154, 1.0, 2.5e-309, 1e-154, 3.0_f64.sqrt()),
+                        // Dividing rho'' by C² first would underflow and erase
+                        // its contribution to the local curvature.
+                        1 => (1e200, 1e200, 0.0, 1e200, 3.0_f64.sqrt()),
+                        // rho'/sqrt(EPS) overflows; multiplying by the tiny
+                        // residual first still gives a finite local model.
+                        _ => (1e-100, 1e-100, 5e-201, 1e208, f64::EPSILON.sqrt()),
+                    };
+                let result = least_squares(
+                    |_| vec![residual],
+                    &[1.0],
+                    LeastSquaresOptions {
+                        method: Some(method),
+                        jac: Some(LeastSquaresJacobian::new(|_| vec![vec![1.0]])),
+                        custom_loss: Some(LeastSquaresLoss::new(move |z| {
+                            let z = z[0];
+                            let shift = z - 1.0;
+                            match case {
+                                0 => [vec![(5e307 * z) * z], vec![1e308 * z], vec![1e308]],
+                                1 => [
+                                    vec![0.5 * shift * shift + shift],
+                                    vec![1.0 + shift],
+                                    vec![1.0],
+                                ],
+                                _ => [
+                                    vec![1.0 + 1e308 * shift - (2.5e307 * shift) * shift],
+                                    vec![1e308 - 5e307 * shift],
+                                    vec![-5e307],
+                                ],
+                            }
+                        })),
+                        f_scale,
+                        gtol: 0.0,
+                        max_nfev: Some(1),
+                        ..LeastSquaresOptions::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(result.status, 0, "{method:?}, case={case}: {result:?}");
+                if expected_cost == 0.0 {
+                    assert_eq!(result.cost, 0.0);
+                } else {
+                    assert!((result.cost / expected_cost - 1.0).abs() < 1e-13);
+                }
+                assert!((result.grad[0] / expected_gradient - 1.0).abs() < 1e-13);
+                let jac = result.jac.to_dense().unwrap();
+                assert!((jac[0][0] / expected_jacobian - 1.0).abs() < 1e-13);
+            }
+        }
+    }
+
+    #[test]
+    fn least_squares_custom_loss_preserves_finite_cost_when_unhalved_sum_overflows() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            let result = least_squares(
+                |_| vec![1e154; 2],
+                &[0.0],
+                LeastSquaresOptions {
+                    method: Some(method),
+                    jac: Some(LeastSquaresJacobian::new(|_| vec![vec![0.0]; 2])),
+                    custom_loss: Some(custom_weighted_loss(vec![1.0; 2])),
+                    ..LeastSquaresOptions::default()
+                },
+            )
+            .unwrap();
+            assert!(result.success, "{method:?}: {result:?}");
+            assert!((result.cost / 1e308 - 1.0).abs() < 1e-14);
+            assert_eq!(result.grad, [0.0]);
+        }
+    }
+
+    #[test]
+    fn least_squares_custom_loss_validates_all_rows_on_every_call() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            for row in 0..3 {
+                for malformed_shape in [false, true] {
+                    for after_initial in [false, true] {
+                        let calls = Arc::new(AtomicUsize::new(0));
+                        let loss_calls = Arc::clone(&calls);
+                        let error = least_squares(
+                            |x| vec![x[0] - 3.0],
+                            &[0.0],
+                            LeastSquaresOptions {
+                                method: Some(method),
+                                jac: Some(LeastSquaresJacobian::new(|_| vec![vec![1.0]])),
+                                custom_loss: Some(LeastSquaresLoss::new(move |z| {
+                                    let call = loss_calls.fetch_add(1, Ordering::Relaxed);
+                                    let mut rho =
+                                        [z.to_vec(), vec![1.0; z.len()], vec![0.0; z.len()]];
+                                    if !after_initial || call > 0 {
+                                        if malformed_shape {
+                                            rho[row].clear();
+                                        } else {
+                                            rho[row][0] = f64::NAN;
+                                        }
+                                    }
+                                    rho
+                                })),
+                                ..LeastSquaresOptions::default()
+                            },
+                        )
+                        .expect_err("every custom-loss evaluation validates all three rows");
+                        if malformed_shape {
+                            assert!(matches!(error, OptError::InvalidArgument { .. }));
+                        } else {
+                            assert!(matches!(error, OptError::NonFiniteInput { .. }));
+                        }
+                        assert_eq!(
+                            calls.load(Ordering::Relaxed),
+                            if after_initial { 2 } else { 1 }
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn least_squares_custom_loss_propagates_callback_errors_without_more_evaluations() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let loss_calls = Arc::clone(&calls);
+            let model_calls = AtomicUsize::new(0);
+            let jac_calls = Arc::new(AtomicUsize::new(0));
+            let jac_counter = Arc::clone(&jac_calls);
+            let error = least_squares(
+                |x| {
+                    model_calls.fetch_add(1, Ordering::Relaxed);
+                    vec![x[0] - 3.0]
+                },
+                &[0.0],
+                LeastSquaresOptions {
+                    method: Some(method),
+                    jac: Some(LeastSquaresJacobian::new(move |_| {
+                        jac_counter.fetch_add(1, Ordering::Relaxed);
+                        vec![vec![1.0]]
+                    })),
+                    custom_loss: Some(LeastSquaresLoss::new_fallible(move |z| {
+                        if loss_calls.fetch_add(1, Ordering::Relaxed) != 0 {
+                            return Err(OptError::InvalidArgument {
+                                detail: String::from("custom loss rejected the trial"),
+                            });
+                        }
+                        Ok([z.to_vec(), vec![1.0; z.len()], vec![0.0; z.len()]])
+                    })),
+                    ..LeastSquaresOptions::default()
+                },
+            )
+            .expect_err("callback errors abort the solve");
+            assert!(matches!(
+                error,
+                OptError::InvalidArgument { detail } if detail == "custom loss rejected the trial"
+            ));
+            assert_eq!(calls.load(Ordering::Relaxed), 2);
+            assert_eq!(model_calls.load(Ordering::Relaxed), 2);
+            assert_eq!(jac_calls.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn least_squares_custom_loss_rejects_conflicting_options_before_model_calls() {
+        for method in [
+            LeastSquaresMethod::Trf,
+            LeastSquaresMethod::Dogbox,
+            LeastSquaresMethod::Lm,
+        ] {
+            let error = least_squares(
+                |_| panic!("invalid custom-loss options must not evaluate the model"),
+                &[0.0],
+                LeastSquaresOptions {
+                    method: Some(method),
+                    loss: if method == LeastSquaresMethod::Lm {
+                        LossKind::Linear
+                    } else {
+                        LossKind::Cauchy
+                    },
+                    custom_loss: Some(LeastSquaresLoss::new(|_| {
+                        panic!("invalid custom-loss options must not evaluate the loss")
+                    })),
+                    ..LeastSquaresOptions::default()
+                },
+            )
+            .expect_err("ambiguous losses and non-linear LM losses are unsupported");
+            assert!(matches!(error, OptError::InvalidArgument { .. }));
+        }
+    }
+
+    #[test]
+    fn least_squares_custom_loss_rejects_unrepresentable_normalization() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            for scale in [1e-200, 1e200] {
+                let error = least_squares(
+                    |_| vec![1.0],
+                    &[0.0],
+                    LeastSquaresOptions {
+                        method: Some(method),
+                        jac: Some(LeastSquaresJacobian::new(|_| vec![vec![0.0]])),
+                        custom_loss: Some(LeastSquaresLoss::new(|_| {
+                            panic!("rounded zero/infinity must not reach a custom loss")
+                        })),
+                        f_scale: scale,
+                        ..LeastSquaresOptions::default()
+                    },
+                )
+                .expect_err("a rounded custom-loss input cannot certify convergence");
+                assert!(matches!(error, OptError::NonFiniteInput { .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn least_squares_custom_loss_accepts_empty_residuals() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            let result = least_squares(
+                |_| vec![],
+                &[1.0, 2.0],
+                LeastSquaresOptions {
+                    method: Some(method),
+                    jac: Some(LeastSquaresJacobian::new(|_| vec![])),
+                    custom_loss: Some(custom_weighted_loss(vec![])),
+                    ..LeastSquaresOptions::default()
+                },
+            )
+            .unwrap();
+            assert!(result.success);
+            assert_eq!(result.x, [1.0, 2.0]);
+            assert_eq!(result.grad, [0.0, 0.0]);
+            assert_eq!(result.cost, 0.0);
+        }
+    }
+
+    #[test]
+    fn curve_fit_and_batched_least_squares_preserve_custom_loss() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            let fit = curve_fit_bounded(
+                |_, p| p[0],
+                &[0.0, 1.0, 2.0],
+                &[1.0, 3.0, 9.0],
+                &[0.0],
+                &[2.0],
+                CurveFitOptions {
+                    p0: Some(vec![0.5]),
+                    sigma: Some(CurveFitSigma::StandardDeviations(vec![1.0, 2.0, 1.0])),
+                    absolute_sigma: true,
+                    ls_options: LeastSquaresOptions {
+                        method: Some(method),
+                        jac: Some(LeastSquaresJacobian::new(|_| vec![vec![1.0]; 3])),
+                        custom_loss: Some(custom_weighted_loss(vec![4.0, 2.0, 0.0])),
+                        gtol: 1e-12,
+                        ftol: 1e-12,
+                        xtol: 1e-12,
+                        ..LeastSquaresOptions::default()
+                    },
+                },
+            )
+            .unwrap();
+            // Whitening changes the physical weights to [4, 1/2, 0].
+            assert!((fit.popt[0] - 11.0 / 9.0).abs() < 1e-9, "{fit:?}");
+            assert!((fit.ls_result.cost - 8.0 / 9.0).abs() < 1e-9);
+            assert!((fit.pcov[0][0] - 2.0 / 9.0).abs() < 1e-9);
+
+            let rows = [vec![0.0, 2.0, 100.0], vec![10.0, 12.0, -100.0]];
+            let fitted = least_squares_many(
+                |p, observations| observations.iter().map(|y| p[0] - y).collect(),
+                &[0.5],
+                &rows,
+                LeastSquaresOptions {
+                    method: Some(method),
+                    jac: Some(LeastSquaresJacobian::new(|_| vec![vec![1.0]; 3])),
+                    custom_loss: Some(custom_weighted_loss(vec![1.0, 3.0, 0.0])),
+                    ..LeastSquaresOptions::default()
+                },
+            );
+            assert_eq!(fitted.len(), 2);
+            for (result, expected) in fitted.into_iter().zip([1.5, 11.5]) {
+                let result = result.unwrap();
+                assert!(result.success, "{result:?}");
+                assert!((result.x[0] - expected).abs() < 1e-8, "{result:?}");
+            }
+        }
+    }
 
     #[test]
     fn least_squares_callback_stops_with_current_bounded_robust_state() {

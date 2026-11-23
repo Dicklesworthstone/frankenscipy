@@ -7,12 +7,273 @@
 use std::process::Command;
 
 use fsci_opt::{
-    FiniteDiffMethod, JacobianSparsity, LeastSquaresJacobian, LeastSquaresMethod,
+    FiniteDiffMethod, JacobianSparsity, LeastSquaresJacobian, LeastSquaresLoss, LeastSquaresMethod,
     LeastSquaresOptions, LossKind, OptError, TrustRegionLsmrOptions, TrustRegionSolver, XScale,
     least_squares, least_squares_bounded,
 };
 use fsci_sparse::{CsrMatrix, DenseLinearOperator, Shape2D};
 use serde::{Deserialize, Serialize};
+
+fn custom_loss_residuals(x: &[f64]) -> Vec<f64> {
+    let noise = [0.05, -0.01, 0.02, 1.5, -0.04, 0.01, -1.0, 0.03, 0.0];
+    let mut residuals: Vec<f64> = noise
+        .iter()
+        .enumerate()
+        .map(|(i, noise)| {
+            let t = i as f64 * 0.5;
+            x[0] * (-x[1] * t).exp() - (2.2 * (-0.7 * t).exp() + noise)
+        })
+        .collect();
+    // A parameter prior is kept quadratic by the mixed loss.
+    residuals.push(0.6 * (x[1] - 0.4));
+    residuals
+}
+
+fn custom_loss_jacobian(x: &[f64]) -> Vec<Vec<f64>> {
+    let mut jac: Vec<Vec<f64>> = (0..9)
+        .map(|i| {
+            let t = f64::from(i) * 0.5;
+            let exponential = (-x[1] * t).exp();
+            vec![exponential, -x[0] * t * exponential]
+        })
+        .collect();
+    jac.push(vec![0.0, 0.6]);
+    jac
+}
+
+fn custom_loss_callback(kind: &'static str) -> LeastSquaresLoss {
+    LeastSquaresLoss::new(move |z| {
+        let mut rho = std::array::from_fn(|_| Vec::with_capacity(z.len()));
+        for (i, &value) in z.iter().enumerate() {
+            let (loss, first, second) = if kind == "mixed" && i + 1 == z.len() {
+                (value, 1.0, 0.0)
+            } else if kind == "weighted" {
+                let weight = 0.5 + (i % 3) as f64;
+                let root = (1.0 + value).sqrt();
+                (
+                    weight * 2.0 * (root - 1.0),
+                    weight / root,
+                    -0.5 * weight / (root * root * root),
+                )
+            } else {
+                (
+                    4.0 * (0.25 * value.ln_1p()).exp_m1(),
+                    (1.0 + value).powf(-0.75),
+                    -0.75 * (1.0 + value).powf(-1.75),
+                )
+            };
+            rho[0].push(loss);
+            rho[1].push(first);
+            rho[2].push(second);
+        }
+        rho
+    })
+}
+
+#[test]
+fn custom_losses_match_live_scipy_for_dense_sparse_and_operator_jacobians() {
+    #[derive(Debug, Deserialize)]
+    struct CustomLossRow {
+        x: Vec<f64>,
+        fun: Vec<f64>,
+        cost: f64,
+        grad: Vec<f64>,
+        active_mask: Vec<i8>,
+        status: i32,
+    }
+
+    #[derive(Deserialize)]
+    struct CustomLossOracle {
+        scipy: String,
+        numpy: String,
+        rows: Vec<CustomLossRow>,
+    }
+
+    let required = std::env::var("FSCI_REQUIRE_SCIPY_ORACLE").as_deref() == Ok("1");
+    let python = std::env::var("FSCI_PYTHON").unwrap_or_else(|_| "python3".into());
+    let available = Command::new(&python)
+        .args(["-c", "import scipy; import numpy"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !available {
+        assert!(!required, "required SciPy oracle unavailable via {python}");
+        eprintln!("SKIP custom least-squares losses: missing SciPy; compared cases = 0");
+        return;
+    }
+    let mut cases = Vec::new();
+    for method in ["trf", "dogbox"] {
+        for bounded in [false, true] {
+            for storage in ["dense", "sparse", "operator"] {
+                for kind in ["power", "mixed", "weighted"] {
+                    cases.push((method, bounded, storage, kind));
+                }
+            }
+        }
+    }
+    let script = r#"
+import json, os, sys
+import numpy as np
+import scipy
+from scipy.optimize import least_squares
+from scipy.sparse import csr_array
+from scipy.sparse.linalg import aslinearoperator
+if os.environ.get("FSCI_REQUIRE_SCIPY_ORACLE") == "1":
+    assert (scipy.__version__, np.__version__) == ("1.17.1", "2.4.3")
+t = np.arange(9)*0.5
+y = 2.2*np.exp(-0.7*t) + np.array([.05,-.01,.02,1.5,-.04,.01,-1.,.03,0.])
+def residuals(x):
+    return np.r_[x[0]*np.exp(-x[1]*t)-y, .6*(x[1]-.4)]
+rows = []
+for method, bounded, storage, kind in json.loads(sys.argv[1]):
+    def jac(x):
+        e = np.exp(-x[1]*t)
+        matrix = np.vstack((np.column_stack((e, -x[0]*t*e)), [0., .6]))
+        return (csr_array(matrix) if storage == "sparse" else
+                aslinearoperator(matrix) if storage == "operator" else matrix)
+    def loss(z):
+        if kind == "weighted":
+            weights = .5 + np.arange(len(z)) % 3
+            root = np.sqrt(1+z)
+            return np.array([2*weights*(root-1), weights/root, -.5*weights/root**3])
+        rho = np.array([4*np.expm1(.25*np.log1p(z)), (1+z)**(-.75), -.75*(1+z)**(-1.75)])
+        if kind == "mixed":
+            rho[:, -1] = [z[-1], 1., 0.]
+        return rho
+    options = dict(jac=jac, method=method, loss=loss, f_scale=.25,
+                   x_scale=[1., .5], gtol=1e-12, ftol=1e-12, xtol=1e-12,
+                   max_nfev=1000)
+    if storage != "dense":
+        options["tr_options"] = dict(atol=1e-12, btol=1e-12)
+    if bounded:
+        options["bounds"] = ([0., .9], [5., 3.])
+    result = least_squares(residuals, [1., .95], **options)
+    assert result.success, (method, bounded, storage, kind, result.message)
+    rows.append(dict(x=result.x.tolist(), fun=result.fun.tolist(), cost=result.cost,
+                     grad=result.grad.tolist(), active_mask=result.active_mask.astype(int).tolist(),
+                     status=int(result.status)))
+print(json.dumps(dict(scipy=scipy.__version__, numpy=np.__version__, rows=rows), allow_nan=False))
+"#;
+    let output = Command::new(&python)
+        .args(["-c", script, &serde_json::to_string(&cases).unwrap()])
+        .output()
+        .expect("launch custom-loss SciPy oracle");
+    assert!(
+        output.status.success(),
+        "custom-loss SciPy oracle failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let oracle: CustomLossOracle = serde_json::from_slice(&output.stdout).unwrap();
+    if required {
+        assert_eq!((&*oracle.scipy, &*oracle.numpy), ("1.17.1", "2.4.3"));
+    }
+    assert_eq!(oracle.rows.len(), cases.len());
+    let mut compared = 0;
+    for ((method, bounded, storage, kind), reference) in cases.iter().zip(&oracle.rows) {
+        let jac = match *storage {
+            "sparse" => LeastSquaresJacobian::new_sparse(|x| {
+                let dense = custom_loss_jacobian(x);
+                let mut data = Vec::new();
+                let mut indices = Vec::new();
+                let mut indptr = vec![0];
+                for row in &dense {
+                    for (column, &value) in row.iter().enumerate() {
+                        if value != 0.0 {
+                            data.push(value);
+                            indices.push(column);
+                        }
+                    }
+                    indptr.push(data.len());
+                }
+                CsrMatrix::from_components(Shape2D::new(10, 2), data, indices, indptr, true)
+                    .unwrap()
+            }),
+            "operator" => LeastSquaresJacobian::new_operator(|x| {
+                DenseLinearOperator::from_rows(&custom_loss_jacobian(x)).unwrap()
+            }),
+            _ => LeastSquaresJacobian::new(custom_loss_jacobian),
+        };
+        let options = LeastSquaresOptions {
+            method: Some(if *method == "trf" {
+                LeastSquaresMethod::Trf
+            } else {
+                LeastSquaresMethod::Dogbox
+            }),
+            jac: Some(jac),
+            tr_solver: if *storage == "dense" {
+                TrustRegionSolver::Exact
+            } else {
+                TrustRegionSolver::Lsmr(TrustRegionLsmrOptions {
+                    atol: 1e-12,
+                    btol: 1e-12,
+                    ..TrustRegionLsmrOptions::default()
+                })
+            },
+            custom_loss: Some(custom_loss_callback(kind)),
+            f_scale: 0.25,
+            x_scale: Some(XScale::Fixed(vec![1.0, 0.5])),
+            gtol: 1e-12,
+            ftol: 1e-12,
+            xtol: 1e-12,
+            max_nfev: Some(1000),
+            ..LeastSquaresOptions::default()
+        };
+        let result = if *bounded {
+            least_squares_bounded(
+                custom_loss_residuals,
+                &[1.0, 0.95],
+                &[0.0, 0.9],
+                &[5.0, 3.0],
+                options,
+            )
+        } else {
+            least_squares(custom_loss_residuals, &[1.0, 0.95], options)
+        }
+        .unwrap_or_else(|error| panic!("{method}/{bounded}/{storage}/{kind}: {error}"));
+        assert!(result.success && reference.status > 0, "{result:?}");
+        assert_eq!(result.active_mask, reference.active_mask);
+        assert_eq!(result.jac.is_operator(), *storage == "operator");
+        assert_eq!(result.jac.as_sparse().is_some(), *storage == "sparse");
+        assert_eq!(result.x.len(), reference.x.len());
+        assert_eq!(result.fun.len(), reference.fun.len());
+        assert_eq!(result.grad.len(), reference.grad.len());
+        for (actual, expected) in result
+            .x
+            .iter()
+            .zip(&reference.x)
+            .chain(result.fun.iter().zip(&reference.fun))
+        {
+            assert!(
+                (actual - expected).abs() <= 1e-6 * expected.abs().max(1.0),
+                "{method}/{bounded}/{storage}/{kind}: {actual} vs {expected}"
+            );
+        }
+        assert!(
+            (result.cost - reference.cost).abs() <= 1e-8 * reference.cost.abs().max(1e-12),
+            "{method}/{bounded}/{storage}/{kind}: cost {} vs {}",
+            result.cost,
+            reference.cost
+        );
+        for (actual, expected) in result.grad.iter().zip(&reference.grad) {
+            assert!(
+                (actual - expected).abs() <= 1e-6 * expected.abs().max(1.0),
+                "{method}/{bounded}/{storage}/{kind}: gradient {actual} vs {expected}"
+            );
+        }
+        compared += 1;
+        eprintln!(
+            "custom loss {method}/{bounded}/{storage}/{kind}: cost={:.12e}, active={:?}",
+            result.cost, result.active_mask
+        );
+    }
+    assert_eq!(
+        compared, 36,
+        "every generated custom-loss case must be compared"
+    );
+    eprintln!(
+        "custom losses: compared {compared} cases against SciPy {} / NumPy {}",
+        oracle.scipy, oracle.numpy
+    );
+}
 
 #[test]
 fn iteration_callbacks_match_live_scipy_stopping_points() {

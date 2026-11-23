@@ -1037,6 +1037,22 @@ its Cholesky whitening expands numerical sparsity dependencies and converts an
 analytic sparse Jacobian to dense storage. Use `least_squares` directly when the
 entire fitting path must avoid dense Jacobian allocation.
 
+##### Caller-defined robust losses
+
+Set `LeastSquaresOptions::custom_loss` to a `LeastSquaresLoss::new` callback
+to supply a loss beyond the built-in families or use different losses for
+observations and regularization residuals. The callback receives the vector
+`z = (residual / f_scale)^2` and returns three equally sized rows containing
+`rho(z)`, `rho'(z)`, and `rho''(z)`. Leave the built-in `loss` set to `Linear`;
+the solver applies `f_scale` to the returned values and derivatives.
+
+TRF and Dogbox support these callbacks with dense, CSR, or matrix-free
+Jacobians, including through `curve_fit` and batched fits. Use
+`LeastSquaresLoss::new_fallible` when the callback needs to return an
+`OptError`. Callback errors and invalid row shapes or nonfinite values stop
+the solve. LM rejects custom losses. The callback is shared across batched
+fits, so captured state must support concurrent calls.
+
 #### `fsci-integrate` public surface (selected)
 
 ```text
