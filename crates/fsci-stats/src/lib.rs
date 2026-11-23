@@ -20688,6 +20688,38 @@ impl GenPareto {
     pub fn new(c: f64) -> Self {
         Self { c }
     }
+
+    /// Log survival inside the support. Using the ratio rather than dividing
+    /// `ln_1p(c*x)` by c preserves the exponential limit even when c*x is
+    /// subnormal. A positive overflowing product still has a finite logarithm.
+    fn log_survival_inside(&self, x: f64) -> f64 {
+        let product = self.c * x;
+        if product == 0.0 {
+            -x
+        } else if product.is_infinite() {
+            -(self.c.ln() + x.ln()) / self.c
+        } else {
+            -x * (product.ln_1p() / product)
+        }
+    }
+
+    /// Invert a log survival probability without forming `1 - q`, and without
+    /// losing a small shape-times-log-probability product to underflow.
+    fn quantile_from_log_survival(&self, log_probability: f64) -> f64 {
+        let exponential_quantile = -log_probability;
+        let product = self.c * exponential_quantile;
+        if product == 0.0 {
+            exponential_quantile
+        } else if product == f64::NEG_INFINITY {
+            -1.0 / self.c
+        } else if product > f64::MAX.ln() {
+            // exp(product) can overflow while division by a large c rescues
+            // the final quantile. At this scale subtracting one is negligible.
+            (product - self.c.ln()).exp()
+        } else {
+            exponential_quantile * (product.exp_m1() / product)
+        }
+    }
 }
 
 impl ContinuousDistribution for GenPareto {
@@ -20700,93 +20732,72 @@ impl ContinuousDistribution for GenPareto {
     }
 
     fn pdf(&self, x: f64) -> f64 {
-        if x < 0.0 {
-            return 0.0;
-        }
-        let c = self.c;
-        if c.abs() < 1e-15 {
-            (-x).exp()
-        } else {
-            let t = 1.0 + c * x;
-            if t <= 0.0 {
-                return 0.0;
-            }
-            t.powf(-1.0 / c - 1.0)
-        }
+        self.logpdf(x).exp()
     }
 
     fn logpdf(&self, x: f64) -> f64 {
-        // −x (c→0) or (−1/c−1)·ln(1+c·x); finite in the tail. frankenscipy-p82v7
-        if x < 0.0 {
+        if x.is_nan() || !self.c.is_finite() {
+            return f64::NAN;
+        }
+        if x < 0.0 || x == f64::INFINITY {
             return f64::NEG_INFINITY;
         }
         let c = self.c;
-        if c.abs() < 1e-15 {
-            -x
-        } else {
-            let t = 1.0 + c * x;
-            if t <= 0.0 {
+        if c < 0.0 {
+            let endpoint = -1.0 / c;
+            if x > endpoint {
                 return f64::NEG_INFINITY;
             }
-            (-1.0 / c - 1.0) * t.ln()
+            if x == endpoint {
+                return if c < -1.0 {
+                    f64::INFINITY
+                } else if c == -1.0 {
+                    0.0
+                } else {
+                    f64::NEG_INFINITY
+                };
+            }
         }
+        (1.0 + c) * self.log_survival_inside(x)
     }
 
     fn cdf(&self, x: f64) -> f64 {
-        if x < 0.0 {
-            return 0.0;
-        }
-        let c = self.c;
-        if c.abs() < 1e-15 {
-            1.0 - (-x).exp()
+        let log_survival = self.logsf(x);
+        if log_survival == 0.0 {
+            0.0
         } else {
-            let t = 1.0 + c * x;
-            if t <= 0.0 {
-                return if c > 0.0 { 0.0 } else { 1.0 };
-            }
-            1.0 - t.powf(-1.0 / c)
+            -log_survival.exp_m1()
+        }
+    }
+
+    fn logcdf(&self, x: f64) -> f64 {
+        let log_survival = self.logsf(x);
+        if log_survival < -std::f64::consts::LN_2 {
+            (-log_survival.exp()).ln_1p()
+        } else {
+            (-log_survival.exp_m1()).ln()
         }
     }
 
     fn sf(&self, x: f64) -> f64 {
-        // Closed-form survival (1 + c·x)^(-1/c), or e^(-x) for c→0 — the default
-        // 1−cdf collapses to 0 in the right tail (genpareto(0).sf(40) scipy
-        // 4.2e-18). frankenscipy-w3f6m
-        if x < 0.0 {
-            return 1.0;
-        }
-        let c = self.c;
-        if c.abs() < 1e-15 {
-            (-x).exp()
-        } else {
-            let t = 1.0 + c * x;
-            if t <= 0.0 {
-                return if c > 0.0 { 0.0 } else { 1.0 };
-            }
-            t.powf(-1.0 / c)
-        }
+        self.logsf(x).exp()
     }
 
     fn logsf(&self, x: f64) -> f64 {
-        // log sf = −(1/c)·ln(1+c·x), or −x for c→0; finite in the ultra-extreme
-        // tail where ln(sf) would be −inf. frankenscipy-czegj
-        if x < 0.0 {
+        if x.is_nan() || !self.c.is_finite() {
+            return f64::NAN;
+        }
+        if x <= 0.0 {
             return 0.0;
         }
-        let c = self.c;
-        if c.abs() < 1e-15 {
-            -x
-        } else {
-            let t = 1.0 + c * x;
-            if t <= 0.0 {
-                return if c > 0.0 { f64::NEG_INFINITY } else { 0.0 };
-            }
-            -(1.0 / c) * t.ln()
+        if x == f64::INFINITY || (self.c < 0.0 && x >= -1.0 / self.c) {
+            return f64::NEG_INFINITY;
         }
+        self.log_survival_inside(x)
     }
 
     fn ppf(&self, q: f64) -> f64 {
-        if !(0.0..=1.0).contains(&q) {
+        if !(0.0..=1.0).contains(&q) || !self.c.is_finite() {
             return f64::NAN;
         }
         if q == 0.0 {
@@ -20799,12 +20810,20 @@ impl ContinuousDistribution for GenPareto {
                 f64::INFINITY
             };
         }
-        let c = self.c;
-        if c.abs() < 1e-15 {
-            -(1.0 - q).ln()
-        } else {
-            ((1.0 - q).powf(-c) - 1.0) / c
+        self.quantile_from_log_survival((-q).ln_1p())
+    }
+
+    fn isf(&self, q: f64) -> f64 {
+        if !(0.0..=1.0).contains(&q) || !self.c.is_finite() {
+            return f64::NAN;
         }
+        if q == 0.0 {
+            return self.ppf(1.0);
+        }
+        if q == 1.0 {
+            return 0.0;
+        }
+        self.quantile_from_log_survival(q.ln())
     }
 
     fn mean(&self) -> f64 {
@@ -20861,51 +20880,68 @@ impl ContinuousDistribution for GenPareto {
         1.0 + self.c
     }
 
+    /// Maximum likelihood for shape c with location zero and scale one,
+    /// matching `scipy.stats.genpareto.fit(data, floc=0, fscale=1)`.
+    ///
+    /// A successful fit has finite log density at every observation. If all
+    /// observations are zero the shape is unidentifiable. If the largest
+    /// positive observation is below one, the likelihood is unbounded as a
+    /// singular upper endpoint approaches that observation; this returns
+    /// `NonConvergent` instead of reporting a finite approximation as an MLE.
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        if data.len() < 2 {
-            return Err(FitError::InsufficientData {
-                required: 2,
-                actual: data.len(),
+        if active_stats_mode() == RuntimeMode::Hardened && data.len() > hardened_max_sample_len() {
+            return Err(FitError::ResourceExhausted {
+                detail: "Hardened mode fit sample length exceeds HARDENED_MAX_SAMPLE_LEN",
             });
         }
-        // Method-of-moments: at unit scale, E[X | c] = 1/(1-c) for c < 1.
-        // Solving for c: c_hat = 1 - 1/sample_mean = (mean - 1) / mean.
-        let mut sum = 0.0_f64;
-        let mut count = 0usize;
+        validate_finite_fit_data(data, 2, "GenPareto")?;
+        let mut largest = 0.0_f64;
         for &x in data {
-            if !x.is_finite() {
-                return Err(FitError::UnsupportedData(format!(
-                    "GenPareto data contains non-finite value: {x}"
-                )));
-            }
             if x < 0.0 {
                 return Err(FitError::UnsupportedData(format!(
                     "GenPareto support starts at 0; got {x}"
                 )));
             }
-            sum += x;
-            count += 1;
+            largest = largest.max(x);
         }
-        let mean = sum / count as f64;
-        if mean <= 0.0 || !mean.is_finite() {
-            return Err(FitError::NonConvergent(format!(
-                "GenPareto MoM: sample mean {mean} is non-positive"
-            )));
+        if largest == 0.0 {
+            return Err(FitError::NonConvergent(
+                "GenPareto shape is unidentifiable for an all-zero sample".into(),
+            ));
         }
-        let c = (mean - 1.0) / mean;
-        if !c.is_finite() {
-            return Err(FitError::NonConvergent(format!(
-                "GenPareto MoM produced non-finite shape: {c}"
-            )));
+        if largest < 1.0 {
+            return Err(FitError::NonConvergent(
+                "GenPareto fixed-scale likelihood is unbounded at a singular sample endpoint"
+                    .into(),
+            ));
         }
-        Ok(Self { c })
+        if largest == 1.0 {
+            // c=-1 is uniform on [0,1], with log likelihood zero. Every
+            // admissible c>-1 has density <=1 at all these observations.
+            return Ok(Self { c: -1.0 });
+        }
+        fit_mle(
+            data,
+            &[MleParameter::Above {
+                initial: 1.0,
+                lower: -1.0 / largest,
+            }],
+            |parameters| Some(Self { c: parameters[0] }),
+            MleOptions::default(),
+        )
+        .map(|fit| fit.distribution)
     }
 
     fn mode(&self) -> f64 {
-        // GenPareto pdf = (1 + c·x)^{−(1/c + 1)} on x ≥ 0 is strictly
-        // decreasing in x for every valid c, so the mode is the boundary
-        // 0 (frankenscipy-tlw2q).
-        0.0
+        if !self.c.is_finite() || self.c == -1.0 {
+            // c=-1 is uniform: there is no unique mode.
+            f64::NAN
+        } else if self.c < -1.0 {
+            // The density increases to a singular finite upper endpoint.
+            -1.0 / self.c
+        } else {
+            0.0
+        }
     }
 }
 
@@ -98633,6 +98669,108 @@ mod tests {
     }
 
     #[test]
+    fn genpareto_finite_support_tails_and_endpoint_density() {
+        for c in [-2.0_f64, -1.0, -0.5, -0.25] {
+            let distribution = GenPareto::new(c);
+            let endpoint = -1.0 / c;
+            for x in [endpoint, endpoint.next_up(), endpoint * 2.0] {
+                assert_eq!(distribution.cdf(x), 1.0, "c={c}, x={x}");
+                assert_eq!(distribution.sf(x), 0.0, "c={c}, x={x}");
+                assert_eq!(distribution.logsf(x), f64::NEG_INFINITY);
+                assert_eq!(distribution.logcdf(x), 0.0);
+            }
+            let expected_density = if c < -1.0 {
+                f64::INFINITY
+            } else if c == -1.0 {
+                1.0
+            } else {
+                0.0
+            };
+            assert_eq!(distribution.pdf(endpoint), expected_density);
+            assert_eq!(distribution.logpdf(endpoint), expected_density.ln());
+            assert_eq!(distribution.pdf(endpoint.next_up()), 0.0);
+            assert_eq!(distribution.logpdf(endpoint.next_up()), f64::NEG_INFINITY);
+            let inside = endpoint * 0.75;
+            assert!((distribution.cdf(inside) + distribution.sf(inside) - 1.0).abs() < 1e-15);
+        }
+    }
+
+    #[test]
+    fn genpareto_quantiles_and_log_tails_preserve_small_probabilities() {
+        for c in [-0.5_f64, -1e-12, -1e-300, 0.0, 1e-300, 1e-12, 0.5, 2.0] {
+            let distribution = GenPareto::new(c);
+            for q in [1e-30_f64, 1e-16, 1e-8, 0.25, 0.75] {
+                let x = distribution.ppf(q);
+                assert!(x > 0.0 && x.is_finite(), "c={c}, q={q}, x={x}");
+                assert!(
+                    (distribution.cdf(x) / q - 1.0).abs() < 2e-13,
+                    "c={c}, q={q}"
+                );
+                assert!((distribution.logcdf(x) - q.ln()).abs() < 2e-13);
+                if c >= 0.0 || q >= 1e-8 {
+                    // Deeper bounded-tail quantiles can round to the finite
+                    // support endpoint; require round trips only when resolvable.
+                    let right = distribution.isf(q);
+                    assert!(right.is_finite(), "c={c}, q={q}");
+                    assert!((distribution.logsf(right) - q.ln()).abs() < 2e-11);
+                }
+            }
+        }
+        for c in [-0.5_f64, 0.0, 0.5] {
+            let distribution = GenPareto::new(c);
+            assert!(distribution.pdf(f64::NAN).is_nan());
+            assert!(distribution.sf(f64::NAN).is_nan());
+            assert!(distribution.ppf(f64::NAN).is_nan());
+            assert!(distribution.isf(-0.1).is_nan());
+            assert_eq!(distribution.isf(1.0), 0.0);
+            assert_eq!(distribution.isf(0.0), distribution.ppf(1.0));
+            assert_eq!(distribution.sf(f64::INFINITY), 0.0);
+            assert_eq!(distribution.logpdf(f64::INFINITY), f64::NEG_INFINITY);
+        }
+    }
+
+    #[test]
+    fn genpareto_mode_tracks_the_density_shape() {
+        assert_eq!(GenPareto::new(-2.0).mode(), 0.5);
+        assert!(
+            GenPareto::new(-1.0).mode().is_nan(),
+            "uniform mode is not unique"
+        );
+        for c in [-0.5_f64, 0.0, 1.0, 2.0] {
+            let distribution = GenPareto::new(c);
+            assert_eq!(distribution.mode(), 0.0);
+            assert!(distribution.pdf(0.0) > distribution.pdf(0.25));
+        }
+    }
+
+    #[test]
+    fn genpareto_extreme_products_preserve_representable_values() {
+        for c in [f64::from_bits(1), f64::from_bits(2), 1e-300] {
+            for x in [0.125_f64, 0.75, 1e-300] {
+                let distribution = GenPareto::new(c);
+                assert_eq!(distribution.logsf(x), -x, "c={c}, x={x}");
+                assert_eq!(distribution.logpdf(x), -x, "c={c}, x={x}");
+                assert!(
+                    (distribution.ppf(x.min(0.25)) / (-(-x.min(0.25)).ln_1p()) - 1.0).abs() < 2e-15
+                );
+            }
+        }
+        // A tiny shape is not interchangeable with zero when x is large.
+        let distribution = GenPareto::new(1e-300);
+        let expected = -std::f64::consts::LN_2 * 1e300;
+        assert!((distribution.logsf(1e300) / expected - 1.0).abs() < 2e-15);
+        let distribution = GenPareto::new(1e308);
+        let expected_logsf = -(1e308_f64.ln() + 1e308_f64.ln()) / 1e308;
+        assert_eq!(distribution.logsf(1e308), expected_logsf);
+        assert!(distribution.logpdf(1e308).is_finite());
+        let q = 710.0 / 1e308;
+        let quantile = distribution.ppf(q);
+        let expected = (710.0 - 1e308_f64.ln()).exp();
+        assert!((quantile / expected - 1.0).abs() < 3e-13);
+        assert!((distribution.cdf(quantile) / q - 1.0).abs() < 3e-13);
+    }
+
+    #[test]
     fn gen_pareto_ppf_cdf_roundtrip_all_branches() {
         let qs = [0.05_f64, 0.25, 0.5, 0.75, 0.95];
         for &c in &[-0.5_f64, -0.25, 0.0, 0.25, 0.5] {
@@ -104211,34 +104349,67 @@ mod tests {
     }
 
     #[test]
-    fn genpareto_fit_metamorphic_mean_inverts_c() {
-        // For any c < 1 at unit scale, drawing samples whose mean is m
-        // should recover c = (m-1)/m. Verify directly with synthetic data.
+    fn genpareto_fit_maximizes_likelihood_instead_of_matching_a_moment() {
+        // The old method-of-moments value c=(mean-1)/mean is not a stationary
+        // likelihood fit, even on this small well-behaved sample.
         let data = [0.5_f64, 1.0, 1.5, 2.0, 2.5, 3.0];
         let n = data.len() as f64;
         let m = data.iter().sum::<f64>() / n;
         let fitted = GenPareto::try_fit(&data).expect("fit");
-        let expected = (m - 1.0) / m;
-        assert!(
-            (fitted.c - expected).abs() < 1e-15,
-            "GenPareto MoM: c={} expected {expected}",
-            fitted.c
-        );
+        let likelihood = |c| {
+            data.iter()
+                .map(|&x| GenPareto::new(c).logpdf(x))
+                .sum::<f64>()
+        };
+        assert!(likelihood(fitted.c) > likelihood((m - 1.0) / m) + 0.01);
+        assert!(likelihood(fitted.c) > likelihood(fitted.c - 1e-4));
+        assert!(likelihood(fitted.c) > likelihood(fitted.c + 1e-4));
+
+        // For observations all equal to two the shape score vanishes at c=0.
+        // This exercises the removable singularity in the likelihood at zero.
+        let exponential = GenPareto::try_fit(&[2.0; 8]).expect("finite maximum at c=0");
+        assert!(exponential.c.abs() < 1e-7, "shape={}", exponential.c);
+    }
+
+    #[test]
+    fn genpareto_fit_respects_sample_support_and_likelihood_existence() {
+        let boundary_data = [0.1, 0.2, 1.0];
+        let fitted = GenPareto::try_fit(&boundary_data).expect("uniform boundary maximum");
+        assert_eq!(fitted.c, -1.0);
+        for x in boundary_data {
+            assert_eq!(fitted.logpdf(x), 0.0);
+        }
+        let interior = GenPareto::try_fit(&[0.0, 0.1, 0.2, 0.9, 1.1]).expect("interior MLE");
+        assert!(interior.c > -1.0 / 1.1);
+        assert!(interior.c < 0.0);
+        assert!(interior.logpdf(1.1).is_finite());
+
+        // At fixed location/scale the likelihood is unbounded if the largest
+        // positive observation is below one: c approaches -1/max(data) < -1
+        // and the endpoint density diverges. No finite fit may be fabricated.
+        for data in [&[0.1, 0.2, 0.5][..], &[0.0, 0.25][..], &[0.5, 0.5][..]] {
+            assert!(matches!(
+                GenPareto::try_fit(data),
+                Err(FitError::NonConvergent(_))
+            ));
+        }
+        assert!(matches!(
+            GenPareto::try_fit(&[0.1, f64::INFINITY]),
+            Err(FitError::UnsupportedData(_))
+        ));
     }
 
     #[test]
     fn genpareto_fit_synthetic_recovery() {
         // Synthesize n=2000 samples from GenPareto(c=0.3) via inverse CDF;
-        // MoM recovers c within 5%. Note: the deterministic-ppf grid is
-        // biased for heavy tails so we cap the upper-tail samples.
+        // The deterministic quantile grid approximates the population MLE.
         let true_c = 0.3;
         let dist = GenPareto::new(true_c);
         let n = 2000;
         let samples: Vec<f64> = (1..=n)
             .map(|i| dist.ppf((i as f64 - 0.5) / n as f64))
-            .filter(|x| x.is_finite() && *x < 1.0e6)
             .collect();
-        assert!(samples.len() > 1500);
+        assert_eq!(samples.len(), n);
         let fitted = GenPareto::try_fit(&samples).expect("fit");
         let rel = (fitted.c - true_c).abs() / true_c;
         assert!(

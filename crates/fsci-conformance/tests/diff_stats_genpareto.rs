@@ -1,10 +1,10 @@
 #![forbid(unsafe_code)]
 //! Live SciPy differential coverage for `scipy.stats.genpareto`.
 //!
-//! Resolves [frankenscipy-q9zdr]. GenPareto has anchor tests in
-//! `fsci-stats/src/lib.rs` but no dedicated scipy diff harness.
-//! Covers all three regimes: c < 0 (bounded support), c = 0
-//! (exponential limit), c > 0 (heavy unbounded tail).
+//! Covers bounded support (including endpoint density and survival), the
+//! exponential limit, heavy tails, log probabilities, inverse tails, and
+//! fixed-location/scale maximum likelihood (frankenscipy-1ksfv.14).
+//! Every requested output is counted, including matching infinities.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -13,8 +13,10 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::compare_ledger::oracle_f64;
 use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{ContinuousDistribution, GenPareto};
+use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
@@ -38,29 +40,58 @@ struct PpfCase {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct FitCase {
+    case_id: String,
+    data: Vec<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct OracleQuery {
     points: Vec<PointCase>,
     ppf: Vec<PpfCase>,
+    fit: Vec<FitCase>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct PointArm {
     case_id: String,
+    #[serde(default, deserialize_with = "oracle_f64")]
     pdf: Option<f64>,
+    #[serde(default, deserialize_with = "oracle_f64")]
+    logpdf: Option<f64>,
+    #[serde(default, deserialize_with = "oracle_f64")]
     cdf: Option<f64>,
+    #[serde(default, deserialize_with = "oracle_f64")]
+    logcdf: Option<f64>,
+    #[serde(default, deserialize_with = "oracle_f64")]
     sf: Option<f64>,
+    #[serde(default, deserialize_with = "oracle_f64")]
+    logsf: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct PpfArm {
     case_id: String,
+    #[serde(default, deserialize_with = "oracle_f64")]
     ppf: Option<f64>,
+    #[serde(default, deserialize_with = "oracle_f64")]
+    isf: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FitArm {
+    case_id: String,
+    c: Option<f64>,
+    log_likelihood: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct OracleResult {
     points: Vec<PointArm>,
     ppf: Vec<PpfArm>,
+    fit: Vec<FitArm>,
+    scipy_version: String,
+    numpy_version: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -109,9 +140,10 @@ fn generate_query() -> OracleQuery {
     // GenPareto support depends on c:
     //   c >= 0: x in [0, ∞)
     //   c <  0: x in [0, -1/c]
-    // For each c, sample x in a way that respects the support.
-    let cs = [-1.0_f64, -0.5, 0.0, 0.3, 0.5, 1.0];
-    let qs = [0.05_f64, 0.25, 0.5, 0.75, 0.95];
+    let cs = [-2.0_f64, -1.0, -0.5, -1e-12, 0.0, 1e-12, 0.3, 0.5, 1.0];
+    let qs = [
+        0.0_f64, 1e-30, 1e-16, 1e-8, 0.05, 0.25, 0.5, 0.75, 0.95, 1.0,
+    ];
     let mut points = Vec::new();
     for &c in &cs {
         let upper = if c < 0.0 { (-1.0 / c) * 0.95 } else { 5.0 };
@@ -120,6 +152,20 @@ fn generate_query() -> OracleQuery {
             let x = frac * upper;
             points.push(PointCase {
                 case_id: format!("c{c}_x{x:.4}"),
+                c,
+                x,
+            });
+        }
+        let mut xs = vec![-0.1, 0.0, 1e-30];
+        if c < 0.0 {
+            let endpoint = -1.0 / c;
+            xs.extend([endpoint, endpoint.next_up(), 2.0 * endpoint]);
+        } else {
+            xs.extend([100.0, 1e100]);
+        }
+        for (index, x) in xs.into_iter().enumerate() {
+            points.push(PointCase {
+                case_id: format!("boundary_c{c}_{index}"),
                 c,
                 x,
             });
@@ -135,17 +181,73 @@ fn generate_query() -> OracleQuery {
             });
         }
     }
+    let mut fit = vec![
+        FitCase {
+            case_id: "fit_mom_is_not_mle".into(),
+            data: vec![0.5, 1.0, 1.5, 2.0, 2.5, 3.0],
+        },
+        FitCase {
+            case_id: "fit_uniform_endpoint".into(),
+            data: vec![0.1, 0.2, 1.0],
+        },
+        FitCase {
+            case_id: "fit_zero_shape".into(),
+            data: vec![2.0; 8],
+        },
+        FitCase {
+            case_id: "fit_mom_excludes_observation".into(),
+            data: vec![0.0, 0.1, 0.2, 0.9, 1.1],
+        },
+        FitCase {
+            case_id: "fit_heavy_tail".into(),
+            data: vec![0.1, 0.4, 2.0, 10.0, 100.0, 1000.0],
+        },
+    ];
+    for c in [-0.75_f64, -0.25, 0.0, 0.25, 0.75, 2.0] {
+        for seed in [17, 29, 43] {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let data = (0..2_000)
+                .map(|_| {
+                    let q = rng.random::<f64>();
+                    let t = -(-q).ln_1p();
+                    if c == 0.0 { t } else { (c * t).exp_m1() / c }
+                })
+                .collect();
+            fit.push(FitCase {
+                case_id: format!("fit_c{c}_seed{seed}"),
+                data,
+            });
+        }
+    }
     OracleQuery {
         points,
         ppf: ppf_cases,
+        fit,
     }
 }
 
 fn scipy_oracle_or_skip(query: &OracleQuery) -> Option<OracleResult> {
     let script = r#"
 import json
+import math
 import sys
+import numpy as np
+import scipy
+from scipy.optimize import fmin
 from scipy.stats import genpareto
+
+def fval(value):
+    value = float(value)
+    if math.isfinite(value):
+        return value
+    return "nan" if math.isnan(value) else ("inf" if value > 0 else "-inf")
+
+def optimizer(func, x0, args=(), disp=0):
+    result = fmin(func, x0, args=args, disp=0, xtol=1e-12, ftol=1e-12,
+                  maxiter=4000, maxfun=8000, full_output=True)
+    if result[4] != 0:
+        raise RuntimeError("SciPy likelihood fit did not converge")
+    return result[0]
 
 q = json.load(sys.stdin)
 points = []
@@ -155,9 +257,12 @@ for case in q["points"]:
     try:
         points.append({
             "case_id": cid,
-            "pdf": float(genpareto.pdf(x, c)),
-            "cdf": float(genpareto.cdf(x, c)),
-            "sf":  float(genpareto.sf(x, c)),
+            "pdf": fval(genpareto.pdf(x, c)),
+            "logpdf": fval(genpareto.logpdf(x, c)),
+            "cdf": fval(genpareto.cdf(x, c)),
+            "logcdf": fval(genpareto.logcdf(x, c)),
+            "sf": fval(genpareto.sf(x, c)),
+            "logsf": fval(genpareto.logsf(x, c)),
         })
     except Exception:
         points.append({"case_id": cid, "pdf": None, "cdf": None, "sf": None})
@@ -165,10 +270,22 @@ ppf = []
 for case in q["ppf"]:
     cid = case["case_id"]; c = float(case["c"]); qv = float(case["q"])
     try:
-        ppf.append({"case_id": cid, "ppf": float(genpareto.ppf(qv, c))})
+        ppf.append({"case_id": cid, "ppf": fval(genpareto.ppf(qv, c)),
+                    "isf": fval(genpareto.isf(qv, c))})
     except Exception:
-        ppf.append({"case_id": cid, "ppf": None})
-print(json.dumps({"points": points, "ppf": ppf}))
+        ppf.append({"case_id": cid, "ppf": None, "isf": None})
+fit = []
+for case in q["fit"]:
+    try:
+        c, loc, scale = genpareto.fit(case["data"], floc=0, fscale=1, optimizer=optimizer)
+        fit.append({"case_id": case["case_id"], "c": float(c),
+                    "log_likelihood": float(np.sum(genpareto.logpdf(case["data"], c)))})
+    except Exception as error:
+        print(case["case_id"], repr(error), file=sys.stderr)
+        fit.append({"case_id": case["case_id"], "c": None, "log_likelihood": None})
+print(json.dumps({"points": points, "ppf": ppf, "fit": fit,
+                  "scipy_version": scipy.__version__, "numpy_version": np.__version__},
+                 allow_nan=False))
 "#;
 
     let query_json = serde_json::to_string(query).expect("serialize genpareto query");
@@ -225,6 +342,11 @@ fn diff_stats_genpareto() {
     };
     assert_eq!(oracle.points.len(), query.points.len());
     assert_eq!(oracle.ppf.len(), query.ppf.len());
+    assert_eq!(oracle.fit.len(), query.fit.len());
+    eprintln!(
+        "GenPareto oracle: SciPy {}, NumPy {}",
+        oracle.scipy_version, oracle.numpy_version
+    );
 
     let pmap: HashMap<String, PointArm> = oracle
         .points
@@ -236,25 +358,46 @@ fn diff_stats_genpareto() {
         .into_iter()
         .map(|r| (r.case_id.clone(), r))
         .collect();
+    let fitmap: HashMap<String, FitArm> = oracle
+        .fit
+        .into_iter()
+        .map(|row| (row.case_id.clone(), row))
+        .collect();
+    assert_eq!(pmap.len(), query.points.len());
+    assert_eq!(ppfmap.len(), query.ppf.len());
+    assert_eq!(fitmap.len(), query.fit.len());
 
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
-    let mut ledger = CompareLedger::new("diff_stats_genpareto", &["pdf", "cdf", "sf", "ppf"]);
+    let mut ledger = CompareLedger::new(
+        "diff_stats_genpareto",
+        &[
+            "pdf", "logpdf", "cdf", "logcdf", "sf", "logsf", "ppf", "isf", "fit_c", "fit_ll",
+        ],
+    );
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
         let dist = GenPareto::new(case.c);
         let arms = [
             ("pdf", oracle.pdf, dist.pdf(case.x), PDF_TOL),
+            ("logpdf", oracle.logpdf, dist.logpdf(case.x), PDF_TOL),
             ("cdf", oracle.cdf, dist.cdf(case.x), CDF_TOL),
+            ("logcdf", oracle.logcdf, dist.logcdf(case.x), CDF_TOL),
             ("sf", oracle.sf, dist.sf(case.x), CDF_TOL),
+            ("logsf", oracle.logsf, dist.logsf(case.x), CDF_TOL),
         ];
         for (family, scipy, fsci, tol) in arms {
             let Some((s, f)) = ledger.pair(family, &case.case_id, scipy, Some(fsci)) else {
                 continue;
             };
             let d = (f - s).abs();
+            let tol = if family.starts_with("log") {
+                tol * s.abs().max(1.0)
+            } else {
+                tol
+            };
             max_overall = max_overall.max(d);
             ledger.compared(family, &case.case_id, d <= tol);
             diffs.push(CaseDiff {
@@ -269,29 +412,69 @@ fn diff_stats_genpareto() {
     for case in &query.ppf {
         let oracle = ppfmap.get(&case.case_id).expect("validated oracle");
         let dist = GenPareto::new(case.c);
-        let Some((sppf, rust)) =
-            ledger.pair("ppf", &case.case_id, oracle.ppf, Some(dist.ppf(case.q)))
-        else {
-            continue;
-        };
-        let d = (rust - sppf).abs();
-        let scale = sppf.abs().max(1.0);
-        max_overall = max_overall.max(d);
-        ledger.compared("ppf", &case.case_id, d <= PPF_TOL_REL * scale);
-        diffs.push(CaseDiff {
-            case_id: case.case_id.clone(),
-            family: "ppf".into(),
-            abs_diff: d,
-            pass: d <= PPF_TOL_REL * scale,
-        });
+        for (family, scipy, rust) in [
+            ("ppf", oracle.ppf, dist.ppf(case.q)),
+            ("isf", oracle.isf, dist.isf(case.q)),
+        ] {
+            let Some((scipy, rust)) = ledger.pair(family, &case.case_id, scipy, Some(rust)) else {
+                continue;
+            };
+            let d = (rust - scipy).abs();
+            let pass = d <= PPF_TOL_REL * scipy.abs();
+            max_overall = max_overall.max(d);
+            ledger.compared(family, &case.case_id, pass);
+            diffs.push(CaseDiff {
+                case_id: case.case_id.clone(),
+                family: family.into(),
+                abs_diff: d,
+                pass,
+            });
+        }
     }
 
-    let all_pass = diffs.iter().all(|d| d.pass);
+    for case in &query.fit {
+        let oracle = fitmap.get(&case.case_id).expect("validated fit oracle");
+        let fitted = GenPareto::try_fit(&case.data);
+        if let Err(error) = &fitted {
+            eprintln!("{}: Rust fit failed: {error}", case.case_id);
+        }
+        let shape = fitted.as_ref().ok().map(|dist| dist.c);
+        let likelihood = fitted
+            .as_ref()
+            .ok()
+            .map(|dist| case.data.iter().map(|&x| dist.logpdf(x)).sum::<f64>());
+        eprintln!(
+            "{}: c rust={shape:?} scipy={:?}; LL rust={likelihood:?} scipy={:?}",
+            case.case_id, oracle.c, oracle.log_likelihood
+        );
+        for (family, scipy, rust, relative_tolerance) in [
+            ("fit_c", oracle.c, shape, 2e-6),
+            ("fit_ll", oracle.log_likelihood, likelihood, 1e-8),
+        ] {
+            let Some((scipy, rust)) = ledger.pair(family, &case.case_id, scipy, rust) else {
+                continue;
+            };
+            let d = (rust - scipy).abs();
+            let pass = d <= relative_tolerance * scipy.abs().max(1.0);
+            max_overall = max_overall.max(d);
+            ledger.compared(family, &case.case_id, pass);
+            diffs.push(CaseDiff {
+                case_id: case.case_id.clone(),
+                family: family.into(),
+                abs_diff: d,
+                pass,
+            });
+        }
+    }
+
+    let all_pass = ledger.counts().values().all(|counts| {
+        counts.compared_failed == 0 && counts.rust_failed == 0 && counts.oracle_missing == 0
+    });
 
     let log = DiffLog {
         test_id: "diff_stats_genpareto".into(),
         category: "scipy.stats.genpareto".into(),
-        case_count: diffs.len(),
+        case_count: ledger.counts().values().map(|arm| arm.compared_cases).sum(),
         compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
@@ -317,6 +500,14 @@ fn diff_stats_genpareto() {
         diffs.len(),
         max_overall
     );
-    // pdf/cdf/sf compare every point case; ppf has its own (smaller) q-grid.
-    ledger.finish(query.points.len().min(query.ppf.len()));
+    let counts = ledger.finish(1);
+    for arm in ["pdf", "logpdf", "cdf", "logcdf", "sf", "logsf"] {
+        assert_eq!(counts[arm].compared_cases, query.points.len(), "{arm}");
+    }
+    for arm in ["ppf", "isf"] {
+        assert_eq!(counts[arm].compared_cases, query.ppf.len(), "{arm}");
+    }
+    for arm in ["fit_c", "fit_ll"] {
+        assert_eq!(counts[arm].compared_cases, query.fit.len(), "{arm}");
+    }
 }
