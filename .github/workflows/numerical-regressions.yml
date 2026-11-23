@@ -9,6 +9,8 @@ on:
       - "crates/fsci-linalg/**"
       - "crates/fsci-sparse/**"
       - "crates/fsci-stats/**"
+      - "crates/fsci-signal/**"
+      - "crates/fsci-conformance/tests/diff_signal_sosfilt.rs"
       - "crates/fsci-conformance/src/lib.rs"
       - "crates/fsci-conformance/python_oracle/scipy_fft_oracle.py"
       - "crates/fsci-conformance/tests/diff_stats_truncnorm.rs"
@@ -38,7 +40,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [least-squares, sparse-lsmr, distribution-fit, fft-capture, casp, quadrature]
+        lane: [least-squares, sparse-lsmr, distribution-fit, fft-capture, casp, quadrature, signal-state]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -97,6 +99,11 @@ jobs:
               cargo test --locked -p fsci-stats --lib discrete_likelihood_fits -- --nocapture
               cargo test --locked -p fsci-stats --lib randint_fitted_extreme_signed_intervals -- --nocapture
               cargo test --locked -p fsci-stats --test mle_scipy -- --nocapture
+              ;;
+            signal-state)
+              cargo test --locked -p fsci-signal --lib sosfilt_ -- --nocapture
+              cargo test --locked -p fsci-signal --doc SosFilter -- --nocapture
+              cargo test --locked -p fsci-conformance --no-default-features --test diff_signal_sosfilt -- --nocapture
               ;;
             fft-capture)
               cargo test --locked -p fsci-conformance --no-default-features --lib fft -- --nocapture

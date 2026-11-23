@@ -10121,20 +10121,166 @@ pub fn sosfilt(sos: &[SosSection], x: &[f64]) -> Result<Vec<f64>, SignalError> {
     let mut state = vec![[0.0f64; 2]; sos.len()];
     let mut signal = x.to_vec();
 
-    for sample in &mut signal {
-        let mut cur = *sample;
-        for (c, st) in coeffs.iter().zip(state.iter_mut()) {
-            let [b0, b1, b2, a1n, a2n] = *c;
-            // Direct Form II transposed for this biquad section.
-            let yi = b0 * cur + st[0];
-            st[0] = b1 * cur - a1n * yi + st[1];
-            st[1] = b2 * cur - a2n * yi;
-            cur = yi;
-        }
-        *sample = cur;
-    }
+    sosfilt_serial_in_place(&coeffs, &mut state, &mut signal);
 
     Ok(signal)
+}
+
+/// A prepared second-order-section cascade for block-by-block filtering.
+///
+/// Coefficients are normalized once, and each section retains its two Direct
+/// Form II transposed delays between calls. Processing uses the same sample
+/// order for every block size, so changing block boundaries does not change
+/// the output or final state. Separate channels need separate filter instances.
+///
+/// Initial and final states have shape `(n_sections, 2)`, matching
+/// `scipy.signal.sosfilt(..., zi=zi)`. Use [`sosfilt_zi`] (scaled by the
+/// first sample) to start in step-response steady state, or `None` for zeros.
+///
+/// ```
+/// use fsci_signal::SosFilter;
+///
+/// let sos = [[0.5, 0.0, 0.0, 1.0, -0.5, 0.0]];
+/// let mut filter = SosFilter::new(&sos, None).unwrap();
+/// assert_eq!(filter.filter(&[1.0, 1.0]).unwrap(), [0.5, 0.75]);
+/// assert_eq!(filter.filter(&[1.0]).unwrap(), [0.875]);
+/// ```
+#[derive(Debug, Clone)]
+pub struct SosFilter {
+    coefficients: Vec<[f64; 5]>,
+    state: Vec<[f64; 2]>,
+}
+
+impl SosFilter {
+    /// Prepare a cascade with optional initial delay values.
+    ///
+    /// As in [`sosfilt`], sections with nonunit `a0` are normalized.
+    /// Empty cascades, invalid coefficients, and nonfinite or incorrectly
+    /// sized initial states are rejected.
+    pub fn new(sos: &[SosSection], zi: Option<&[[f64; 2]]>) -> Result<Self, SignalError> {
+        if sos.is_empty() {
+            return Err(SignalError::InvalidArgument(
+                "sos must not be empty".to_string(),
+            ));
+        }
+        validate_sos_coefficients_finite(sos, "sosfilt")?;
+        let coefficients: Vec<[f64; 5]> = sos
+            .iter()
+            .map(normalize_sos_section)
+            .collect::<Result<_, _>>()?;
+        if coefficients.iter().flatten().any(|value| !value.is_finite()) {
+            return Err(SignalError::NonFiniteInput {
+                detail: "normalized SOS coefficients must be finite".to_string(),
+            });
+        }
+        let mut filter = Self {
+            coefficients,
+            state: vec![[0.0; 2]; sos.len()],
+        };
+        if let Some(initial) = zi {
+            filter.set_state(initial)?;
+        }
+        Ok(filter)
+    }
+
+    /// Current delays, suitable as `zi` for a subsequent call or checkpoint.
+    #[must_use]
+    pub fn state(&self) -> &[[f64; 2]] {
+        &self.state
+    }
+
+    /// Restore finite delays without changing the filter coefficients.
+    /// Invalid input leaves the current state unchanged.
+    pub fn set_state(&mut self, state: &[[f64; 2]]) -> Result<(), SignalError> {
+        if state.len() != self.state.len() {
+            return Err(SignalError::InvalidArgument(format!(
+                "zi must have one pair of delays per SOS section (expected {}, got {})",
+                self.state.len(),
+                state.len()
+            )));
+        }
+        if state.iter().flatten().any(|value| !value.is_finite()) {
+            return Err(SignalError::NonFiniteInput {
+                detail: "sosfilt initial conditions must be finite".to_string(),
+            });
+        }
+        self.state.copy_from_slice(state);
+        Ok(())
+    }
+
+    /// Clear all delays, retaining the prepared coefficients.
+    pub fn reset(&mut self) {
+        self.state.fill([0.0; 2]);
+    }
+
+    /// Filter a block and retain its final delays for the next block.
+    /// An empty block leaves the state unchanged.
+    pub fn filter(&mut self, x: &[f64]) -> Result<Vec<f64>, SignalError> {
+        let mut y = x.to_vec();
+        self.filter_in_place(&mut y)?;
+        Ok(y)
+    }
+
+    /// Filter into caller-owned output storage without allocating.
+    ///
+    /// Input validation happens before either the output or delays change.
+    /// Finite coefficients can still overflow during filtering; as with
+    /// [`sosfilt`], results follow floating-point arithmetic.
+    pub fn filter_into(&mut self, x: &[f64], y: &mut [f64]) -> Result<(), SignalError> {
+        if x.len() != y.len() {
+            return Err(SignalError::InvalidInputLength {
+                expected: x.len(),
+                actual: y.len(),
+            });
+        }
+        validate_real_values_finite(x, "sosfilt input samples must be finite")?;
+        y.copy_from_slice(x);
+        sosfilt_serial_in_place(&self.coefficients, &mut self.state, y);
+        Ok(())
+    }
+
+    /// Filter a caller-owned block in place without allocating.
+    /// Nonfinite input is rejected before samples or delays change.
+    pub fn filter_in_place(&mut self, x: &mut [f64]) -> Result<(), SignalError> {
+        validate_real_values_finite(x, "sosfilt input samples must be finite")?;
+        sosfilt_serial_in_place(&self.coefficients, &mut self.state, x);
+        Ok(())
+    }
+}
+
+/// Filter an SOS cascade and return both the output and its final delays.
+///
+/// Matches the `(y, zf)` result from `scipy.signal.sosfilt(sos, x, zi=zi)`.
+/// `None` starts with zero delays; otherwise `zi` must have one pair per
+/// section. Feeding the returned state into the next block preserves the
+/// continuous filter response. Empty blocks return the initial state unchanged.
+///
+/// For repeated blocks, [`SosFilter`] retains normalized coefficients and
+/// state, and offers allocation-free filtering into caller-owned storage.
+pub fn sosfilt_with_state(
+    sos: &[SosSection],
+    x: &[f64],
+    zi: Option<&[[f64; 2]]>,
+) -> Result<(Vec<f64>, Vec<[f64; 2]>), SignalError> {
+    let mut filter = SosFilter::new(sos, zi)?;
+    let y = filter.filter(x)?;
+    Ok((y, filter.state))
+}
+
+/// Shared serial DF2T recurrence. A block boundary does not perform any
+/// arithmetic on the delays, preserving the exact continuous sample order.
+fn sosfilt_serial_in_place(coefficients: &[[f64; 5]], state: &mut [[f64; 2]], x: &mut [f64]) {
+    for sample in x {
+        let mut current = *sample;
+        for (c, delays) in coefficients.iter().zip(state.iter_mut()) {
+            let [b0, b1, b2, a1, a2] = *c;
+            let output = b0 * current + delays[0];
+            delays[0] = b1 * current - a1 * output + delays[1];
+            delays[1] = b2 * current - a2 * output;
+            current = output;
+        }
+        *sample = current;
+    }
 }
 
 /// Mode-aware and audit-emitting cascaded second-order section filter (`frankenscipy-3cu8u.3`).
@@ -10693,17 +10839,7 @@ fn sosfilt_in_place(sos: &[SosSection], x: &mut [f64], zi: &[[f64; 2]]) -> Resul
         state.push([zi[i][0], zi[i][1]]);
     }
 
-    for sample in x.iter_mut() {
-        let mut cur = *sample;
-        for (c, st) in coeffs.iter().zip(state.iter_mut()) {
-            let [b0, b1, b2, a1, a2] = *c;
-            let yi = b0 * cur + st[0];
-            st[0] = b1 * cur - a1 * yi + st[1];
-            st[1] = b2 * cur - a2 * yi;
-            cur = yi;
-        }
-        *sample = cur;
-    }
+    sosfilt_serial_in_place(&coeffs, &mut state, x);
     Ok(())
 }
 
@@ -27247,6 +27383,170 @@ mod tests {
     }
 
     // ── SOS filtering tests ────────────────────────────────────────
+
+    #[test]
+    fn sosfilt_streaming_returns_output_and_final_delays() {
+        let sos = [
+            [0.5, 0.25, 0.125, 1.0, -0.4, 0.2],
+            [1.0, -0.3, 0.2, 1.0, 0.25, -0.1],
+        ];
+        let zi = [[0.2, -0.1], [-0.3, 0.4]];
+        let input = [1.0, -2.0, 0.5, 3.0, -1.0, 0.0, 2.0];
+        let expected = [0.4, -0.48, -0.022, 1.2832, 0.11868, 0.316432, 0.8315368];
+        let expected_state = [[0.76626368, 0.09309136], [-0.36405036, 0.24006232]];
+        let (output, state) = sosfilt_with_state(&sos, &input, Some(&zi)).expect("stateful SOS");
+        for (&actual, &expected) in output.iter().zip(&expected) {
+            assert!((actual - expected).abs() < 1e-14, "{actual} != {expected}");
+        }
+        for (&actual, &expected) in state.iter().flatten().zip(expected_state.iter().flatten()) {
+            assert!((actual - expected).abs() < 1e-14, "{actual} != {expected}");
+        }
+
+        // Carrying the delays changes the response; restarting at every block
+        // was the only option exposed by the previous public SOS interface.
+        let mut restarted = sosfilt_with_state(&sos, &input[..3], Some(&zi)).unwrap().0;
+        restarted.extend(sosfilt(&sos, &input[3..]).expect("restarted block"));
+        assert!(
+            restarted[3..]
+                .iter()
+                .zip(&output[3..])
+                .any(|(a, b)| (a - b).abs() > 0.1)
+        );
+
+        let (first, checkpoint) = sosfilt_with_state(&sos, &input[..3], Some(&zi)).unwrap();
+        let (second, final_state) =
+            sosfilt_with_state(&sos, &input[3..], Some(&checkpoint)).unwrap();
+        let continued: Vec<f64> = first.into_iter().chain(second).collect();
+        assert_eq!(continued, output);
+        assert_eq!(final_state, state);
+    }
+
+    #[test]
+    fn sosfilt_streaming_is_independent_of_block_boundaries() {
+        let sections = [
+            [0.25, 0.5, 0.25, 1.0, -0.4, 0.2],
+            [1.0, -0.5, 0.125, 1.0, 0.25, -0.1],
+            [0.5, 0.25, 0.0, 1.0, -0.6, 0.0],
+            [0.5, -0.125, 0.25, 1.0, -0.3, 0.1],
+            [0.5, 0.25, 0.125, 1.0, 0.1, 0.2],
+        ];
+        let input: Vec<f64> = (0..5007)
+            .map(|i| (i as f64 * 0.07).sin() + (i as f64 * 0.19).cos())
+            .collect();
+        for count in [1, 2, 5] {
+            let sos = &sections[..count];
+            let zi: Vec<[f64; 2]> = (0..count)
+                .map(|i| [0.05 * (i + 1) as f64, -0.02 * i as f64])
+                .collect();
+            let (expected, expected_state) = sosfilt_with_state(sos, &input, Some(&zi)).unwrap();
+            for chunk_size in [1, 7, 64, 1024] {
+                let mut filter = SosFilter::new(sos, Some(&zi)).unwrap();
+                let mut actual = vec![0.0; input.len()];
+                for (block, output) in input.chunks(chunk_size).zip(actual.chunks_mut(chunk_size)) {
+                    filter.filter_into(block, output).unwrap();
+                    // Empty chunks must not inject a sample or clear delays.
+                    filter.filter_in_place(&mut []).unwrap();
+                }
+                assert!(
+                    actual
+                        .iter()
+                        .zip(&expected)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "{count} sections with blocks of {chunk_size}"
+                );
+                assert!(
+                    filter
+                        .state()
+                        .iter()
+                        .flatten()
+                        .zip(expected_state.iter().flatten())
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+                );
+            }
+
+            let zero_state = sosfilt_with_state(sos, &input, None).unwrap().0;
+            assert_eq!(zero_state, sosfilt(sos, &input).unwrap());
+        }
+    }
+
+    #[test]
+    fn sosfilt_streaming_supports_steady_state_reset_and_resume() {
+        let sos = [
+            [0.5, 0.0, 0.0, 1.0, -0.5, 0.0],
+            [1.0, 0.0, 0.0, 1.0, -0.3, 0.1],
+            [0.5, 0.25, 0.0, 1.0, 0.0, 0.0],
+        ];
+        let mut zi = sosfilt_zi(&sos).unwrap();
+        for state in &mut zi {
+            state[0] *= 2.0;
+            state[1] *= 2.0;
+        }
+        let mut filter = SosFilter::new(&sos, Some(&zi)).unwrap();
+        let mut constant = [2.0; 32];
+        filter.filter_in_place(&mut constant).unwrap();
+        assert!(constant.iter().all(|&value| (value - 1.875).abs() < 1e-14));
+
+        let checkpoint = filter.state().to_vec();
+        let mut cloned = filter.clone();
+        let continuation = filter.filter(&[0.0, -1.0, 2.0]).unwrap();
+        assert_eq!(cloned.filter(&[0.0, -1.0, 2.0]).unwrap(), continuation);
+        filter.reset();
+        assert!(filter.state().iter().flatten().all(|&value| value == 0.0));
+        filter.set_state(&checkpoint).unwrap();
+        assert_eq!(filter.filter(&[0.0, -1.0, 2.0]).unwrap(), continuation);
+        assert_eq!(filter.state(), cloned.state());
+
+        let (empty, retained) = sosfilt_with_state(&sos, &[], Some(&zi)).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(retained, zi);
+    }
+
+    #[test]
+    fn sosfilt_streaming_normalizes_coefficients_without_rescaling_delays() {
+        let normalized = [
+            [0.5, 0.25, 0.125, 1.0, -0.4, 0.2],
+            [1.0, -0.3, 0.2, 1.0, 0.25, -0.1],
+        ];
+        let scaled: Vec<SosSection> = normalized
+            .iter()
+            .map(|section| section.map(|value| 4.0 * value))
+            .collect();
+        let zi = [[0.2, -0.1], [-0.3, 0.4]];
+        let input = [1.0, -2.0, 0.5, 3.0];
+        assert_eq!(
+            sosfilt_with_state(&scaled, &input, Some(&zi)).unwrap(),
+            sosfilt_with_state(&normalized, &input, Some(&zi)).unwrap()
+        );
+    }
+
+    #[test]
+    fn sosfilt_streaming_validates_before_mutating_buffers_or_state() {
+        let sos = [[0.5, 0.25, 0.0, 1.0, -0.3, 0.1]];
+        assert!(SosFilter::new(&[], None).is_err());
+        assert!(SosFilter::new(&[[1.0, 0.0, 0.0, 0.0, 0.0, 0.0]], None).is_err());
+        assert!(SosFilter::new(&[[f64::NAN, 0.0, 0.0, 1.0, 0.0, 0.0]], None).is_err());
+        assert!(SosFilter::new(&[[f64::MAX, 0.0, 0.0, 1e-29, 0.0, 0.0]], None).is_err());
+        assert!(SosFilter::new(&sos, Some(&[])).is_err());
+        assert!(SosFilter::new(&sos, Some(&[[f64::INFINITY, 0.0]])).is_err());
+
+        let mut filter = SosFilter::new(&sos, Some(&[[0.3, -0.2]])).unwrap();
+        let original = filter.state().to_vec();
+        let mut output = [99.0; 2];
+        assert!(filter.filter_into(&[1.0, f64::NAN], &mut output).is_err());
+        assert_eq!(output, [99.0; 2]);
+        assert_eq!(filter.state(), original);
+        assert!(filter.filter_into(&[1.0], &mut output).is_err());
+        assert_eq!(output, [99.0; 2]);
+        assert_eq!(filter.state(), original);
+        assert!(filter.set_state(&[]).is_err());
+        assert!(filter.set_state(&[[0.0, f64::NAN]]).is_err());
+        assert_eq!(filter.state(), original);
+
+        let mut input = [1.0, f64::INFINITY];
+        assert!(filter.filter_in_place(&mut input).is_err());
+        assert_eq!(input, [1.0, f64::INFINITY]);
+        assert_eq!(filter.state(), original);
+    }
 
     #[test]
     fn sosfilt_matches_lfilter_low_order() {
