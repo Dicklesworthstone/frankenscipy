@@ -2,7 +2,9 @@
 
 //! Public nested-domain quadrature against a live SciPy oracle.
 
-use fsci_integrate::{NquadRange, QuadOptions, QuadResult, nquad_with_ranges};
+use fsci_integrate::{
+    DblquadOptions, NquadRange, QuadOptions, QuadResult, dblquad, nquad_with_ranges, tplquad,
+};
 use std::cell::Cell;
 use std::process::Command;
 
@@ -150,6 +152,120 @@ print(json.dumps({'scipy':scipy.__version__,'numpy':np.__version__,'rows':rows})
     assert_eq!(compared, 6);
     eprintln!(
         "nquad compared {compared}/6 cases; SciPy {}, NumPy {}",
+        oracle["scipy"], oracle["numpy"]
+    );
+}
+
+#[test]
+fn dblquad_and_tplquad_report_all_nested_errors_like_live_scipy() {
+    let required = std::env::var("FSCI_REQUIRE_SCIPY_ORACLE").as_deref() == Ok("1");
+    let python = std::env::var("FSCI_PYTHON").unwrap_or_else(|_| "python3".into());
+    let available = Command::new(&python)
+        .args(["-c", "import scipy.integrate; import numpy"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !available {
+        assert!(!required, "required SciPy oracle unavailable via {python}");
+        eprintln!("SKIP nested quadrature errors: SciPy unavailable; compared cases = 0");
+        return;
+    }
+    let script = r#"
+import json, os, warnings
+import numpy as np
+import scipy
+from scipy.integrate import dblquad, tplquad, nquad
+if os.environ.get('FSCI_REQUIRE_SCIPY_ORACLE') == '1':
+    assert (scipy.__version__, np.__version__) == ('1.17.1', '2.4.3')
+opts = dict(epsabs=1e-8, epsrel=1e-8)
+rows = []
+with warnings.catch_warnings():
+    warnings.simplefilter('ignore')
+    rows.append(dblquad(lambda y,x: np.sin(100*y), 0., 1., 0., 1., **opts))
+    rows.append(dblquad(lambda y,x: np.sin(100*y), 1., 0., 0., 1., **opts))
+    rows.append(dblquad(lambda y,x: (1+x)*np.sin(100*y), 0., 1., 0., 1., **opts))
+    rows.append(tplquad(lambda z,y,x: np.sin(100*z), 0., 1., 0., 1., 0., 1., **opts))
+    rows.append(tplquad(lambda z,y,x: np.sin(100*y), 0., 1., 0., 1., 0., 1., **opts))
+    rows.append(tplquad(lambda z,y,x: np.sin(100*x), 0., 1., 0., 1., 0., 1., **opts))
+    # dblquad/tplquad expose no subdivision limit, so use their nquad engine
+    # to compare the same deliberately unresolved nested problems at limit 3.
+    shallow = dict(opts, limit=3)
+    rows.append(nquad(lambda y,x: abs(y-1/3)**(-.9), [[0.,1.]]*2, opts=shallow))
+    rows.append(nquad(lambda z,y,x: abs(z-1/3)**(-.9), [[0.,1.]]*3, opts=shallow))
+assert len(rows) == 8
+print(json.dumps({'scipy':scipy.__version__, 'numpy':np.__version__, 'rows':rows}))
+"#;
+    let output = Command::new(&python).args(["-c", script]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "nested quadrature oracle failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let oracle: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let rows = oracle["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 8, "the oracle must compare every requested case");
+    let mut compared = 0;
+    for (id, row) in rows.iter().enumerate() {
+        let options = DblquadOptions {
+            epsabs: 1e-8,
+            epsrel: 1e-8,
+            limit: if id >= 6 { 3 } else { 50 },
+        };
+        let actual = if id < 3 || id == 6 {
+            dblquad(
+                |y, x| {
+                    if id == 6 {
+                        (y - 1.0 / 3.0).abs().powf(-0.9)
+                    } else {
+                        (if id == 2 { 1.0 + x } else { 1.0 }) * (100.0 * y).sin()
+                    }
+                },
+                if id == 1 { 1.0 } else { 0.0 },
+                if id == 1 { 0.0 } else { 1.0 },
+                |_| 0.0,
+                |_| 1.0,
+                options,
+            )
+        } else {
+            tplquad(
+                |z, y, x| match id {
+                    3 => (100.0 * z).sin(),
+                    4 => (100.0 * y).sin(),
+                    5 => (100.0 * x).sin(),
+                    7 => (z - 1.0 / 3.0).abs().powf(-0.9),
+                    _ => unreachable!(),
+                },
+                0.0,
+                1.0,
+                |_| 0.0,
+                |_| 1.0,
+                |_, _| 0.0,
+                |_, _| 1.0,
+                options,
+            )
+        }
+        .expect("valid nested quadrature");
+        let expected = row[0].as_f64().unwrap();
+        let expected_error = row[1].as_f64().unwrap();
+        assert!(actual.integral.is_finite() && actual.error.is_finite());
+        assert!(
+            (actual.integral - expected).abs() <= 1e-10 * (1.0 + expected.abs()),
+            "case {id}: integral {} versus SciPy {expected}",
+            actual.integral
+        );
+        // Compare the error itself at its own scale: a loose absolute floor
+        // around 1e-10 would let the old ~1e-17 outer-only estimate pass.
+        assert!(expected_error > 1e-12);
+        assert!(
+            (actual.error - expected_error).abs() <= 5e-3 * expected_error,
+            "case {id}: error {} versus SciPy {expected_error}",
+            actual.error
+        );
+        assert_eq!(actual.converged, id < 6, "case {id}");
+        compared += 1;
+    }
+    assert_eq!(compared, 8);
+    eprintln!(
+        "nested quadrature errors compared {compared}/8 cases; SciPy {}, NumPy {}",
         oracle["scipy"], oracle["numpy"]
     );
 }

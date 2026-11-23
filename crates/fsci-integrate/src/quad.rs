@@ -1110,9 +1110,9 @@ fn max_abs_component(values: &[f64]) -> f64 {
 /// Options for double integration.
 #[derive(Debug, Clone, Copy)]
 pub struct DblquadOptions {
-    /// Absolute error tolerance for the outer integral.
+    /// Absolute error tolerance for every nested 1-D integral.
     pub epsabs: f64,
-    /// Relative error tolerance for the outer integral.
+    /// Relative error tolerance for every nested 1-D integral.
     pub epsrel: f64,
     /// Maximum subdivisions for each 1-D quadrature.
     pub limit: usize,
@@ -1133,7 +1133,8 @@ impl Default for DblquadOptions {
 pub struct DblquadResult {
     /// Estimated value of the double integral.
     pub integral: f64,
-    /// Estimated absolute error.
+    /// Largest absolute-error estimate from any nested 1-D integral, as in SciPy.
+    /// This is a diagnostic for the nested solves, not a rigorous bound on the total error.
     pub error: f64,
     /// Whether the requested accuracy was achieved.
     pub converged: bool,
@@ -1145,6 +1146,8 @@ pub struct DblquadResult {
 /// and for each `x`, `y` ranges from `gfun(x)` to `hfun(x)`.
 ///
 /// Matches `scipy.integrate.dblquad(f, a, b, gfun, hfun)`.
+/// The returned error includes every inner solve. Invalid callable bounds return
+/// their validation error; a failed inner solve makes the result unconverged.
 pub fn dblquad<F, GL, GH>(
     f: F,
     a: f64,
@@ -1192,10 +1195,15 @@ where
     // An inner integral that misses its tolerance makes the whole result unconverged (SciPy
     // raises an IntegrationWarning from the inner quad); the outer flag alone cannot see it.
     let inner_converged = std::cell::Cell::new(true);
+    let inner_abserr = std::cell::Cell::new(0.0_f64);
+    let inner_error = std::cell::RefCell::new(None);
 
     // Outer integral over x, inner integral over y for each x
     let outer_result = quad(
         |x| {
+            if inner_error.borrow().is_some() {
+                return 0.0;
+            }
             let y_lo = gfun(x);
             let y_hi = hfun(x);
             if y_lo == y_hi {
@@ -1207,9 +1215,17 @@ where
                     if !r.converged {
                         inner_converged.set(false);
                     }
+                    inner_abserr.set(if r.error.is_finite() {
+                        inner_abserr.get().max(r.error)
+                    } else {
+                        f64::INFINITY
+                    });
                     r.integral
                 }
-                Err(_) => f64::INFINITY, // Trigger error in outer quad
+                Err(error) => {
+                    *inner_error.borrow_mut() = Some(error);
+                    0.0
+                }
             }
         },
         a,
@@ -1221,6 +1237,9 @@ where
         },
     )?;
 
+    if let Some(error) = inner_error.into_inner() {
+        return Err(error);
+    }
     if !outer_result.integral.is_finite() {
         return Ok(DblquadResult {
             integral: f64::NAN,
@@ -1229,10 +1248,15 @@ where
         });
     }
 
+    let error = if outer_result.error.is_finite() {
+        outer_result.error.max(inner_abserr.get())
+    } else {
+        f64::INFINITY
+    };
     Ok(DblquadResult {
         integral: outer_result.integral,
-        error: outer_result.error,
-        converged: outer_result.converged && inner_converged.get(),
+        error,
+        converged: outer_result.converged && inner_converged.get() && error.is_finite(),
     })
 }
 
@@ -1734,6 +1758,10 @@ pub fn cumulative_trapezoid_uniform(
 /// - x ∈ [a, b]
 /// - y ∈ [gfun(x), hfun(x)]
 /// - z ∈ [qfun(x,y), rfun(x,y)]
+///
+/// The reported error is the largest estimate across all three levels, as in
+/// SciPy. Invalid callable bounds propagate their validation error immediately
+/// after the active outer quadrature returns, without retrying the failed solve.
 #[allow(clippy::too_many_arguments)]
 pub fn tplquad<F, GL, GH, QL, QH>(
     f: F,
@@ -1767,8 +1795,13 @@ where
 
     // Any nested integral that misses its tolerance makes the result unconverged (see dblquad).
     let inner_converged = std::cell::Cell::new(true);
+    let inner_abserr = std::cell::Cell::new(0.0_f64);
+    let inner_error = std::cell::RefCell::new(None);
     let outer_result = quad(
         |x| {
+            if inner_error.borrow().is_some() {
+                return 0.0;
+            }
             let y_lo = gfun(x);
             let y_hi = hfun(x);
             if y_lo == y_hi {
@@ -1776,6 +1809,9 @@ where
             }
             match quad(
                 |y| {
+                    if inner_error.borrow().is_some() {
+                        return 0.0;
+                    }
                     let z_lo = qfun(x, y);
                     let z_hi = rfun(x, y);
                     if z_lo == z_hi {
@@ -1786,9 +1822,17 @@ where
                             if !r.converged {
                                 inner_converged.set(false);
                             }
+                            inner_abserr.set(if r.error.is_finite() {
+                                inner_abserr.get().max(r.error)
+                            } else {
+                                f64::INFINITY
+                            });
                             r.integral
                         }
-                        Err(_) => f64::INFINITY,
+                        Err(error) => {
+                            *inner_error.borrow_mut() = Some(error);
+                            0.0
+                        }
                     }
                 },
                 y_lo,
@@ -1799,9 +1843,17 @@ where
                     if !r.converged {
                         inner_converged.set(false);
                     }
+                    inner_abserr.set(if r.error.is_finite() {
+                        inner_abserr.get().max(r.error)
+                    } else {
+                        f64::INFINITY
+                    });
                     r.integral
                 }
-                Err(_) => f64::INFINITY,
+                Err(error) => {
+                    *inner_error.borrow_mut() = Some(error);
+                    0.0
+                }
             }
         },
         a,
@@ -1809,10 +1861,25 @@ where
         inner_opts,
     )?;
 
+    if let Some(error) = inner_error.into_inner() {
+        return Err(error);
+    }
+    if !outer_result.integral.is_finite() {
+        return Ok(DblquadResult {
+            integral: f64::NAN,
+            error: f64::INFINITY,
+            converged: false,
+        });
+    }
+    let error = if outer_result.error.is_finite() {
+        outer_result.error.max(inner_abserr.get())
+    } else {
+        f64::INFINITY
+    };
     Ok(DblquadResult {
         integral: outer_result.integral,
-        error: outer_result.error,
-        converged: outer_result.converged && inner_converged.get(),
+        error,
+        converged: outer_result.converged && inner_converged.get() && error.is_finite(),
     })
 }
 
@@ -9406,6 +9473,7 @@ mod tests {
             !d.converged,
             "dblquad inner quad cannot converge at limit 3"
         );
+        assert!(d.error >= singular.error, "dblquad dropped the inner error");
         let t = tplquad(
             |z, _y, _x| (z - 1.0 / 3.0).abs().powf(-0.9),
             0.0,
@@ -9424,6 +9492,123 @@ mod tests {
             !t.converged,
             "tplquad innermost quad cannot converge at limit 3"
         );
+        assert!(t.error >= singular.error, "tplquad dropped the inner error");
+    }
+
+    #[test]
+    fn nested_quad_preserves_inner_errors_even_when_every_level_converges() {
+        let options = DblquadOptions {
+            epsabs: 1e-8,
+            epsrel: 1e-8,
+            limit: 50,
+        };
+        let one = quad(
+            |x| (100.0 * x).sin(),
+            0.0,
+            1.0,
+            QuadOptions {
+                epsabs: options.epsabs,
+                epsrel: options.epsrel,
+                limit: options.limit,
+            },
+        )
+        .unwrap();
+        // The oscillatory integral's error is about 9.46e-11. Integrating
+        // that constant over an outer unit interval reports only 1.53e-17.
+        // Every level converges, so AND-ing convergence flags cannot detect
+        // the six orders of magnitude lost by reporting just the outer error.
+        assert!(one.converged && one.error > 1e-12);
+        let exact = (1.0 - 100.0_f64.cos()) / 100.0;
+        for (a, b, sign) in [(0.0, 1.0, 1.0), (1.0, 0.0, -1.0)] {
+            let double = dblquad(
+                |y, _| (100.0 * y).sin(),
+                a,
+                b,
+                |_| 0.0,
+                |_| 1.0,
+                options,
+            )
+            .unwrap();
+            assert!(double.converged);
+            assert!((double.integral - sign * exact).abs() < 1e-12);
+            assert_eq!(double.error.to_bits(), one.error.to_bits());
+            for hard_middle in [false, true] {
+                let triple = tplquad(
+                    |z, y, _| (100.0 * if hard_middle { y } else { z }).sin(),
+                    a,
+                    b,
+                    |_| 0.0,
+                    |_| 1.0,
+                    |_, _| 0.0,
+                    |_, _| 1.0,
+                    options,
+                )
+                .unwrap();
+                assert!(triple.converged);
+                assert!((triple.integral - sign * exact).abs() < 1e-12);
+                assert!(triple.error > 1e-12);
+                assert!((triple.error - one.error).abs() < 1e-13);
+            }
+        }
+    }
+
+    #[test]
+    fn nested_quad_propagates_invalid_callable_bounds_without_retrying() {
+        let bound_calls = std::cell::Cell::new(0);
+        let integrand_calls = std::cell::Cell::new(0);
+        let double = dblquad(
+            |_, _| {
+                integrand_calls.set(integrand_calls.get() + 1);
+                1.0
+            },
+            0.0,
+            1.0,
+            |_| {
+                bound_calls.set(bound_calls.get() + 1);
+                f64::NAN
+            },
+            |_| 1.0,
+            DblquadOptions::default(),
+        );
+        assert!(matches!(
+            double,
+            Err(IntegrateValidationError::QuadInvalidBounds { .. })
+        ));
+        assert_eq!(bound_calls.get(), 1);
+        assert_eq!(integrand_calls.get(), 0);
+
+        for bad_middle in [false, true] {
+            bound_calls.set(0);
+            let triple = tplquad(
+                |_, _, _| {
+                    integrand_calls.set(integrand_calls.get() + 1);
+                    1.0
+                },
+                0.0,
+                1.0,
+                |_| {
+                    if bad_middle {
+                        bound_calls.set(bound_calls.get() + 1);
+                        f64::NAN
+                    } else {
+                        0.0
+                    }
+                },
+                |_| 1.0,
+                |_, _| {
+                    bound_calls.set(bound_calls.get() + 1);
+                    f64::NAN
+                },
+                |_, _| 1.0,
+                DblquadOptions::default(),
+            );
+            assert!(matches!(
+                triple,
+                Err(IntegrateValidationError::QuadInvalidBounds { .. })
+            ));
+            assert_eq!(bound_calls.get(), 1);
+            assert_eq!(integrand_calls.get(), 0);
+        }
     }
 
     // br-szq1n.7: a non-finite finite-range partial sum is SciPy's status -3, not converged.
