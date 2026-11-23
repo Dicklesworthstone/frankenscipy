@@ -351,11 +351,77 @@ fn interval_log_probability<D: ContinuousDistribution>(
     if log_cdf_upper.is_nan() || log_sf_lower.is_nan() {
         return f64::NAN;
     }
-    if log_cdf_upper < log_sf_lower {
-        log_probability_difference(log_cdf_upper, distribution.logcdf(lower))
+    let (larger, smaller) = if log_cdf_upper < log_sf_lower {
+        (log_cdf_upper, distribution.logcdf(lower))
     } else {
-        log_probability_difference(log_sf_lower, distribution.logsf(upper))
+        (log_sf_lower, distribution.logsf(upper))
+    };
+    let difference = log_probability_difference(larger, smaller);
+    if difference.is_nan() {
+        // An invalid or decreasing tail must not be repaired by a density
+        // integral: the supplied probability model is inconsistent.
+        return difference;
     }
+    // expm1 preserves a small difference between two *distinct* logarithms,
+    // but cannot recover digits already lost in those logarithms. In the
+    // centre of a normal distribution, for example, [0, 1e-20] has positive
+    // mass although both log-CDFs and both log-SFs round to the same value.
+    // Quadrature is only needed where this subtraction is ill-conditioned.
+    let cancellation_scale = 1.0_f64.max(larger.abs()).max(smaller.abs());
+    if (difference == f64::NEG_INFINITY || larger - smaller < 1.0e-4 * cancellation_scale)
+        && let Some(integral) = density_interval_log_probability(distribution, lower, upper)
+    {
+        return integral;
+    }
+    difference
+}
+
+/// Integrate in unit-interval coordinates and scale by a log density so neither
+/// a subnormal interval width nor an underflowing tail density erases its mass.
+/// Keep the tail result when the density is singular or the bounded adaptive
+/// quadrature cannot establish the requested relative accuracy.
+fn density_interval_log_probability<D: ContinuousDistribution>(
+    distribution: &D,
+    lower: f64,
+    upper: f64,
+) -> Option<f64> {
+    let width = upper - lower;
+    if !width.is_finite() || width <= 0.0 {
+        return None;
+    }
+    let midpoint = width.mul_add(0.5, lower);
+    if midpoint <= lower || midpoint >= upper {
+        // With no representable interior point, evaluating a support endpoint
+        // can fabricate mass in an interval that lies entirely outside support.
+        return None;
+    }
+    let log_scale = distribution.logpdf(midpoint);
+    if !log_scale.is_finite() {
+        return None;
+    }
+    let relative_tolerance = 1.0e-11;
+    let (result, _) = fsci_integrate::quad_full_output(
+        |t| (distribution.logpdf(width.mul_add(t, lower)) - log_scale).exp(),
+        0.0,
+        1.0,
+        &[],
+        fsci_integrate::QuadOptions {
+            epsabs: 0.0,
+            epsrel: relative_tolerance,
+            limit: 32,
+        },
+    )
+    .ok()?;
+    if !result.converged
+        || !result.integral.is_finite()
+        || result.integral <= 0.0
+        || !result.error.is_finite()
+        || result.error > relative_tolerance * result.integral
+    {
+        return None;
+    }
+    let probability = width.ln() + log_scale + result.integral.ln();
+    (probability.is_finite() && probability <= 0.0).then_some(probability)
 }
 
 /// Solve the two beta shape scores from logarithmic sufficient statistics.
@@ -1030,20 +1096,26 @@ pub(crate) fn inverse_gamma_shape_mle(data: &[f64]) -> Result<f64, FitError> {
         target = next;
     }
 
+    shape_from_digamma(target, "InverseGamma")
+}
+
+/// Solve a positive shape score `psi(a) = target`. Several fixed-scale
+/// gamma-family likelihoods share this strictly monotone equation.
+pub(crate) fn shape_from_digamma(target: f64, family: &str) -> Result<f64, FitError> {
     // psi(a) increases strictly from -infinity to infinity. The asymptotic
     // inverse gives a starting upper bound; expand it if rounding requires it.
     let mut upper = (target.exp() + 1.0).max(1.0);
     if !upper.is_finite() {
-        return Err(FitError::NonConvergent(
-            "InverseGamma MLE shape exceeds the finite parameter range".into(),
-        ));
+        return Err(FitError::NonConvergent(format!(
+            "{family} MLE shape exceeds the finite parameter range"
+        )));
     }
     while fsci_special::digamma_scalar(upper) < target {
         let next = (2.0 * upper).min(f64::MAX);
         if next == upper {
-            return Err(FitError::NonConvergent(
-                "InverseGamma MLE shape exceeds the finite parameter range".into(),
-            ));
+            return Err(FitError::NonConvergent(format!(
+                "{family} MLE shape exceeds the finite parameter range"
+            )));
         }
         upper = next;
     }
@@ -1532,6 +1604,9 @@ where
 /// for left censoring, `logsf(x)` for right censoring, and
 /// `log(cdf(upper) - cdf(lower))` for interval censoring. Interval differences
 /// use logarithms of the smaller tail to avoid cancellation and underflow.
+/// When the tail logarithms themselves lose the interval's separation, a
+/// bounded, error-checked quadrature of the scaled density can recover its
+/// probability without exponentiating the small final result.
 ///
 /// All explicit exact/left/right observations must be finite. An interval may
 /// have a lower bound of negative infinity or an upper bound of positive
@@ -1889,6 +1964,193 @@ where
         FitError::NonConvergent("MLE parameters are not finite or are outside their domains".into())
     })?;
     finish(values, result.nit, result.nfev)
+}
+
+#[cfg(test)]
+mod interval_likelihood_tests {
+    use super::*;
+    use crate::{GammaDist, Normal, with_stats_runtime_mode};
+
+    #[test]
+    fn normal_intervals_keep_mass_when_both_tail_logs_round_equal() {
+        let normal = Normal {
+            loc: 0.0,
+            scale: 1.0,
+        };
+        for width in [1.0e-20, 1.0e-300, 1.0e-310] {
+            assert_eq!(normal.logcdf(0.0), normal.logcdf(width));
+            assert_eq!(normal.logsf(0.0), normal.logsf(width));
+            let actual = interval_log_probability(&normal, 0.0, width);
+            // The density differs from phi(0) by O(width^2), below any f64
+            // correction in these intervals. The probability itself can
+            // underflow, but its logarithm is still representable.
+            let expected = width.ln() - 0.5 * (2.0 * std::f64::consts::PI).ln();
+            assert!(actual.is_finite(), "width={width:e}");
+            assert!(
+                (actual - expected).abs() < 2.0e-12,
+                "{actual} vs {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_normal_intervals_fit_in_both_tails_and_at_extreme_scale() {
+        for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+            for (lower, upper, scale) in [
+                (-40.0_f64, -40.0 + 1.0e-12, 1.0),
+                (-8.0, -8.0 + 1.0e-13, 1.0),
+                (8.0, 8.0 + 1.0e-13, 1.0),
+                (40.0, 40.0 + 1.0e-12, 1.0),
+                (0.0, 1.0, 1.0e300),
+            ] {
+                let normal = Normal { loc: 0.0, scale };
+                let width = upper - lower;
+                // Midpoint integration error is O((width/scale)^2),
+                // negligible here even for the far-tail observations.
+                let expected = -(width.ln() + normal.logpdf(width.mul_add(0.5, lower)));
+                let data = CensoredData::interval_censored(&[lower], &[upper]).unwrap();
+                let fitted = with_stats_runtime_mode(mode, || {
+                    fit_mle_censored(
+                        &data,
+                        &[MleParameter::Fixed(0.0), MleParameter::Fixed(scale)],
+                        |p| {
+                            Some(Normal {
+                                loc: p[0],
+                                scale: p[1],
+                            })
+                        },
+                        MleOptions::default(),
+                    )
+                })
+                .unwrap();
+                assert!(
+                    (fitted.negative_log_likelihood - expected).abs() < 2.0e-10,
+                    "[{lower}, {upper}], scale={scale}: {} vs {expected}",
+                    fitted.negative_log_likelihood
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_interval_fit_recovers_normal_location_and_scale() {
+        let lower = [-2.0, -1.0, 0.5, 1.0, 3.0];
+        let upper = lower.map(|x| x + 1.0e-10);
+        let data = CensoredData::interval_censored(&lower, &upper).unwrap();
+        let fitted = fit_mle_censored(
+            &data,
+            &[MleParameter::Free(0.0), MleParameter::Positive(1.0)],
+            |p| {
+                Some(Normal {
+                    loc: p[0],
+                    scale: p[1],
+                })
+            },
+            MleOptions::default(),
+        )
+        .unwrap();
+        let expected_loc = 0.3 + 0.5e-10;
+        let expected_scale = (lower.iter().map(|x| (x - 0.3).powi(2)).sum::<f64>() / 5.0).sqrt();
+        assert!((fitted.distribution.loc - expected_loc).abs() < 2.0e-7);
+        assert!((fitted.distribution.scale - expected_scale).abs() < 2.0e-7);
+        assert!(fitted.iterations > 0);
+        let reference = Normal {
+            loc: expected_loc,
+            scale: expected_scale,
+        };
+        let expected_nll = -lower
+            .iter()
+            .zip(&upper)
+            .map(|(&lo, &hi)| {
+                let width = hi - lo;
+                reference.logpdf(width.mul_add(0.5, lo)) + width.ln()
+            })
+            .sum::<f64>();
+        assert!((fitted.negative_log_likelihood - expected_nll).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn exponential_intervals_preserve_support_and_analytic_probability() {
+        let exponential = GammaDist { a: 1.0, scale: 2.0 };
+        for (lower, upper) in [(8.0_f64, 8.0 + 1.0e-13), (2000.0, 2000.0 + 1.0e-11)] {
+            let expected = -lower / 2.0 + (-(-(upper - lower) / 2.0).exp_m1()).ln();
+            let actual = interval_log_probability(&exponential, lower, upper);
+            assert!(
+                (actual - expected).abs() < 2.0e-10,
+                "{actual} vs {expected}"
+            );
+        }
+        for lower in [-1.0e-20, -f64::from_bits(1)] {
+            assert_eq!(
+                interval_log_probability(&exponential, lower, 0.0),
+                f64::NEG_INFINITY
+            );
+        }
+        let at_boundary = interval_log_probability(&exponential, 0.0, 1.0e-300);
+        assert!((at_boundary - (0.5e-300_f64).ln()).abs() < 2.0e-12);
+    }
+
+    struct InvalidModel {
+        log_density: f64,
+        decreasing_cdf: bool,
+    }
+
+    impl ContinuousDistribution for InvalidModel {
+        fn pdf(&self, _: f64) -> f64 {
+            self.log_density.exp()
+        }
+        fn logpdf(&self, x: f64) -> f64 {
+            if self.log_density == f64::INFINITY && x <= 0.75 {
+                // The midpoint is valid, but quadrature must reject a model
+                // that fails at other interior evaluation points.
+                0.0
+            } else {
+                self.log_density
+            }
+        }
+        fn cdf(&self, x: f64) -> f64 {
+            self.logcdf(x).exp()
+        }
+        fn logcdf(&self, x: f64) -> f64 {
+            if self.decreasing_cdf {
+                -2.0 - x
+            } else {
+                -std::f64::consts::LN_2
+            }
+        }
+        fn logsf(&self, _: f64) -> f64 {
+            -std::f64::consts::LN_2
+        }
+        fn ppf(&self, q: f64) -> f64 {
+            q
+        }
+        fn mean(&self) -> f64 {
+            0.5
+        }
+        fn var(&self) -> f64 {
+            1.0 / 12.0
+        }
+    }
+
+    #[test]
+    fn density_fallback_does_not_repair_invalid_models() {
+        let decreasing = InvalidModel {
+            log_density: 0.0,
+            decreasing_cdf: true,
+        };
+        assert!(interval_log_probability(&decreasing, 0.0, 1.0).is_nan());
+        for log_density in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1000.0] {
+            let invalid = InvalidModel {
+                log_density,
+                decreasing_cdf: false,
+            };
+            assert!(density_interval_log_probability(&invalid, 0.0, 1.0).is_none());
+            assert_eq!(
+                interval_log_probability(&invalid, 0.0, 1.0),
+                f64::NEG_INFINITY
+            );
+        }
+    }
 }
 
 #[cfg(test)]
