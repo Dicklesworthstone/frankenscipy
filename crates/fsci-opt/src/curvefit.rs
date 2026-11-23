@@ -2951,7 +2951,7 @@ mod tests {
     #[test]
     fn least_squares_custom_loss_preserves_finite_extreme_scale_models() {
         for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
-            for case in 0..3 {
+            for case in 0..5 {
                 let (residual, f_scale, expected_cost, expected_gradient, expected_jacobian) =
                     match case {
                         // Multiplying rho'' by two before z overflows, although
@@ -2962,7 +2962,11 @@ mod tests {
                         1 => (1e200, 1e200, 0.0, 1e200, 3.0_f64.sqrt()),
                         // rho'/sqrt(EPS) overflows; multiplying by the tiny
                         // residual first still gives a finite local model.
-                        _ => (1e-100, 1e-100, 5e-201, 1e208, f64::EPSILON.sqrt()),
+                        2 => (1e-100, 1e-100, 5e-201, 1e208, f64::EPSILON.sqrt()),
+                        // Doubling rho''*z overflows before cancellation with
+                        // rho', although the final curvature is finite.
+                        3 => (1e-100, 1e-100, 5e-201, 1e208, f64::EPSILON.sqrt()),
+                        _ => (1e-100, 1e-100, 5e-201, -1e208, 1e154),
                     };
                 let result = least_squares(
                     |_| vec![residual],
@@ -2980,11 +2984,19 @@ mod tests {
                                     vec![1.0 + shift],
                                     vec![1.0],
                                 ],
-                                _ => [
+                                2 => [
                                     vec![1.0 + 1e308 * shift - (2.5e307 * shift) * shift],
                                     vec![1e308 - 5e307 * shift],
                                     vec![-5e307],
                                 ],
+                                _ => {
+                                    let first = if case == 3 { 1e308 } else { -1e308 };
+                                    [
+                                        vec![1.0 + first * shift - (0.5 * first * shift) * shift],
+                                        vec![first - first * shift],
+                                        vec![-first],
+                                    ]
+                                }
                             }
                         })),
                         f_scale,
@@ -2993,7 +3005,7 @@ mod tests {
                         ..LeastSquaresOptions::default()
                     },
                 )
-                .unwrap();
+                .unwrap_or_else(|error| panic!("{method:?}, case={case}: {error}"));
                 assert_eq!(result.status, 0, "{method:?}, case={case}: {result:?}");
                 if expected_cost == 0.0 {
                     assert_eq!(result.cost, 0.0);

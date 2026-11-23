@@ -291,7 +291,12 @@ impl LossFunction {
                 // Match SciPy's robust Gauss-Newton model: cap nonpositive
                 // curvature at epsilon, while retaining the exact loss score.
                 let z = (value / f_scale).powi(2);
-                let curvature = first + 2.0 * (second * z);
+                let mut curvature = first + 2.0 * (second * z);
+                if !curvature.is_finite() {
+                    // The doubled term can overflow before cancellation with
+                    // rho'. Fuse only this fallback to retain ordinary rounding.
+                    curvature = 2.0_f64.mul_add(second * z, first);
+                }
                 let row_scale = curvature.max(EPS).sqrt();
                 let mut residual = value * (first / row_scale);
                 if !residual.is_finite() || (residual == 0.0 && value != 0.0 && first != 0.0) {
