@@ -52151,7 +52151,7 @@ mod toggle_ab_pinv_cholesky {
     use std::sync::Mutex;
     use std::sync::atomic::Ordering;
 
-    static LOCK: Mutex<()> = Mutex::new(());
+    pub(crate) static LOCK: Mutex<()> = Mutex::new(());
 
     struct RestoreToggles {
         tall_trsm: bool,
@@ -53576,6 +53576,11 @@ mod chol_syrk_nc_blocking {
 
         // 4. Default lstsq and pinv on full-rank tall (256x128), wide (128x256), and square (128x128)
         // emit honest SolverAction labels matching the actual kernel executed.
+        // Serialize against toggle_ab_pinv_cholesky which flips global pinv toggle atomics
+        // and asserts exact hit counts on >=128-column tall/wide Cholesky routes.
+        let _pinv_toggle_lock = crate::toggle_ab_pinv_cholesky::LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let snap3 = default_solver_portfolio_snapshot(RuntimeMode::Strict);
         let rows_tall = 256;
         let cols_tall = 128;
