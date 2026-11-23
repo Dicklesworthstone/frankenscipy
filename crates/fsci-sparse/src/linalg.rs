@@ -11529,6 +11529,159 @@ pub fn minres(
 // LSQR — Sparse Least-Squares via Golub-Kahan Bidiagonalization
 // ══════════════════════════════════════════════════════════════════════
 
+/// Controls for [`lsqr_with_options`], corresponding to SciPy's LSQR keywords.
+///
+/// `atol` describes relative uncertainty in the operator and `btol` in the
+/// right-hand side. A nonpositive or infinite `conlim` disables the user
+/// condition limit; machine-precision stopping tests remain active.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LsqrOptions<'a> {
+    pub mode: RuntimeMode,
+    pub atol: f64,
+    pub btol: f64,
+    pub conlim: f64,
+    /// Defaults to twice the number of columns, as in SciPy's `iter_lim`.
+    pub max_iter: Option<usize>,
+    /// Tikhonov damping. Its sign does not change the regularized objective.
+    pub damp: f64,
+    /// The damping penalizes `x - x0`; the default starting point is zero.
+    pub x0: Option<&'a [f64]>,
+    /// Estimate the diagonal of `(AᵀA + damp² I)⁻¹` from the LSQR directions.
+    pub calc_var: bool,
+}
+
+impl Default for LsqrOptions<'_> {
+    fn default() -> Self {
+        Self {
+            mode: RuntimeMode::Strict,
+            atol: 1.0e-6,
+            btol: 1.0e-6,
+            conlim: 1.0e8,
+            max_iter: None,
+            damp: 0.0,
+            x0: None,
+            calc_var: false,
+        }
+    }
+}
+
+/// SciPy's ten-element LSQR return tuple, with named fields.
+///
+/// These are bidiagonalization estimates, including SciPy's zero-iteration
+/// initialization. `xnorm` estimates the correction from `x0`, not the norm
+/// of a nonzero warm start. `r1norm` can be negative when subtracting the
+/// estimated damping contribution loses accuracy, as in SciPy.
+/// Condition, normal-residual, correction-norm, and variance estimates outside
+/// the f64 range round to zero or infinity; stopping decisions retain separately
+/// scaled products. The operator and residual norms used by the recurrence
+/// must remain representable.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LsqrResult {
+    pub solution: Vec<f64>,
+    /// 0: initial point is stationary (or the iteration budget is zero);
+    /// 1: compatible-system tolerance; 2: least-squares tolerance;
+    /// 3: condition limit; 4/5/6: corresponding machine-precision limits;
+    /// 7: iteration limit. Condition and iteration limits are not convergence.
+    pub istop: i32,
+    pub iterations: usize,
+    /// Estimated norm of the original residual, `b - A*x`.
+    pub r1norm: f64,
+    /// Estimated augmented residual, including `damp * (x - x0)`.
+    pub r2norm: f64,
+    /// Estimated Frobenius norm of the augmented operator `[A; damp*I]`.
+    pub anorm: f64,
+    pub acond: f64,
+    /// Estimated normal-equation residual, `Aᵀr - damp² * (x - x0)`.
+    pub arnorm: f64,
+    pub xnorm: f64,
+    /// Variance estimates when requested, otherwise a zero vector of length n.
+    pub var: Vec<f64>,
+}
+
+/// Solve sparse least squares with independent stopping tolerances and diagnostics.
+///
+/// Minimizes `||A*x - b||² + damp² * ||x - x0||²` using the same Golub–Kahan
+/// recurrence as [`lsqr`]. Both concrete sparse matrices and matrix-free
+/// [`LinearOperator`] implementations with a transpose product are supported.
+/// `calc_var` adds O(n) storage and work per iteration, without forming AᵀA.
+///
+/// Strict mode preserves SciPy's additive epsilon in the normal-residual
+/// stopping denominator. Hardened mode uses the scale-relative denominator,
+/// so rescaling a well-conditioned problem cannot alone declare convergence.
+/// Negative damping is interpreted by magnitude, consistently with [`lsqr_damped`].
+/// With a zero right-hand side and a nonstationary damped warm start, both modes
+/// solve the regularized correction problem: the undefined relative-residual
+/// test is disabled. This deliberately avoids SciPy's `infinity <= infinity`
+/// compatible-system exit, which can stop before reaching that minimizer.
+///
+/// # Errors
+/// Invalid tolerances or dimensions, non-finite inputs or operator products,
+/// and unrepresentable solution updates return typed errors. Reaching a
+/// condition or iteration limit returns the current iterate and its `istop`.
+pub fn lsqr_with_options(
+    a: &dyn LinearOperator,
+    b: &[f64],
+    options: LsqrOptions<'_>,
+) -> SparseResult<LsqrResult> {
+    let n = a.shape().cols;
+    if let Some(start) = options.x0
+        && start.len() != n
+    {
+        return Err(SparseError::IncompatibleShape {
+            message: format!(
+                "lsqr x0 length {} must match matrix columns {n}",
+                start.len()
+            ),
+        });
+    }
+    for (name, tolerance) in [("atol", options.atol), ("btol", options.btol)] {
+        if !tolerance.is_finite() || tolerance < 0.0 {
+            return Err(SparseError::InvalidArgument {
+                message: format!("lsqr {name} must be finite and non-negative"),
+            });
+        }
+    }
+    if options.conlim.is_nan() || !options.damp.is_finite() {
+        return Err(SparseError::InvalidArgument {
+            message: "lsqr conlim must not be NaN and damp must be finite".to_string(),
+        });
+    }
+    let mut tracking = LsqrTracking::new(options, n);
+    let result = lsqr_core(
+        a,
+        b,
+        options.damp,
+        options.x0,
+        IterativeSolveOptions {
+            mode: options.mode,
+            check_finite: true,
+            tol: options.atol,
+            max_iter: options.max_iter,
+        },
+        Some(&mut tracking),
+    )?;
+    Ok(LsqrResult {
+        solution: result.solution,
+        istop: tracking.istop,
+        iterations: result.iterations,
+        r1norm: tracking.r1norm,
+        r2norm: tracking.r2norm,
+        anorm: tracking.anorm,
+        acond: tracking.acond,
+        arnorm: tracking.arnorm,
+        xnorm: tracking.xnorm,
+        var: if options.calc_var {
+            tracking
+                .variance
+                .into_iter()
+                .map(|value| value.to_f64().unwrap_or(f64::INFINITY))
+                .collect()
+        } else {
+            vec![0.0; n]
+        },
+    })
+}
+
 /// LSQR solver for sparse least-squares problems.
 ///
 /// Solves min ||Ax - b||₂ (equivalent to A^T A x = A^T b but numerically superior).
@@ -11539,6 +11692,8 @@ pub fn minres(
 ///
 /// Equivalent to `lsqr_damped(a, b, 0.0, options)`: both entry points share the
 /// same undamped recurrence and stopping tests.
+/// Use [`lsqr_with_options`] for independent `atol`/`btol`, a condition limit,
+/// termination reasons, norm estimates, and variance diagnostics.
 ///
 /// `A` may be any [`LinearOperator`] that defines `rmatvec` (LSQR applies `Aᵀ` every step, as
 /// SciPy's does).
@@ -11651,6 +11806,20 @@ fn lsqr_impl(
     x0: Option<&[f64]>,
     options: IterativeSolveOptions,
 ) -> SparseResult<IterativeSolveResult> {
+    lsqr_core(a, b, damp, x0, options, None)
+}
+
+/// Shared numerical core. The original entry points retain their relative-residual
+/// policy and arithmetic order; diagnostic tracking adds SciPy's stopping policy
+/// without duplicating the bidiagonalization or solution-update recurrence.
+fn lsqr_core(
+    a: &dyn LinearOperator,
+    b: &[f64],
+    damp: f64,
+    x0: Option<&[f64]>,
+    options: IterativeSolveOptions,
+    mut tracking: Option<&mut LsqrTracking<'_>>,
+) -> SparseResult<IterativeSolveResult> {
     // Norm of the accumulated damping residuals (SciPy's sqrt(res2)).
     // Hypot avoids squaring the problem's scale in the residual estimate.
     let mut damping_residual_norm = 0.0_f64;
@@ -11673,9 +11842,9 @@ fn lsqr_impl(
     // converged where SciPy reports iteration-limit. The limit is strictly smaller, so
     // the change can only turn a converged result into a non-converged one, never a
     // wrong answer.
-    let max_iter = options.max_iter.unwrap_or(2 * n);
+    let max_iter = options.max_iter.unwrap_or_else(|| n.saturating_mul(2));
     let b_norm = finite_least_squares_norm(vec_norm(b))?;
-    if rhs_is_zero(b_norm) {
+    if rhs_is_zero(b_norm) && tracking.is_none() {
         if let Some(start) = x0 {
             // With a guess, b = 0 is NOT a zero problem: the objective
             // ‖Ax‖² + damp²‖x − x0‖² has a nonzero minimiser whenever damp > 0 (and for
@@ -11734,19 +11903,24 @@ fn lsqr_impl(
         });
     }
     beta = beta_0;
-    for entry in &mut u {
-        *entry /= beta_0;
-    }
+    lsmr_normalize(&mut u, beta_0, tracking.is_some());
 
     // α₁v₁ = A^T u₁
     let mut atb = vec![0.0; n];
     csc_transpose_matvec_into(a, a_csc.as_ref(), &u, &mut atb)?;
     let mut alpha = finite_least_squares_norm(vec_norm(&atb))?;
-    let mut v: Vec<f64> = if alpha > 0.0 {
-        atb.iter().map(|ai| ai / alpha).collect()
-    } else {
-        vec![0.0; n]
-    };
+    let mut v = atb;
+    if alpha > 0.0 {
+        lsmr_normalize(&mut v, alpha, tracking.is_some());
+    }
+    if let Some(state) = tracking.as_deref_mut() {
+        state.r1norm = beta_0;
+        state.r2norm = beta_0;
+        state.arnorm = ScaledValue::from_f64(alpha)
+            .mul(ScaledValue::from_f64(beta_0))
+            .to_f64()
+            .unwrap_or(f64::INFINITY);
+    }
 
     // SciPy's `arnorm = alfa * beta == 0` early return. `beta_0 > 0` is
     // already guaranteed above, so this is exactly `alpha == 0`, i.e. Aᵀr₀ = 0 for
@@ -11792,9 +11966,7 @@ fn lsqr_impl(
         }
         beta = finite_least_squares_norm(vec_norm(&u))?;
         if beta > 0.0 {
-            for ui in &mut u {
-                *ui /= beta;
-            }
+            lsmr_normalize(&mut u, beta, tracking.is_some());
             // The current diagonal belongs to this bidiagonal column; the
             // alpha computed below belongs to the NEXT column. Omitting the
             // current alpha loses alpha_1 from the stopping-test scale.
@@ -11808,9 +11980,7 @@ fn lsqr_impl(
             }
             alpha = finite_least_squares_norm(vec_norm(&v))?;
             if alpha > 0.0 {
-                for vi in &mut v {
-                    *vi /= alpha;
-                }
+                lsmr_normalize(&mut v, alpha, tracking.is_some());
             }
         }
 
@@ -11837,18 +12007,25 @@ fn lsqr_impl(
         damping_residual_norm = damping_residual_norm.hypot(psi);
 
         // Construct and apply rotation
-        let rho = rho_bar_damped.hypot(beta);
+        let (cs, sn, rho) = if tracking.is_some() {
+            symmetric_orthogonalization(rho_bar_damped, beta)
+        } else {
+            let rho = rho_bar_damped.hypot(beta);
+            (rho_bar_damped / rho, beta / rho, rho)
+        };
         if rho == 0.0 || !rho.is_finite() {
             return Err(SparseError::SingularMatrix {
                 message: "lsqr orthogonalization broke down before a stopping test".to_string(),
             });
         }
-        let cs = rho_bar_damped / rho;
-        let sn = beta / rho;
         let theta = sn * alpha;
         rho_bar = -cs * alpha;
         let phi = cs * phi_bar;
         phi_bar *= sn;
+
+        if let Some(state) = tracking.as_deref_mut() {
+            state.record_direction(&w, rho)?;
+        }
 
         // Update x and w.
         //
@@ -11895,6 +12072,11 @@ fn lsqr_impl(
             w[i] = v[i] - (theta / rho) * w[i];
         }
         if nonzero_update && !representable_update {
+            if tracking.is_some() {
+                return Err(SparseError::SingularMatrix {
+                    message: "lsqr solution update is below the floating-point range".to_string(),
+                });
+            }
             let residual_norm = least_squares_relative_residual(a, b, &x, b_norm)?;
             return Ok(IterativeSolveResult {
                 solution: x,
@@ -11902,6 +12084,45 @@ fn lsqr_impl(
                 iterations: iteration + 1,
                 residual_norm,
             });
+        }
+
+        if let Some(state) = tracking.as_deref_mut() {
+            ensure_finite(&x)?;
+            ensure_finite(&w)?;
+            let phi_scaled = ScaledValue::from_f64(rho_bar_before_damping)
+                .mul(ScaledValue::from_f64(phi_bar_before_damping))
+                .div(ScaledValue::from_f64(rho));
+            let normal_residual = ScaledValue::from_f64(alpha)
+                .mul(ScaledValue::from_f64(beta))
+                .mul(phi_scaled.abs())
+                .div(ScaledValue::from_f64(rho));
+            state.record_iteration(
+                a_norm,
+                phi_bar.hypot(damping_residual_norm),
+                normal_residual,
+                rho,
+                theta,
+                phi_scaled,
+                damp,
+                b_norm,
+                iteration + 1,
+                max_iter,
+            )?;
+            if state.istop != 0 {
+                // The public diagnostics API returns recurrence estimates. Avoid an
+                // extra operator product just to compute this private legacy field.
+                return Ok(IterativeSolveResult {
+                    solution: x,
+                    converged: matches!(state.istop, 1 | 2 | 4 | 5),
+                    iterations: iteration + 1,
+                    residual_norm: if b_norm > 0.0 {
+                        state.r1norm / b_norm
+                    } else {
+                        state.r1norm
+                    },
+                });
+            }
+            continue;
         }
 
         // Check convergence — SciPy's istop=1: the residual itself is small.
@@ -11976,13 +12197,214 @@ fn lsqr_impl(
         }
     }
 
-    let final_norm = least_squares_relative_residual(a, b, &x, b_norm)?;
+    let final_norm = if let Some(state) = tracking {
+        if b_norm > 0.0 {
+            state.r1norm / b_norm
+        } else {
+            state.r1norm
+        }
+    } else {
+        least_squares_relative_residual(a, b, &x, b_norm)?
+    };
     Ok(IterativeSolveResult {
         solution: x,
         converged: false,
         iterations: max_iter,
         residual_norm: final_norm,
     })
+}
+
+/// Optional LSQR diagnostics. The extra inverse-direction norms, right rotations,
+/// and variance estimates do not run for the original relative-residual API.
+struct LsqrTracking<'a> {
+    controls: LsqrOptions<'a>,
+    istop: i32,
+    r1norm: f64,
+    r2norm: f64,
+    anorm: f64,
+    acond: f64,
+    arnorm: f64,
+    xnorm: f64,
+    scaled_xnorm: ScaledValue,
+    inverse_direction_norm_squared: ScaledValue,
+    correction_norm_squared: ScaledValue,
+    variance: Vec<ScaledValue>,
+    z: ScaledValue,
+    cs2: f64,
+    sn2: f64,
+}
+
+impl<'a> LsqrTracking<'a> {
+    fn new(controls: LsqrOptions<'a>, columns: usize) -> Self {
+        Self {
+            controls,
+            istop: 0,
+            r1norm: 0.0,
+            r2norm: 0.0,
+            anorm: 0.0,
+            acond: 0.0,
+            arnorm: 0.0,
+            xnorm: 0.0,
+            scaled_xnorm: ScaledValue::default(),
+            inverse_direction_norm_squared: ScaledValue::default(),
+            correction_norm_squared: ScaledValue::default(),
+            variance: if controls.calc_var {
+                vec![ScaledValue::default(); columns]
+            } else {
+                Vec::new()
+            },
+            z: ScaledValue::default(),
+            cs2: -1.0,
+            sn2: 0.0,
+        }
+    }
+
+    fn record_direction(&mut self, direction: &[f64], rho: f64) -> SparseResult<()> {
+        let norm = finite_least_squares_norm(vec_norm(direction))?;
+        let scaled_rho = ScaledValue::from_f64(rho);
+        let inverse_direction_norm = ScaledValue::from_f64(norm).div(scaled_rho);
+        self.inverse_direction_norm_squared = self
+            .inverse_direction_norm_squared
+            .add(inverse_direction_norm.mul(inverse_direction_norm));
+        if self.controls.calc_var {
+            for (variance, &value) in self.variance.iter_mut().zip(direction) {
+                let dk = ScaledValue::from_f64(value).div(scaled_rho);
+                *variance = variance.add(dk.mul(dk));
+            }
+        }
+        Ok(())
+    }
+
+    fn record_iteration(
+        &mut self,
+        anorm: f64,
+        rnorm: f64,
+        normal_residual: ScaledValue,
+        rho: f64,
+        theta: f64,
+        phi: ScaledValue,
+        damp: f64,
+        bnorm: f64,
+        iteration: usize,
+        max_iter: usize,
+    ) -> SparseResult<()> {
+        finite_least_squares_norm(anorm)?;
+        finite_least_squares_norm(rnorm)?;
+        // The right Givens rotation estimates the norm of the correction.
+        // Scaled sums of squares avoid overflowing on finite large solutions
+        // or losing the condition estimate on very small operators.
+        let scaled_rho = ScaledValue::from_f64(rho);
+        let gamma_bar = ScaledValue::from_f64(-self.cs2).mul(scaled_rho);
+        let rhs = phi.add(ScaledValue::from_f64(-self.sn2).mul(scaled_rho).mul(self.z));
+        let gamma = (-self.cs2 * rho).hypot(theta);
+        if gamma_bar.mantissa == 0.0 || gamma == 0.0 || !gamma.is_finite() {
+            return Err(SparseError::SingularMatrix {
+                message: "lsqr norm-estimation rotation broke down".to_string(),
+            });
+        }
+        let z_bar = rhs.div(gamma_bar);
+        self.scaled_xnorm = self.correction_norm_squared.add(z_bar.mul(z_bar)).sqrt();
+        self.xnorm = self.scaled_xnorm.to_f64().unwrap_or(f64::INFINITY);
+        self.cs2 = gamma_bar
+            .div(ScaledValue::from_f64(gamma))
+            .to_f64()
+            .expect("Givens cosine has magnitude at most one");
+        self.sn2 = theta / gamma;
+        self.z = rhs.div(ScaledValue::from_f64(gamma));
+        self.correction_norm_squared = self.correction_norm_squared.add(self.z.mul(self.z));
+
+        self.anorm = anorm;
+        let condition =
+            ScaledValue::from_f64(anorm).mul(self.inverse_direction_norm_squared.sqrt());
+        self.acond = condition.to_f64().unwrap_or(f64::INFINITY);
+        self.arnorm = normal_residual.to_f64().unwrap_or(f64::INFINITY);
+        self.r2norm = rnorm;
+        self.r1norm = if damp == 0.0 {
+            rnorm
+        } else {
+            let residual = ScaledValue::from_f64(rnorm);
+            let damping = ScaledValue::from_f64(damp);
+            let original_residual_squared = residual.mul(residual).add(
+                damping
+                    .mul(damping)
+                    .mul(self.correction_norm_squared)
+                    .mul(ScaledValue::from_f64(-1.0)),
+            );
+            original_residual_squared
+                .abs()
+                .sqrt()
+                .to_f64()
+                .unwrap_or(f64::INFINITY)
+                .copysign(original_residual_squared.mantissa)
+        };
+
+        let epsilon = ScaledValue::from_f64(f64::EPSILON);
+        let scaled_residual = ScaledValue::from_f64(rnorm);
+        let ax_norm = ScaledValue::from_f64(anorm).mul(self.scaled_xnorm);
+        let compatible_denominator = ScaledValue::from_f64(bnorm).add(ax_norm);
+        let compatible_test = if compatible_denominator.mantissa != 0.0 {
+            scaled_residual
+                .div(compatible_denominator)
+                .to_f64()
+                .unwrap_or(f64::INFINITY)
+        } else {
+            f64::INFINITY
+        };
+        let mut normal_denominator = ScaledValue::from_f64(anorm).mul(scaled_residual);
+        if self.controls.mode == RuntimeMode::Strict {
+            // SciPy's test2 = arnorm / (anorm*rnorm + eps). Retain the
+            // additive guard only in strict mode; it has absolute units.
+            normal_denominator = normal_denominator.add(epsilon);
+        }
+        let normal_test = if normal_residual.mantissa == 0.0 {
+            0.0
+        } else if normal_denominator.mantissa != 0.0 {
+            normal_residual
+                .div(normal_denominator)
+                .to_f64()
+                .unwrap_or(f64::INFINITY)
+        } else {
+            f64::INFINITY
+        };
+        let reciprocal_condition = ScaledValue::from_f64(1.0)
+            .div(condition.add(epsilon))
+            .to_f64()
+            .unwrap_or(f64::INFINITY);
+        let ctol = if self.controls.conlim > 0.0 {
+            1.0 / self.controls.conlim
+        } else {
+            0.0
+        };
+
+        // SciPy's precedence: a tolerance satisfied on the last allowed
+        // iteration wins over the budget or condition-limit stop.
+        if iteration >= max_iter {
+            self.istop = 7;
+        }
+        if 1.0 + reciprocal_condition <= 1.0 {
+            self.istop = 6;
+        }
+        if 1.0 + normal_test <= 1.0 {
+            self.istop = 5;
+        }
+        if bnorm > 0.0 && 1.0 + compatible_test <= 1.0 {
+            self.istop = 4;
+        }
+        if reciprocal_condition <= ctol {
+            self.istop = 3;
+        }
+        if normal_residual.abs_le(normal_denominator.mul(ScaledValue::from_f64(self.controls.atol)))
+        {
+            self.istop = 2;
+        }
+        let compatible_tolerance = ScaledValue::from_f64(self.controls.btol)
+            .mul(ScaledValue::from_f64(bnorm))
+            .add(ScaledValue::from_f64(self.controls.atol).mul(ax_norm));
+        if bnorm > 0.0 && scaled_residual.abs_le(compatible_tolerance) {
+            self.istop = 1;
+        }
+        Ok(())
+    }
 }
 
 /// `y = Aᵀ·x` for the bidiagonalization solvers (LSQR, LSMR, `svds`). A concrete CSR matrix
@@ -49833,6 +50255,16 @@ impl ScaledValue {
         let mut result = self;
         result.mantissa = result.mantissa.abs();
         result
+    }
+
+    fn sqrt(self) -> Self {
+        debug_assert!(self.mantissa >= 0.0);
+        let mantissa = if self.exponent.rem_euclid(2) == 0 {
+            self.mantissa
+        } else {
+            2.0 * self.mantissa
+        };
+        Self::normalized(mantissa.sqrt(), self.exponent.div_euclid(2))
     }
 
     fn to_f64(self) -> Option<f64> {
