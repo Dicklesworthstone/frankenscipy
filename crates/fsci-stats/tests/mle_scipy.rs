@@ -17,7 +17,7 @@ use fsci_stats::{
     fit_mle_censored, fit_mle_location_scale, fit_mle_location_scale_censored,
     with_hardened_stats_caps, with_stats_runtime_mode,
 };
-use fsci_stats::{Cauchy, ExponNorm};
+use fsci_stats::{Cauchy, DoubleGamma, ExponNorm, FoldedNormal, LaplaceAsymmetric};
 use rand::{SeedableRng, rngs::StdRng};
 
 const ORACLE: &str = r#"
@@ -54,6 +54,9 @@ cases = [
     ('exponweib', stats.exponweib, [(0.2, 1.4), (2.0, 1.5), (40.0, 20.0)]),
     ('rice', stats.rice, [(0.0,), (2.0,), (25.0,)]),
     ('norminvgauss', stats.norminvgauss, [(1.5, 0.5), (5.0, -2.0), (50.0, 45.0)]),
+    ('laplace_asymmetric', stats.laplace_asymmetric, [(0.2,), (1.0,), (5.0,)]),
+    ('dgamma', stats.dgamma, [(0.4,), (2.0,), (10.0,)]),
+    ('foldnorm', stats.foldnorm, [(0.0,), (0.8,), (8.0,)]),
 ]
 for family_index, (name, dist, shapes) in enumerate(cases):
     for case_index, shape in enumerate(shapes):
@@ -79,6 +82,210 @@ fn likelihood<D: ContinuousDistribution>(distribution: &D, data: &[f64]) -> f64 
 
 fn discrete_likelihood<D: DiscreteDistribution>(distribution: &D, data: &[i64]) -> f64 {
     -data.iter().map(|&x| distribution.logpmf(x)).sum::<f64>()
+}
+
+#[test]
+fn standardized_shape_mles_improve_likelihood_over_moment_estimates() {
+    for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+        with_stats_runtime_mode(mode, || {
+            let data = [-10.0_f64, -0.5, 0.2, 1.0, 4.0];
+            let fitted = LaplaceAsymmetric::try_fit(&data).unwrap();
+            let mean = data.iter().sum::<f64>() / data.len() as f64;
+            let moment_shape = 0.5 * ((mean * mean + 4.0).sqrt() - mean);
+            let moment_fit = LaplaceAsymmetric::new(moment_shape);
+            assert!(likelihood(&moment_fit, &data) - likelihood(&fitted, &data) > 0.5);
+            let positive = data.iter().map(|&x| x.max(0.0)).sum::<f64>() / data.len() as f64;
+            let negative = data.iter().map(|&x| (-x).max(0.0)).sum::<f64>() / data.len() as f64;
+            let k = fitted.kappa;
+            let score = (1.0 - k * k) / (1.0 + k * k) - k * positive + negative / k;
+            assert!(
+                score.abs() < 1e-13,
+                "asymmetric Laplace likelihood score={score}"
+            );
+            let reflected: Vec<_> = data.iter().map(|&x| -x).collect();
+            let reflected_fit = LaplaceAsymmetric::try_fit(&reflected).unwrap();
+            assert!((fitted.kappa * reflected_fit.kappa - 1.0).abs() < 1e-13);
+            assert_eq!(fitted.kappa, LaplaceAsymmetric::fit(&data).kappa);
+
+            let data = [-1.5_f64, -0.5, 0.5, 1.0, 2.0, -2.5, 0.7, -0.3];
+            let fitted = DoubleGamma::try_fit(&data).unwrap();
+            let second_moment = data.iter().map(|x| x * x).sum::<f64>() / data.len() as f64;
+            let moment_fit = DoubleGamma::new(0.5 * ((1.0 + 4.0 * second_moment).sqrt() - 1.0));
+            assert!(likelihood(&moment_fit, &data) - likelihood(&fitted, &data) > 0.01);
+            let target = data.iter().map(|x| x.abs().ln()).sum::<f64>() / data.len() as f64;
+            assert!((fsci_special::digamma_scalar(fitted.a) - target).abs() < 1e-12);
+            let reflected: Vec<_> = data.iter().map(|&x| -x).collect();
+            assert_eq!(fitted.a, DoubleGamma::try_fit(&reflected).unwrap().a);
+            assert_eq!(fitted.a, DoubleGamma::fit(&data).a);
+
+            // The mean is below the half-normal mean, so the former moment
+            // fit returned c=0. The likelihood has a positive interior maximum
+            // because the second moment exceeds one.
+            let data = [0.0_f64, 0.0, 0.0, 3.0];
+            let fitted = FoldedNormal::try_fit(&data).unwrap();
+            assert!(fitted.c > 0.7 && fitted.c < 0.8);
+            assert!(likelihood(&FoldedNormal::new(0.0), &data) - likelihood(&fitted, &data) > 0.4);
+            let score = data.iter().map(|&x| x * (fitted.c * x).tanh()).sum::<f64>()
+                / data.len() as f64
+                - fitted.c;
+            assert!(
+                score.abs() < 1e-13,
+                "folded-normal likelihood score={score}"
+            );
+            for factor in [0.9, 1.1] {
+                assert!(
+                    likelihood(&fitted, &data)
+                        < likelihood(&FoldedNormal::new(factor * fitted.c), &data)
+                );
+            }
+            assert_eq!(fitted.c, FoldedNormal::fit(&data).c);
+        });
+    }
+}
+
+#[test]
+fn standardized_shape_mles_validate_samples_and_honor_hardened_caps() {
+    assert!(matches!(
+        LaplaceAsymmetric::try_fit(&[]),
+        Err(FitError::InsufficientData { .. })
+    ));
+    assert!(matches!(
+        FoldedNormal::try_fit(&[]),
+        Err(FitError::InsufficientData { .. })
+    ));
+    for data in [&[][..], &[1.0][..]] {
+        assert!(matches!(
+            DoubleGamma::try_fit(data),
+            Err(FitError::InsufficientData { .. })
+        ));
+    }
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(matches!(
+            LaplaceAsymmetric::try_fit(&[1.0, bad]),
+            Err(FitError::UnsupportedData(_))
+        ));
+        assert!(matches!(
+            DoubleGamma::try_fit(&[1.0, bad]),
+            Err(FitError::UnsupportedData(_))
+        ));
+        assert!(matches!(
+            FoldedNormal::try_fit(&[1.0, bad]),
+            Err(FitError::UnsupportedData(_))
+        ));
+    }
+    assert!(matches!(
+        DoubleGamma::try_fit(&[0.0, 1.0]),
+        Err(FitError::NonConvergent(_))
+    ));
+    assert!(matches!(
+        FoldedNormal::try_fit(&[-0.1, 1.0]),
+        Err(FitError::UnsupportedData(_))
+    ));
+    assert_eq!(LaplaceAsymmetric::try_fit(&[0.0, 0.0]).unwrap().kappa, 1.0);
+    assert_eq!(FoldedNormal::try_fit(&[0.0, 0.0]).unwrap().c, 0.0);
+    assert_eq!(FoldedNormal::try_fit(&[0.2, 0.6, 1.0]).unwrap().c, 0.0);
+    with_stats_runtime_mode(RuntimeMode::Hardened, || {
+        with_hardened_stats_caps(2, 2, || {
+            assert!(matches!(
+                LaplaceAsymmetric::try_fit(&[-1.0, 0.0, 1.0]),
+                Err(FitError::ResourceExhausted { .. })
+            ));
+            assert!(matches!(
+                DoubleGamma::try_fit(&[-1.0, 0.5, 1.0]),
+                Err(FitError::ResourceExhausted { .. })
+            ));
+            assert!(matches!(
+                FoldedNormal::try_fit(&[0.0, 1.0, 2.0]),
+                Err(FitError::ResourceExhausted { .. })
+            ));
+        });
+    });
+}
+
+#[test]
+fn fitted_asymmetric_laplace_extreme_shapes_preserve_probability_functions() {
+    for magnitude in [1e200, 1e308] {
+        for sign in [-1.0, 1.0] {
+            let data = [sign * magnitude; 3];
+            let fitted = LaplaceAsymmetric::try_fit(&data).unwrap();
+            let reflected = LaplaceAsymmetric::try_fit(&[-sign * magnitude; 3]).unwrap();
+            assert!(fitted.logcdf(0.0).is_finite());
+            assert!(fitted.logsf(0.0).is_finite());
+            for q in [0.25_f64, 0.5, 0.75] {
+                let x = fitted.ppf(q);
+                assert!(x.is_finite(), "kappa={}, q={q}", fitted.kappa);
+                assert!((fitted.cdf(x) - q).abs() < 1e-12);
+                assert!((fitted.sf(x) - (1.0 - q)).abs() < 1e-12);
+                assert!((fitted.logcdf(x) - q.ln()).abs() < 1e-12);
+                assert!((fitted.logsf(x) - (-q).ln_1p()).abs() < 1e-12);
+                assert!(fitted.pdf(x) > 0.0);
+                assert!((fitted.pdf(x) / fitted.logpdf(x).exp() - 1.0).abs() < 1e-12);
+                let inverse_survival = fitted.isf(q);
+                assert!(inverse_survival.is_finite());
+                assert!((fitted.sf(inverse_survival) - q).abs() < 1e-12);
+                assert!((reflected.cdf(-x) - fitted.sf(x)).abs() < 1e-12);
+                assert!((reflected.pdf(-x) / fitted.pdf(x) - 1.0).abs() < 1e-12);
+                assert!((reflected.ppf(1.0 - q) / -x - 1.0).abs() < 1e-12);
+            }
+            assert_eq!(fitted.ppf(0.0), f64::NEG_INFINITY);
+            assert_eq!(fitted.ppf(1.0), f64::INFINITY);
+            assert_eq!(fitted.isf(0.0), f64::INFINITY);
+            assert_eq!(fitted.isf(1.0), f64::NEG_INFINITY);
+            for q in [-0.1, 1.1, f64::NAN] {
+                assert!(fitted.ppf(q).is_nan());
+                assert!(fitted.isf(q).is_nan());
+            }
+        }
+    }
+    // The ordinary probabilities underflow, but their logarithms must
+    // remain finite even if x*kappa or x/kappa also rounds to zero.
+    let tiny = LaplaceAsymmetric::new(f64::from_bits(1));
+    assert!(tiny.logcdf(0.0).is_finite());
+    assert!(tiny.logcdf(0.1).is_finite());
+    let huge = LaplaceAsymmetric::new(f64::MAX);
+    assert!(huge.logsf(0.0).is_finite());
+    assert!(huge.logsf(-f64::from_bits(1)).is_finite());
+}
+
+#[test]
+fn standardized_shape_mles_keep_extreme_and_near_boundary_solutions() {
+    for sign in [-1.0_f64, 1.0] {
+        let data = [sign * 1e300, sign * 2e300];
+        let fitted = LaplaceAsymmetric::try_fit(&data).unwrap();
+        let expected = if sign > 0.0 { 1.0 / 1.5e300 } else { 1.5e300 };
+        assert!((fitted.kappa / expected - 1.0).abs() < 1e-12);
+        assert!(likelihood(&fitted, &data).is_finite());
+    }
+    let repeated = [f64::MAX; 3];
+    let fitted = LaplaceAsymmetric::try_fit(&repeated).unwrap();
+    assert!(fitted.kappa > 0.0 && likelihood(&fitted, &repeated).is_finite());
+    assert!(
+        LaplaceAsymmetric::new(f64::from_bits(1))
+            .logpdf(0.0)
+            .is_finite()
+    );
+
+    let tiny = [1e-250_f64, -2e-250];
+    let fitted = DoubleGamma::try_fit(&tiny).unwrap();
+    let target = 0.5 * (tiny[0].ln() + tiny[1].abs().ln());
+    assert!((fsci_special::digamma_scalar(fitted.a) - target).abs() < 1e-10);
+    assert!(likelihood(&fitted, &tiny).is_finite());
+
+    // Unit scale is fixed: even a tiny relative shape error here would
+    // displace the mean by many standard deviations. The saturated score
+    // should return the representable sample mean exactly.
+    let large = [1e150; 3];
+    let fitted = FoldedNormal::try_fit(&large).unwrap();
+    assert_eq!(fitted.c, 1e150);
+    assert!(likelihood(&fitted, &large).is_finite());
+    let separated = [1.00000000000005e150, 1.0000000000001e150];
+    let fitted = FoldedNormal::try_fit(&separated).unwrap();
+    let mean = separated[1] * (0.5 * (separated[0] / separated[1]) + 0.5);
+    assert_eq!(fitted.c, mean);
+    let near_boundary = [1.0 + f64::EPSILON];
+    let fitted = FoldedNormal::try_fit(&near_boundary).unwrap();
+    let expected = (6.0 * f64::EPSILON).sqrt();
+    assert!((fitted.c / expected - 1.0).abs() < 1e-12);
 }
 
 #[test]
@@ -2722,6 +2929,18 @@ fn mle_matches_live_scipy_on_seeded_fits() {
         let two_positive = [MleParameter::Positive(1.0), MleParameter::Positive(1.0)];
         let options = MleOptions::default();
         let (actual, nll) = match family {
+            "laplace_asymmetric" => {
+                let fitted = LaplaceAsymmetric::try_fit(&data).unwrap();
+                (vec![fitted.kappa], likelihood(&fitted, &data))
+            }
+            "dgamma" => {
+                let fitted = DoubleGamma::try_fit(&data).unwrap();
+                (vec![fitted.a], likelihood(&fitted, &data))
+            }
+            "foldnorm" => {
+                let fitted = FoldedNormal::try_fit(&data).unwrap();
+                (vec![fitted.c], likelihood(&fitted, &data))
+            }
             "chi2" => {
                 let fitted = ChiSquared::try_fit(&data).unwrap();
                 (vec![fitted.df], likelihood(&fitted, &data))
@@ -2883,10 +3102,10 @@ fn mle_matches_live_scipy_on_seeded_fits() {
         compared += 1;
     }
     assert_eq!(
-        compared, 69,
+        compared, 78,
         "every seeded case must produce a real comparison"
     );
-    eprintln!("MLE compared cases = {compared}; families = 23; samples per case = 2000");
+    eprintln!("MLE compared cases = {compared}; families = 26; samples per case = 2000");
 }
 
 #[test]

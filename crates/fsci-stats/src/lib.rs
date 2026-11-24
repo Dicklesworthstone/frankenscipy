@@ -23732,39 +23732,11 @@ impl ContinuousDistribution for DoubleGamma {
         if self.a > 1.0 { self.a - 1.0 } else { 0.0 }
     }
 
+    /// Maximum-likelihood shape estimate with location zero and scale one.
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        if data.len() < 2 {
-            return Err(FitError::InsufficientData {
-                required: 2,
-                actual: data.len(),
-            });
-        }
-        for &x in data {
-            if !x.is_finite() {
-                return Err(FitError::UnsupportedData(format!(
-                    "DoubleGamma data contains non-finite value: {x}"
-                )));
-            }
-        }
-        // DoubleGamma has mean = 0 and var = a(a+1). MoM: solve
-        //   a² + a − sample_var = 0  ⟹  a = (−1 + √(1 + 4·var)) / 2
-        // (the positive root, since a > 0). We use sample variance about
-        // 0 (the population mean) — not about the sample mean — because
-        // that is the moment the distribution actually defines.
-        let n = data.len() as f64;
-        let m2_about_zero: f64 = data.iter().map(|x| x * x).sum::<f64>() / n;
-        if !m2_about_zero.is_finite() || m2_about_zero <= 0.0 {
-            return Err(FitError::NonConvergent(format!(
-                "DoubleGamma MoM: sample E[x²] {m2_about_zero} is non-positive"
-            )));
-        }
-        let a = 0.5 * (-1.0 + (1.0 + 4.0 * m2_about_zero).sqrt());
-        if !a.is_finite() || a <= 0.0 {
-            return Err(FitError::NonConvergent(format!(
-                "DoubleGamma MoM produced non-positive a: {a}"
-            )));
-        }
-        Ok(Self { a })
+        Ok(Self {
+            a: mle::double_gamma_shape_mle(data)?,
+        })
     }
 }
 
@@ -32092,6 +32064,19 @@ impl LaplaceAsymmetric {
         assert!(kappa > 0.0, "kappa must be positive");
         Self { kappa }
     }
+
+    /// Logarithms of the probability masses to the left and right of zero.
+    /// Form the smaller squared shape through its logarithm so neither
+    /// kappa squared nor its reciprocal needs to be representable.
+    fn log_tail_weights(&self) -> (f64, f64) {
+        let log_shape = self.kappa.ln();
+        let correction = (-2.0 * log_shape.abs()).exp().ln_1p();
+        if log_shape >= 0.0 {
+            (-correction, -2.0 * log_shape - correction)
+        } else {
+            (2.0 * log_shape - correction, -correction)
+        }
+    }
 }
 
 impl ContinuousDistribution for LaplaceAsymmetric {
@@ -32105,7 +32090,8 @@ impl ContinuousDistribution for LaplaceAsymmetric {
 
     fn pdf(&self, x: f64) -> f64 {
         let k = self.kappa;
-        let norm = 1.0 / (k + 1.0 / k);
+        let smaller = if k <= 1.0 { k } else { 1.0 / k };
+        let norm = smaller / (1.0 + smaller * smaller);
         if x >= 0.0 {
             norm * (-x * k).exp()
         } else {
@@ -32114,9 +32100,11 @@ impl ContinuousDistribution for LaplaceAsymmetric {
     }
 
     fn logpdf(&self, x: f64) -> f64 {
-        // −ln(κ+1/κ) − xκ (x≥0) / + x/κ (x<0); finite in both tails. frankenscipy-p82v7
+        // ln(k + 1/k) = |ln(k)| + ln(1 + exp(-2|ln(k)|)).
+        // This retains a finite likelihood even when 1/k would overflow.
         let k = self.kappa;
-        let lognorm = -(k + 1.0 / k).ln();
+        let log_shape = k.ln().abs();
+        let lognorm = -log_shape - (-2.0 * log_shape).exp().ln_1p();
         if x >= 0.0 {
             lognorm - x * k
         } else {
@@ -32125,38 +32113,97 @@ impl ContinuousDistribution for LaplaceAsymmetric {
     }
 
     fn cdf(&self, x: f64) -> f64 {
-        let k = self.kappa;
-        if x >= 0.0 {
-            // CDF = 1 - exp(-xκ) / (1+κ²)
-            1.0 - (-x * k).exp() / (1.0 + k * k)
+        if x <= 0.0 {
+            self.logcdf(x).exp()
         } else {
-            // CDF = κ² / (1+κ²) * exp(x/κ)
-            k * k / (1.0 + k * k) * (x / k).exp()
-        }
-    }
-
-    fn ppf(&self, q: f64) -> f64 {
-        // Piecewise closed-form inverse; split at cdf(0)=κ²/(1+κ²). frankenscipy-ld94y
-        if !(0.0..=1.0).contains(&q) {
-            return f64::NAN;
-        }
-        let k = self.kappa;
-        let split = k * k / (1.0 + k * k);
-        if q <= split {
-            k * (q * (1.0 + k * k) / (k * k)).ln()
-        } else {
-            -((1.0 - q) * (1.0 + k * k)).ln() / k
+            -self.logsf(x).exp_m1()
         }
     }
 
     fn sf(&self, x: f64) -> f64 {
-        // x≥0: sf = exp(−xκ)/(1+κ²) directly — the exponential tail no longer
-        // collapses under 1−cdf; x<0: 1 − κ²/(1+κ²)·exp(x/κ). frankenscipy-w3f6m
-        let k = self.kappa;
         if x >= 0.0 {
-            (-x * k).exp() / (1.0 + k * k)
+            self.logsf(x).exp()
         } else {
-            1.0 - k * k / (1.0 + k * k) * (x / k).exp()
+            -self.logcdf(x).exp_m1()
+        }
+    }
+
+    fn logcdf(&self, x: f64) -> f64 {
+        let (left, right) = self.log_tail_weights();
+        if x <= 0.0 {
+            return left + x / self.kappa;
+        }
+        let product = x * self.kappa;
+        if product < f64::MIN_POSITIVE {
+            // The positive mass is approximately x*kappa at this scale.
+            // Combine it with the mass left of zero in log space, including
+            // when x*kappa itself rounds to zero.
+            let increment = right + x.ln() + self.kappa.ln();
+            let larger = left.max(increment);
+            return larger + (left.min(increment) - larger).exp().ln_1p();
+        }
+        let tail = right - product;
+        if tail < -LN_2 {
+            (-tail.exp()).ln_1p()
+        } else {
+            (-tail.exp_m1()).ln()
+        }
+    }
+
+    fn logsf(&self, x: f64) -> f64 {
+        let (left, right) = self.log_tail_weights();
+        if x >= 0.0 {
+            return right - x * self.kappa;
+        }
+        let quotient = -x / self.kappa;
+        if quotient < f64::MIN_POSITIVE {
+            let increment = left + (-x).ln() - self.kappa.ln();
+            let larger = right.max(increment);
+            return larger + (right.min(increment) - larger).exp().ln_1p();
+        }
+        let tail = left - quotient;
+        if tail < -LN_2 {
+            (-tail.exp()).ln_1p()
+        } else {
+            (-tail.exp_m1()).ln()
+        }
+    }
+
+    fn ppf(&self, q: f64) -> f64 {
+        if !(0.0..=1.0).contains(&q) {
+            return f64::NAN;
+        }
+        if q == 0.0 {
+            return f64::NEG_INFINITY;
+        }
+        if q == 1.0 {
+            return f64::INFINITY;
+        }
+        let (left, right) = self.log_tail_weights();
+        let log_q = q.ln();
+        if log_q <= left {
+            self.kappa * (log_q - left)
+        } else {
+            -((-q).ln_1p() - right) / self.kappa
+        }
+    }
+
+    fn isf(&self, q: f64) -> f64 {
+        if !(0.0..=1.0).contains(&q) {
+            return f64::NAN;
+        }
+        if q == 0.0 {
+            return f64::INFINITY;
+        }
+        if q == 1.0 {
+            return f64::NEG_INFINITY;
+        }
+        let (left, right) = self.log_tail_weights();
+        let log_q = q.ln();
+        if log_q <= right {
+            -(log_q - right) / self.kappa
+        } else {
+            self.kappa * ((-q).ln_1p() - left)
         }
     }
 
@@ -32213,29 +32260,11 @@ impl ContinuousDistribution for LaplaceAsymmetric {
         1.0 + (self.kappa.mul_add(self.kappa, 1.0) / self.kappa).ln()
     }
 
+    /// Maximum-likelihood shape estimate with location zero and scale one.
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        // Closed-form MOM matching the first moment to the type's own
-        // mean formula. LaplaceAsymmetric(κ) has mean = 1/κ − κ. Solving
-        // 1/κ − κ = m̄ for κ > 0 gives the unique positive root of
-        // κ² + m̄·κ − 1 = 0, i.e.
-        //   κ = (−m̄ + √(m̄² + 4)) / 2.
-        // (m̄ > 0 ⇒ κ < 1 ⇒ left-skewed; m̄ < 0 ⇒ κ > 1; m̄ = 0 ⇒ κ = 1
-        // collapses to the symmetric Laplace.)
-        validate_finite_fit_data(data, 1, "LaplaceAsymmetric")?;
-        let m = sample_mean(data);
-        if !m.is_finite() {
-            return Err(FitError::NonConvergent(
-                "LaplaceAsymmetric fit requires a finite sample mean".to_owned(),
-            ));
-        }
-        let kappa = 0.5 * ((m * m + 4.0).sqrt() - m);
-        if kappa.is_finite() && kappa > 0.0 {
-            Ok(Self { kappa })
-        } else {
-            Err(FitError::NonConvergent(
-                "LaplaceAsymmetric MOM did not yield a positive κ".to_owned(),
-            ))
-        }
+        Ok(Self {
+            kappa: mle::laplace_asymmetric_shape_mle(data)?,
+        })
     }
 }
 
@@ -62290,68 +62319,11 @@ impl ContinuousDistribution for FoldedNormal {
         )
     }
 
+    /// Maximum-likelihood shape estimate with location zero and scale one.
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        // Method-of-moments on the first absolute moment. For Y ~ N(c, 1)
-        // with c ≥ 0, the folded variable X = |Y| has
-        //   E[X] = c·(2·Φ(c) − 1) + 2·φ(c)
-        // which is monotonically increasing in c on [0, ∞) (derivative
-        // 2·Φ(c) − 1 ≥ 0). FoldedNormal(c) and FoldedNormal(−c) are the
-        // same distribution by symmetry, so we estimate c ≥ 0 and bisect.
-        validate_finite_fit_data(data, 1, "FoldedNormal")?;
-        if let Some(&bad) = data.iter().find(|&&x| x < 0.0) {
-            return Err(FitError::UnsupportedData(format!(
-                "FoldedNormal support is [0, ∞); got {bad}"
-            )));
-        }
-        let m1 = sample_mean(data);
-        if !m1.is_finite() || m1 < 0.0 {
-            return Err(FitError::NonConvergent(
-                "FoldedNormal fit requires a non-negative finite sample mean".to_owned(),
-            ));
-        }
-        // c = 0 yields E[X] = √(2/π); larger means correspond to
-        // larger c. Bisect on [0, 30] which covers any sample mean
-        // ≤ 30 + √(2/π) (well past any realistic application).
-        let inv_sqrt_2pi = 1.0 / (2.0 * PI).sqrt();
-        let expected = |c: f64| -> f64 {
-            c.mul_add(
-                2.0 * standard_normal_cdf(c) - 1.0,
-                2.0 * inv_sqrt_2pi * (-0.5 * c * c).exp(),
-            )
-        };
-        let baseline = expected(0.0);
-        if m1 <= baseline {
-            return Ok(Self { c: 0.0 });
-        }
-        let mut lo = 0.0_f64;
-        let mut hi = 1.0_f64;
-        while expected(hi) < m1 {
-            hi *= 2.0;
-            if hi > 1e6 {
-                return Err(FitError::NonConvergent(
-                    "FoldedNormal fit could not bracket c via E[|X|]".to_owned(),
-                ));
-            }
-        }
-        for _ in 0..200 {
-            let mid = 0.5 * (lo + hi);
-            if expected(mid) < m1 {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-            if hi - lo < 1e-12 {
-                break;
-            }
-        }
-        let c_hat = 0.5 * (lo + hi);
-        if c_hat.is_finite() && c_hat >= 0.0 {
-            Ok(Self { c: c_hat })
-        } else {
-            Err(FitError::NonConvergent(
-                "FoldedNormal MOM did not converge".to_owned(),
-            ))
-        }
+        Ok(Self {
+            c: mle::folded_normal_shape_mle(data)?,
+        })
     }
 }
 
@@ -104468,7 +104440,7 @@ mod tests {
     #[test]
     fn doublegamma_fit_recovers_synthetic_shape() {
         // Synthesize n=2000 samples from DoubleGamma(a=2.5) via inverse CDF
-        // grid; MoM recovers a within 5%.
+        // grid; the fixed-scale MLE recovers a within 5%.
         let true_a = 2.5;
         let dist = DoubleGamma::new(true_a);
         let n = 2000;
@@ -104487,18 +104459,21 @@ mod tests {
     }
 
     #[test]
-    fn doublegamma_fit_metamorphic_var_identity() {
-        // After fitting, the fitted distribution's var equals sample E[x²]
-        // bit-for-bit (because a is solved exactly from the moment equation).
+    fn doublegamma_fit_satisfies_likelihood_score() {
+        // The fixed-scale likelihood uses mean(log|x|), not E[x²].
+        // The old moment estimator fails this score and has a lower LL.
         let data = [-1.5_f64, -0.5, 0.5, 1.0, 2.0, -2.5, 0.7, -0.3];
         let n = data.len() as f64;
+        let target = data.iter().map(|x| x.abs().ln()).sum::<f64>() / n;
         let m2: f64 = data.iter().map(|x| x * x).sum::<f64>() / n;
+        let moment_fit = DoubleGamma::new(0.5 * ((1.0 + 4.0 * m2).sqrt() - 1.0));
         let fitted = DoubleGamma::try_fit(&data).expect("fit");
-        let expected_var = fitted.a * (fitted.a + 1.0);
-        assert!(
-            (expected_var - m2).abs() < 1e-12,
-            "fitted var {expected_var} != sample E[x²] {m2}"
-        );
+        assert!((fsci_special::digamma_scalar(fitted.a) - target).abs() < 1e-12);
+        let gain: f64 = data
+            .iter()
+            .map(|&x| fitted.logpdf(x) - moment_fit.logpdf(x))
+            .sum();
+        assert!(gain > 0.01, "MLE likelihood gain over moments = {gain}");
     }
 
     #[test]
@@ -105907,11 +105882,9 @@ mod tests {
     }
 
     #[test]
-    fn try_fit_folded_normal_recovers_c_via_mean_match() {
-        // For c_true ≥ 0 the MOM estimator solves E[|X|] = sample mean
-        // exactly when the sample mean equals the population mean. The
-        // deciles sample makes the sample mean essentially the
-        // distribution mean, so we recover c to high precision.
+    fn try_fit_folded_normal_recovers_c_via_likelihood() {
+        // A deterministic quantile sample approximates the population
+        // likelihood, including the half-normal boundary c=0.
         for c_true in [0.0, 0.5, 1.0, 2.0, 4.0] {
             let dist = FoldedNormal { c: c_true };
             let samples: Vec<f64> = (1..=400)
@@ -105979,9 +105952,9 @@ mod tests {
     }
 
     #[test]
-    fn try_fit_laplace_asymmetric_recovers_kappa_from_mean() {
-        // Closed-form MOM should recover κ exactly when the sample
-        // mean equals the population mean 1/κ − κ.
+    fn try_fit_laplace_asymmetric_recovers_kappa_from_likelihood() {
+        // The quantile grid approximates the population's positive and
+        // negative sufficient statistics for the likelihood score.
         for kappa_true in [0.5_f64, 0.8, 1.0, 1.5, 2.0, 3.0] {
             let dist = LaplaceAsymmetric { kappa: kappa_true };
             let samples: Vec<f64> = (1..=600)

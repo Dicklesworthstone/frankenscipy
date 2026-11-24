@@ -941,6 +941,153 @@ fn compensated_mean(values: impl Iterator<Item = f64>, count: usize) -> f64 {
     mean
 }
 
+/// With location zero and scale one, the asymmetric Laplace likelihood is
+/// strictly concave in log(kappa). Its score is
+/// -tanh(log(kappa)) - kappa*mean(x+) + mean((-x)+)/kappa.
+pub(crate) fn laplace_asymmetric_shape_mle(data: &[f64]) -> Result<f64, FitError> {
+    validate_shape_sample(data, 1, "LaplaceAsymmetric")?;
+    let scale = data.iter().fold(0.0_f64, |maximum, x| maximum.max(x.abs()));
+    if scale == 0.0 {
+        return Ok(1.0);
+    }
+    // Scale before summing so repeated large finite observations do not
+    // overflow their mean. The two signs supply separate sufficient
+    // statistics; using their difference alone gives only a moment estimate.
+    let positive = scale * compensated_mean(data.iter().map(|&x| x.max(0.0) / scale), data.len());
+    let negative =
+        scale * compensated_mean(data.iter().map(|&x| (-x).max(0.0) / scale), data.len());
+    if positive == negative {
+        return Ok(1.0);
+    }
+    // 1/(positive+1) <= kappa <= negative+1 brackets the unique root,
+    // including samples whose observations all have the same sign. Log
+    // coordinates avoid an arbitrary shape cutoff or a polynomial solve.
+    let mut lower = -(positive + 1.0).ln();
+    let mut upper = (negative + 1.0).ln();
+    for _ in 0..128 {
+        let middle = lower + 0.5 * (upper - lower);
+        let kappa = middle.exp();
+        let score = -middle.tanh() - kappa * positive + negative / kappa;
+        if score == 0.0 || middle == lower || middle == upper {
+            return Ok(kappa);
+        }
+        if score > 0.0 {
+            lower = middle;
+        } else {
+            upper = middle;
+        }
+    }
+    Err(FitError::NonConvergent(
+        "LaplaceAsymmetric likelihood score did not converge".into(),
+    ))
+}
+
+/// The absolute value of a standardized double-Gamma observation follows
+/// Gamma(a, 1), so the shape score is psi(a) = mean(log(abs(x))).
+pub(crate) fn double_gamma_shape_mle(data: &[f64]) -> Result<f64, FitError> {
+    validate_shape_sample(data, 2, "DoubleGamma")?;
+    if data.contains(&0.0) {
+        return Err(FitError::NonConvergent(
+            "DoubleGamma likelihood is unbounded at a zero observation".into(),
+        ));
+    }
+    let target = compensated_mean(data.iter().map(|x| x.abs().ln()), data.len());
+    shape_from_digamma(target, "DoubleGamma")
+}
+
+/// For standardized folded normals, log likelihood is concave in c^2:
+/// the boundary maximum is c=0 when mean(x^2)<=1; otherwise the unique
+/// positive root of mean(x*tanh(c*x))-c lies below mean(x).
+pub(crate) fn folded_normal_shape_mle(data: &[f64]) -> Result<f64, FitError> {
+    validate_shape_sample(data, 1, "FoldedNormal")?;
+    if data.iter().any(|&x| x < 0.0) {
+        return Err(FitError::UnsupportedData(
+            "FoldedNormal support is [0, infinity)".into(),
+        ));
+    }
+    // Preserve the small gap for observations close to one. Infinite
+    // squares correctly put the likelihood in the interior-maximum case.
+    let gap = compensated_mean(data.iter().map(|&x| (x - 1.0) * (x + 1.0)), data.len());
+    if gap <= 0.0 {
+        return Ok(0.0);
+    }
+    let scale = data.iter().copied().fold(0.0_f64, f64::max);
+    let mean = scale * compensated_mean(data.iter().map(|&x| x / scale), data.len());
+    if !mean.is_finite() || mean <= 0.0 {
+        return Err(FitError::NonConvergent(
+            "FoldedNormal likelihood requires a positive finite sample mean".into(),
+        ));
+    }
+    let score = |c: f64| {
+        if gap < 0.5 {
+            // Divide the score by c and subtract from the boundary score.
+            // 1-tanh(z)/z has a stable even series near zero; computing it
+            // by subtraction would erase a maximum just above c=0.
+            gap - compensated_mean(
+                data.iter().map(|&x| {
+                    let z = c * x;
+                    let complement = if z < 1.0e-2 {
+                        let square = z * z;
+                        square
+                            * (1.0 / 3.0
+                                + square
+                                    * (-2.0 / 15.0
+                                        + square
+                                            * (17.0 / 315.0
+                                                + square
+                                                    * (-62.0 / 2835.0
+                                                        + square * (1382.0 / 155925.0)))))
+                    } else {
+                        1.0 - z.tanh() / z
+                    };
+                    x * x * complement
+                }),
+                data.len(),
+            )
+        } else {
+            // Normalizing by the sample mean keeps the score finite even
+            // when x^2 or c*x overflows. tanh(infinity)=1 is the limit.
+            compensated_mean(
+                data.iter().map(|&x| (x / mean) * (c * x).tanh()),
+                data.len(),
+            ) - c / mean
+        }
+    };
+    // In well-separated folded components, tanh rounds to one and the MLE
+    // is the sample mean. Return that exact value; a relative shape
+    // tolerance alone could lose many unit-scale standard deviations.
+    if data.iter().all(|&x| x == 0.0 || (mean * x).tanh() == 1.0) || score(mean) == 0.0 {
+        return Ok(mean);
+    }
+    let mut lower = 0.0;
+    let mut upper = mean;
+    for _ in 0..128 {
+        let middle = lower + 0.5 * (upper - lower);
+        if middle == lower || middle == upper {
+            return Ok(middle);
+        }
+        let value = score(middle);
+        if value.is_nan() {
+            return Err(FitError::NonConvergent(
+                "FoldedNormal likelihood score could not be evaluated".into(),
+            ));
+        }
+        if value > 0.0 {
+            lower = middle;
+        } else if value < 0.0 {
+            upper = middle;
+        } else {
+            return Ok(middle);
+        }
+        if upper - lower <= 8.0 * f64::EPSILON * middle {
+            return Ok(lower + 0.5 * (upper - lower));
+        }
+    }
+    Err(FitError::NonConvergent(
+        "FoldedNormal likelihood score did not converge".into(),
+    ))
+}
+
 /// Standardized Rice MLE. The likelihood is concave in b^2: its boundary
 /// maximum is b=0 when mean(x^2)<=2; otherwise its unique positive score root
 /// lies below mean(x), because I1(z)/I0(z)<1.
