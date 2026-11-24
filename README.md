@@ -935,13 +935,44 @@ Global:        differential_evolution, dual_annealing, basinhopping, shgo, brute
                pso,
 
 LP / MILP:     linprog (bounded revised simplex + Mehrotra IPM, with marginals),
-               milp (branch and bound),
+               milp (best-bound search, global lower bound, optimality gaps),
 
 Other:         linear_sum_assignment (Jonker-Volgenant), bracket,
                line_search_wolfe1, line_search_wolfe2, validate_wolfe_params,
                projected_gradient_descent, augmented_lagrangian,
                simulated_annealing, …
 ```
+
+##### Mixed-integer optimality gaps
+
+`milp` keeps a feasible incumbent and a global lower bound across its pending
+branch-and-bound subproblems. `MilpResult::mip_dual_bound` and `mip_gap` remain
+available when `max_nodes` or an LP iteration limit interrupts the search.
+`MilpOptions::mip_rel_gap` and `mip_abs_gap` permit stopping at a requested
+relative or absolute objective gap; both default to zero. Status 0 means the
+requested gap was met, subject to the underlying LP feasibility tolerances.
+
+Without an incumbent, `x` is empty and `fun` is NaN. An unavailable lower bound
+is negative infinity. A zero incumbent objective has an infinite relative gap
+unless its lower bound is also zero; use the absolute gap for that case.
+An unbounded continuous relaxation triggers a mixed-integer feasibility search
+before an unbounded result is reported.
+
+##### Simplicial global optimization
+
+`shgo_with_options` selects local starts from the minima of a Freudenthal
+simplicial grid and can refine that grid while reusing sampled values. It
+returns the distinct converged local minima in `xl`/`funl`, together with
+sampling and local-solver evaluation counts. `ShgoOptions::constraints` accepts
+the same equality and inequality callbacks as `minimize`, using SLSQP for
+constrained local searches. Unconstrained local searches use L-BFGS-B.
+
+Explicit sample, edge, objective-evaluation and local-search budgets bound the
+work. A completed run requires converged feasible local solves; interrupted
+runs retain their best feasible point with `success=false`. Grid size grows
+exponentially with dimension, and oversized requests are rejected before
+calling the objective. Finite sampling cannot certify that an arbitrary
+black-box function has no narrower unsampled minimum.
 
 ##### Sparse and matrix-free bounded linear least squares
 

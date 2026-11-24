@@ -2770,13 +2770,112 @@ fn brute_thread_count(total_points: usize) -> usize {
         .max(1)
 }
 
-/// Simplicial homology global optimization over a bounded box.
+/// Controls for simplicial global optimization.
 ///
-/// This implementation uses a bounded lattice search to identify promising
-/// simplicial cells, then polishes the best seeds with the existing L-BFGS-B
-/// local optimizer. It matches the high-level contract of
-/// `scipy.optimize.shgo(func, bounds)` for unconstrained bounded problems.
+/// Each coordinate is initially divided into `initial_subdivisions` intervals.
+/// Subsequent iterations bisect these intervals, retaining previously sampled
+/// vertices. The Cartesian grid is triangulated by the Freudenthal construction:
+/// vertices belong to a common simplex when they are coordinatewise ordered in
+/// the same grid cell. Local solves start at the minima of this neighbor graph,
+/// including one representative of each flat minimum component.
+///
+/// The sample and edge limits are checked before allocating a complex. This
+/// method has exponential dimension dependence; an infeasible initial grid is
+/// rejected before either the objective or a constraint is called.
+#[derive(Debug, Clone, Copy)]
+pub struct ShgoOptions<'a> {
+    pub initial_subdivisions: usize,
+    pub iterations: usize,
+    /// Maximum number of unique sampling vertices, including infeasible ones.
+    pub max_samples: usize,
+    /// Maximum number of edges in any refined simplicial complex.
+    pub max_complex_edges: usize,
+    /// Hard limit on actual objective calls, including numerical gradients.
+    pub max_evaluations: usize,
+    pub local_max_iterations: usize,
+    /// Hard objective-call limit for each local solve.
+    pub local_max_evaluations: usize,
+    pub local_tolerance: f64,
+    /// Two local solutions within this fraction of every box width are merged.
+    pub minimizer_tolerance: f64,
+    /// Equalities and inequalities use the same contract as `minimize`.
+    /// Inequalities filter the sampling complex. Equalities, which can define
+    /// a lower-dimensional set with no grid vertices, are enforced by SLSQP.
+    pub constraints: &'a [Constraint<'a>],
+    pub constraint_tolerance: f64,
+}
+
+impl Default for ShgoOptions<'_> {
+    fn default() -> Self {
+        Self {
+            initial_subdivisions: 4,
+            iterations: 1,
+            max_samples: 100_000,
+            max_complex_edges: 5_000_000,
+            max_evaluations: 1_000_000,
+            local_max_iterations: 250,
+            local_max_evaluations: 2_500,
+            local_tolerance: 1e-8,
+            minimizer_tolerance: 1e-7,
+            constraints: &[],
+            constraint_tolerance: 1e-7,
+        }
+    }
+}
+
+/// Global result and the distinct, successfully polished local minima.
+///
+/// `xl` and `funl` are sorted by objective value. On success, `optimum` is the
+/// lowest converged local minimum. A budget or local-solver failure instead
+/// retains the best finite feasible point, including unpolished samples.
+/// Its iteration count is the number of completed sampling rounds,
+/// and `nfev == sampling_nfev + nlfev` counts actual objective calls.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShgoResult {
+    pub optimum: OptimizeResult,
+    pub xl: Vec<Vec<f64>>,
+    pub funl: Vec<f64>,
+    pub sampling_nfev: usize,
+    pub nlfev: usize,
+    pub nljev: usize,
+    pub nlhev: usize,
+    pub samples: usize,
+    pub local_minimizations: usize,
+    pub failed_local_minimizations: usize,
+}
+
+/// Simplicial global optimization over a bounded box with default controls.
+///
+/// See [`shgo_with_options`] for refinement, constraints, resource limits and
+/// the complete local-minimum pool. A finite sampling run is not a certificate
+/// that an arbitrary black-box objective has no narrower unsampled basin.
 pub fn shgo<F>(func: F, bounds: &[(f64, f64)]) -> Result<OptimizeResult, OptError>
+where
+    F: Fn(&[f64]) -> f64,
+{
+    shgo_with_options(func, bounds, ShgoOptions::default()).map(|result| result.optimum)
+}
+
+/// Minimize using the minima of a refined simplicial complex.
+///
+/// Unlike a fixed number of value-ranked restarts, every sampled minimum
+/// component receives a local solve. Unconstrained problems use L-BFGS-B in
+/// the sampled vertex's star, with a full-box polish if an artificial star
+/// boundary is reached. Constrained problems use SLSQP over the original
+/// bounds so a local star cannot exclude the equality-feasible manifold.
+/// Infeasible inequality vertices are retained with infinite value and never
+/// passed to the objective. Nonfinite objective values likewise create holes
+/// in the complex; nonfinite or shape-changing constraints are errors.
+///
+/// Success requires completed sampling rounds, a converged feasible best
+/// point, and no failed local solves. Limits retain the best feasible point
+/// with `success = false`. Neither a finite grid value nor a failed local
+/// optimizer is reported as convergence.
+pub fn shgo_with_options<F>(
+    func: F,
+    bounds: &[(f64, f64)],
+    options: ShgoOptions<'_>,
+) -> Result<ShgoResult, OptError>
 where
     F: Fn(&[f64]) -> f64,
 {
@@ -2798,134 +2897,549 @@ where
             });
         }
     }
-
-    let target_points = 5usize.saturating_pow((ndim.min(4)) as u32).max(9);
-    let axis_levels = ((target_points as f64).powf(1.0 / ndim as f64).ceil() as usize + 1).max(3);
-    let mut lattice = Vec::new();
-    let mut current = vec![0.0; ndim];
-    build_shgo_lattice(bounds, axis_levels, 0, &mut current, &mut lattice);
-
-    let mut nfev = 0usize;
-    let mut ranked: Vec<(f64, Vec<f64>)> = lattice
-        .into_iter()
-        .filter_map(|point| {
-            let value = func(&point);
-            nfev += 1;
-            value.is_finite().then_some((value, point))
-        })
-        .collect();
-
-    if ranked.is_empty() {
-        return Err(OptError::NonFiniteInput {
-            detail: "objective returned only non-finite values over the bounded domain".to_string(),
+    if options.initial_subdivisions == 0
+        || options.iterations == 0
+        || options.max_samples == 0
+        || options.max_complex_edges == 0
+        || options.max_evaluations == 0
+    {
+        return Err(OptError::InvalidArgument {
+            detail: "shgo: subdivisions, iterations and global resource limits must be positive"
+                .into(),
         });
     }
+    for (name, tolerance) in [
+        ("local_tolerance", options.local_tolerance),
+        ("minimizer_tolerance", options.minimizer_tolerance),
+        ("constraint_tolerance", options.constraint_tolerance),
+    ] {
+        if !tolerance.is_finite() || tolerance <= 0.0 {
+            return Err(OptError::InvalidArgument {
+                detail: format!("shgo: {name} must be positive and finite"),
+            });
+        }
+    }
+    shgo_complex_size(ndim, options.initial_subdivisions, options)?;
 
-    ranked.sort_by(|lhs, rhs| lhs.0.total_cmp(&rhs.0));
-    let starts = select_shgo_starts(&ranked, bounds, 8);
-    let bound_tuples: Vec<Bound> = bounds
+    let evaluations = std::cell::Cell::new(0usize);
+    let evaluation_limit = std::cell::Cell::new(false);
+    let evaluate = |point: &[f64]| {
+        if evaluations.get() >= options.max_evaluations {
+            evaluation_limit.set(true);
+            f64::NAN
+        } else {
+            evaluations.set(evaluations.get() + 1);
+            func(point)
+        }
+    };
+    let global_bounds: Vec<Bound> = bounds
         .iter()
         .map(|&(lo, hi)| (Some(lo), Some(hi)))
         .collect();
-    let local_options = MinimizeOptions {
-        method: Some(OptimizeMethod::LBfgsB),
-        tol: Some(1e-8),
-        maxiter: Some(250),
-        maxfev: Some(2500),
-        ..MinimizeOptions::default()
-    };
+    let mut cache = std::collections::BTreeMap::<Vec<u64>, usize>::new();
+    let mut vertices: Vec<(Vec<f64>, f64)> = Vec::new();
+    let mut constraint_sizes = vec![None; options.constraints.len()];
+    let mut minima: Vec<(Vec<f64>, f64)> = Vec::new();
+    let mut best: Option<(Vec<f64>, f64)> = None;
+    let mut sampling_nfev = 0usize;
+    let mut nlfev = 0usize;
+    let mut nljev = 0usize;
+    let mut nlhev = 0usize;
+    let mut local_minimizations = 0usize;
+    let mut failed_local_minimizations = 0usize;
+    let mut local_failure_status = None;
+    let mut completed = 0usize;
+    let mut stop: Option<(ConvergenceStatus, String)> = None;
+    let mut subdivisions = options.initial_subdivisions;
 
-    let mut best_x = ranked[0].1.clone();
-    let mut best_fun = ranked[0].0;
-    let mut total_nit = 0usize;
+    'rounds: for iteration in 0..options.iterations {
+        let count = match shgo_complex_size(ndim, subdivisions, options) {
+            Ok(count) => count,
+            Err(error) => {
+                stop = Some((ConvergenceStatus::MaxEvaluations, error.to_string()));
+                break;
+            }
+        };
+        let levels = subdivisions + 1;
+        let mut strides = vec![1usize; ndim];
+        for dimension in 1..ndim {
+            strides[dimension] = strides[dimension - 1] * levels;
+        }
+        let mut indices = Vec::with_capacity(count);
+        let mut values = Vec::with_capacity(count);
+        for grid_index in 0..count {
+            let point: Vec<f64> = bounds
+                .iter()
+                .zip(&strides)
+                .map(|(&(lo, hi), &stride)| {
+                    shgo_grid_coordinate(lo, hi, (grid_index / stride) % levels, subdivisions)
+                })
+                .collect();
+            let key: Vec<u64> = point.iter().map(|value| value.to_bits()).collect();
+            let vertex = if let Some(&vertex) = cache.get(&key) {
+                vertex
+            } else {
+                let (inequality_violation, violation) =
+                    shgo_constraint_state(&point, options.constraints, &mut constraint_sizes)?;
+                let value = if inequality_violation == 0.0 {
+                    let before = evaluations.get();
+                    let value = evaluate(&point);
+                    sampling_nfev += evaluations.get() - before;
+                    if evaluation_limit.get() {
+                        stop = Some((
+                            ConvergenceStatus::MaxEvaluations,
+                            "shgo: objective evaluation limit reached during sampling".into(),
+                        ));
+                        break 'rounds;
+                    }
+                    if value.is_finite() {
+                        value
+                    } else {
+                        f64::INFINITY
+                    }
+                } else {
+                    f64::INFINITY
+                };
+                if value.is_finite()
+                    && violation <= options.constraint_tolerance
+                    && best.as_ref().is_none_or(|(_, current)| value < *current)
+                {
+                    best = Some((point.clone(), value));
+                }
+                let vertex = vertices.len();
+                vertices.push((point, value));
+                cache.insert(key, vertex);
+                vertex
+            };
+            indices.push(vertex);
+            values.push(vertices[vertex].1);
+        }
 
-    for start in starts {
-        let local = lbfgsb(&func, &start, local_options, Some(&bound_tuples))?;
-        nfev += local.nfev;
-        total_nit += local.nit;
-        if let Some(fun) = local.fun
-            && fun < best_fun
-        {
-            best_fun = fun;
-            best_x = local.x;
+        let pool = shgo_minimizer_pool(&values, levels, &strides);
+        for (grid_index, plateau) in pool {
+            if options.local_max_iterations == 0 || options.local_max_evaluations == 0 {
+                stop = Some((
+                    if options.local_max_iterations == 0 {
+                        ConvergenceStatus::MaxIterations
+                    } else {
+                        ConvergenceStatus::MaxEvaluations
+                    },
+                    "shgo: local optimization budget is zero; returning sampling results".into(),
+                ));
+                break 'rounds;
+            }
+            let start = &vertices[indices[grid_index]].0;
+            let local_bounds = if plateau || !options.constraints.is_empty() {
+                global_bounds.clone()
+            } else {
+                bounds
+                    .iter()
+                    .zip(&strides)
+                    .map(|(&(lo, hi), &stride)| {
+                        let coordinate = (grid_index / stride) % levels;
+                        (
+                            Some(shgo_grid_coordinate(
+                                lo,
+                                hi,
+                                coordinate.saturating_sub(1),
+                                subdivisions,
+                            )),
+                            Some(shgo_grid_coordinate(
+                                lo,
+                                hi,
+                                (coordinate + 1).min(subdivisions),
+                                subdivisions,
+                            )),
+                        )
+                    })
+                    .collect()
+            };
+            let before = evaluations.get();
+            let local_limit = std::cell::Cell::new(false);
+            let local_objective = |point: &[f64]| {
+                if evaluations.get() - before >= options.local_max_evaluations {
+                    local_limit.set(true);
+                    f64::NAN
+                } else {
+                    evaluate(point)
+                }
+            };
+            let local_options = MinimizeOptions {
+                method: Some(if options.constraints.is_empty() {
+                    OptimizeMethod::LBfgsB
+                } else {
+                    OptimizeMethod::Slsqp
+                }),
+                bounds: Some(&local_bounds),
+                constraints: options.constraints,
+                tol: Some(options.local_tolerance),
+                maxiter: Some(options.local_max_iterations),
+                maxfev: Some(options.local_max_evaluations),
+                ..MinimizeOptions::default()
+            };
+            let mut local = minimize(&local_objective, start, local_options);
+            local_minimizations += 1;
+            if let Ok(first) = &local
+                && first.success
+                && first.x.len() == ndim
+                && first.x.iter().zip(&local_bounds).zip(bounds).any(
+                    |((&x, &(lower, upper)), &(lo, hi))| {
+                        let lower = lower.unwrap_or(lo);
+                        let upper = upper.unwrap_or(hi);
+                        (lower > lo && x <= lower + 64.0 * f64::EPSILON * lower.abs().max(1.0))
+                            || (upper < hi
+                                && x >= upper - 64.0 * f64::EPSILON * upper.abs().max(1.0))
+                    },
+                )
+            {
+                // A constrained optimum on an artificial star boundary is
+                // not necessarily a local minimum of the original box.
+                // Keep its finite value if the full-box polish later stops,
+                // but only the full-box result may enter the minima pool.
+                if let Some(value) = first.fun.filter(|value| value.is_finite())
+                    && first
+                        .x
+                        .iter()
+                        .zip(bounds)
+                        .all(|(&x, &(lo, hi))| x.is_finite() && x >= lo && x <= hi)
+                    && best.as_ref().is_none_or(|(_, current)| value < *current)
+                {
+                    best = Some((first.x.clone(), value));
+                }
+                nljev += first.njev;
+                nlhev += first.nhev;
+                local = minimize(
+                    &local_objective,
+                    &first.x,
+                    MinimizeOptions {
+                        bounds: Some(&global_bounds),
+                        ..local_options
+                    },
+                );
+                local_minimizations += 1;
+            }
+            nlfev += evaluations.get() - before;
+            let local = match local {
+                Ok(local) => local,
+                Err(error) => {
+                    let status = match error {
+                        OptError::NonFiniteInput { .. } => ConvergenceStatus::NanEncountered,
+                        OptError::EvaluationBudgetExceeded { .. } => {
+                            ConvergenceStatus::MaxEvaluations
+                        }
+                        OptError::NotConverged { .. } | OptError::NoConvergence { .. } => {
+                            ConvergenceStatus::PrecisionLoss
+                        }
+                        _ => return Err(error),
+                    };
+                    failed_local_minimizations += 1;
+                    local_failure_status.get_or_insert(if local_limit.get() {
+                        ConvergenceStatus::MaxEvaluations
+                    } else {
+                        status
+                    });
+                    if evaluation_limit.get() {
+                        stop = Some((
+                            ConvergenceStatus::MaxEvaluations,
+                            "shgo: objective evaluation limit reached during local optimization"
+                                .into(),
+                        ));
+                        break 'rounds;
+                    }
+                    continue;
+                }
+            };
+            nljev += local.njev;
+            nlhev += local.nhev;
+            let finite_point = local.x.len() == ndim
+                && local
+                    .x
+                    .iter()
+                    .zip(bounds)
+                    .all(|(&x, &(lo, hi))| x.is_finite() && x >= lo && x <= hi);
+            let feasible = finite_point
+                && shgo_constraint_state(&local.x, options.constraints, &mut constraint_sizes)?.1
+                    <= options.constraint_tolerance;
+            let converged = local.success
+                && feasible
+                && local.fun.is_some_and(f64::is_finite)
+                && !local_limit.get()
+                && !evaluation_limit.get();
+            if !converged {
+                failed_local_minimizations += 1;
+                local_failure_status.get_or_insert(if local_limit.get() {
+                    ConvergenceStatus::MaxEvaluations
+                } else if !local.success {
+                    local.status
+                } else {
+                    ConvergenceStatus::Infeasible
+                });
+            }
+            if feasible && let Some(value) = local.fun.filter(|value| value.is_finite()) {
+                if best.as_ref().is_none_or(|(_, current)| value <= *current) {
+                    best = Some((local.x.clone(), value));
+                }
+                if converged {
+                    let duplicate = minima.iter().position(|(point, _)| {
+                        point.iter().zip(&local.x).zip(bounds).all(
+                            |((&left, &right), &(lo, hi))| {
+                                (shgo_unit_coordinate(left, lo, hi)
+                                    - shgo_unit_coordinate(right, lo, hi))
+                                .abs()
+                                    <= options.minimizer_tolerance
+                            },
+                        )
+                    });
+                    if let Some(index) = duplicate {
+                        if value < minima[index].1 {
+                            minima[index] = (local.x, value);
+                        }
+                    } else {
+                        minima.push((local.x, value));
+                    }
+                }
+            }
+            if evaluation_limit.get() {
+                stop = Some((
+                    ConvergenceStatus::MaxEvaluations,
+                    "shgo: objective evaluation limit reached during local optimization".into(),
+                ));
+                break 'rounds;
+            }
+        }
+        completed += 1;
+        if iteration + 1 < options.iterations {
+            let Some(refined) = subdivisions.checked_mul(2) else {
+                stop = Some((
+                    ConvergenceStatus::MaxEvaluations,
+                    "shgo: refinement would overflow the sampling grid".into(),
+                ));
+                break;
+            };
+            subdivisions = refined;
         }
     }
 
-    Ok(OptimizeResult {
-        x: best_x,
-        fun: Some(best_fun),
-        // status: SciPy parity -- shgo fails only with no feasible sample; that case errs above
-        success: true,
-        status: ConvergenceStatus::Success,
-        message: "shgo completed".to_string(),
-        nfev,
-        njev: 0,
-        nhev: 0,
-        nit: total_nit.max(1),
-        jac: None,
-        hess_inv: None,
-        maxcv: None,
+    let success = stop.is_none()
+        && completed == options.iterations
+        && !minima.is_empty()
+        && failed_local_minimizations == 0;
+    let (status, message) = if success {
+        (
+            ConvergenceStatus::Success,
+            "shgo: simplicial sampling and local minimizations completed successfully".into(),
+        )
+    } else if let Some(stop) = stop {
+        stop
+    } else if failed_local_minimizations > 0 {
+        (
+            local_failure_status.unwrap_or(ConvergenceStatus::PrecisionLoss),
+            format!(
+                "shgo: {failed_local_minimizations} local minimization(s) failed to converge to a finite feasible point"
+            ),
+        )
+    } else {
+        (
+            if options.constraints.is_empty() {
+                ConvergenceStatus::NanEncountered
+            } else {
+                ConvergenceStatus::Infeasible
+            },
+            "shgo: sampling did not find a converged finite feasible minimizer".into(),
+        )
+    };
+    minima.sort_by(|left, right| left.1.total_cmp(&right.1));
+    if success {
+        // An exactly represented sampled optimum can have a slightly lower
+        // value than a converged point a few ULP away. Return the point whose
+        // convergence was actually established, not a falsely failed sample.
+        best = minima.first().cloned();
+    }
+    let (xl, funl) = minima.into_iter().unzip();
+    let (x, fun) = best.map_or_else(|| (Vec::new(), None), |(x, value)| (x, Some(value)));
+    let maxcv = if options.constraints.is_empty() || x.is_empty() {
+        None
+    } else {
+        Some(shgo_constraint_state(&x, options.constraints, &mut constraint_sizes)?.1)
+    };
+    Ok(ShgoResult {
+        optimum: OptimizeResult {
+            x,
+            fun,
+            success,
+            status,
+            message,
+            nfev: evaluations.get(),
+            njev: nljev,
+            nhev: nlhev,
+            nit: completed,
+            jac: None,
+            hess_inv: None,
+            maxcv,
+        },
+        xl,
+        funl,
+        sampling_nfev,
+        nlfev,
+        nljev,
+        nlhev,
+        samples: vertices.len(),
+        local_minimizations,
+        failed_local_minimizations,
     })
 }
 
-fn build_shgo_lattice(
-    bounds: &[(f64, f64)],
-    axis_levels: usize,
-    dim: usize,
-    current: &mut Vec<f64>,
-    lattice: &mut Vec<Vec<f64>>,
-) {
-    if dim == bounds.len() {
-        lattice.push(current.clone());
-        return;
+fn shgo_complex_size(
+    dimension: usize,
+    subdivisions: usize,
+    options: ShgoOptions<'_>,
+) -> Result<usize, OptError> {
+    let invalid = || {
+        OptError::InvalidArgument {
+        detail: "shgo: simplicial complex exceeds its sample/edge budget; reduce dimension or subdivisions, or increase the explicit limits".into(),
     }
+    };
+    let levels = subdivisions.checked_add(1).ok_or_else(invalid)?;
+    let edge_base = subdivisions
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(invalid)?;
+    let mut points = 1usize;
+    let mut edges_with_self = 1usize;
+    for _ in 0..dimension {
+        points = points.checked_mul(levels).ok_or_else(invalid)?;
+        if points > options.max_samples {
+            return Err(invalid());
+        }
+        // Sum over all coordinatewise comparable neighboring vertex pairs:
+        // (2*levels-1)^dimension, including the points themselves.
+        edges_with_self = edges_with_self.checked_mul(edge_base).ok_or_else(invalid)?;
+        if edges_with_self - points > options.max_complex_edges {
+            return Err(invalid());
+        }
+    }
+    Ok(points)
+}
 
-    let (lo, hi) = bounds[dim];
-    for step in 0..axis_levels {
-        let fraction = if axis_levels == 1 {
-            0.0
-        } else {
-            step as f64 / (axis_levels - 1) as f64
-        };
-        current[dim] = lo + fraction * (hi - lo);
-        build_shgo_lattice(bounds, axis_levels, dim + 1, current, lattice);
+fn shgo_grid_coordinate(lo: f64, hi: f64, index: usize, subdivisions: usize) -> f64 {
+    if index == 0 {
+        lo
+    } else if index == subdivisions {
+        hi
+    } else {
+        let fraction = index as f64 / subdivisions as f64;
+        // A finite interval may have an overflowing width. Convex interpolation
+        // keeps every node finite without first forming hi-lo.
+        ((1.0 - fraction) * lo + fraction * hi).clamp(lo, hi)
     }
 }
 
-fn select_shgo_starts(
-    ranked: &[(f64, Vec<f64>)],
-    bounds: &[(f64, f64)],
-    max_starts: usize,
-) -> Vec<Vec<f64>> {
-    let mut starts = Vec::new();
-    let distance_scale = bounds.iter().map(|(lo, hi)| hi - lo).sum::<f64>().max(1.0);
-    let min_distance = 0.1 * distance_scale / bounds.len() as f64;
+fn shgo_unit_coordinate(value: f64, lo: f64, hi: f64) -> f64 {
+    let width = hi - lo;
+    if width.is_finite() {
+        (value - lo) / width
+    } else {
+        (0.5 * value - 0.5 * lo) / (0.5 * hi - 0.5 * lo)
+    }
+}
 
-    for (_, point) in ranked {
-        let distinct = starts.iter().all(|existing: &Vec<f64>| {
-            existing
-                .iter()
-                .zip(point.iter())
-                .map(|(lhs, rhs)| {
-                    let delta = lhs - rhs;
-                    delta * delta
-                })
-                .sum::<f64>()
-                .sqrt()
-                >= min_distance
-        });
-        if distinct {
-            starts.push(point.clone());
-            if starts.len() >= max_starts {
-                break;
+fn shgo_constraint_state(
+    point: &[f64],
+    constraints: &[Constraint<'_>],
+    sizes: &mut [Option<usize>],
+) -> Result<(f64, f64), OptError> {
+    let mut inequality_violation = 0.0_f64;
+    let mut violation = 0.0_f64;
+    for (index, constraint) in constraints.iter().enumerate() {
+        let values = (constraint.fun)(point);
+        if let Some(expected) = sizes[index] {
+            if values.len() != expected {
+                return Err(OptError::InvalidArgument {
+                    detail: format!("shgo: constraint {index} changed its output length"),
+                });
+            }
+        } else {
+            sizes[index] = Some(values.len());
+        }
+        for value in values {
+            if !value.is_finite() {
+                return Err(OptError::NonFiniteInput {
+                    detail: format!("shgo: constraint {index} returned a nonfinite value"),
+                });
+            }
+            match constraint.kind {
+                ConstraintType::Eq => violation = violation.max(value.abs()),
+                ConstraintType::Ineq => {
+                    inequality_violation = inequality_violation.max(-value);
+                    violation = violation.max(-value);
+                }
             }
         }
     }
+    Ok((inequality_violation, violation))
+}
 
-    if starts.is_empty() {
-        starts.push(ranked[0].1.clone());
+/// One representative per minimal connected plateau in the simplicial graph.
+/// Each edge is visited once, without storing an exponential adjacency list.
+fn shgo_minimizer_pool(values: &[f64], levels: usize, strides: &[usize]) -> Vec<(usize, bool)> {
+    fn representative(parent: &mut [usize], mut index: usize) -> usize {
+        while parent[index] != index {
+            parent[index] = parent[parent[index]];
+            index = parent[index];
+        }
+        index
     }
-    starts
+    let mut parent: Vec<usize> = (0..values.len()).collect();
+    let mut has_lower = vec![false; values.len()];
+    let mut plateau_size = vec![1usize; values.len()];
+    let mut offsets = Vec::new();
+    for (index, &value) in values.iter().enumerate() {
+        if !value.is_finite() {
+            continue;
+        }
+        offsets.clear();
+        offsets.push(0usize);
+        for &stride in strides {
+            if (index / stride) % levels + 1 < levels {
+                let count = offsets.len();
+                for offset_index in 0..count {
+                    offsets.push(offsets[offset_index] + stride);
+                }
+            }
+        }
+        for &offset in &offsets[1..] {
+            let neighbor = index + offset;
+            if !values[neighbor].is_finite() {
+                continue;
+            }
+            let left = representative(&mut parent, index);
+            let right = representative(&mut parent, neighbor);
+            if value < values[neighbor] {
+                has_lower[right] = true;
+            } else if value > values[neighbor] {
+                has_lower[left] = true;
+            } else if left != right {
+                let (root, child) = if left < right {
+                    (left, right)
+                } else {
+                    (right, left)
+                };
+                parent[child] = root;
+                has_lower[root] |= has_lower[child];
+                plateau_size[root] += plateau_size[child];
+            }
+        }
+    }
+    let mut pool: Vec<(usize, bool)> = (0..values.len())
+        .filter(|&index| parent[index] == index && values[index].is_finite() && !has_lower[index])
+        .map(|index| (index, plateau_size[index] > 1))
+        .collect();
+    pool.sort_by(|&(left, _), &(right, _)| {
+        values[left]
+            .total_cmp(&values[right])
+            .then(left.cmp(&right))
+    });
+    pool
 }
 
 /// Simple deterministic pseudo-random number generator (xorshift64).

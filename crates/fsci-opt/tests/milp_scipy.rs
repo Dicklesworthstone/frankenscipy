@@ -111,6 +111,11 @@ def add(name, c, integrality, bounds, a_ub=(), b_ub=(), a_eq=(), b_eq=()):
         constraints.append(LinearConstraint(a_eq, b_eq, b_eq))
     result = milp(c, integrality=integrality, bounds=Bounds(lower, upper),
                   constraints=constraints, options={'mip_rel_gap': 0.0})
+    if result.status == 4:
+        # Retry ambiguous presolve outcomes so HiGHS distinguishes feasible
+        # unbounded models from infeasible ones; keep exact status assertions.
+        result = milp(c, integrality=integrality, bounds=Bounds(lower, upper),
+                      constraints=constraints, options={'mip_rel_gap': 0.0, 'presolve': False})
     cases.append(dict(name=name, c=c, integrality=list(map(int,integrality)),
                       a_ub=a_ub, b_ub=b_ub, a_eq=a_eq, b_eq=b_eq,
                       bounds=bounds, status=int(result.status),

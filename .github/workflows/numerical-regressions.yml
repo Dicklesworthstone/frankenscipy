@@ -42,7 +42,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [least-squares, sparse-lsmr, distribution-fit, resampling, fft-capture, casp, quadrature, interpolation, signal-state]
+        lane: [least-squares, global-optimization, sparse-lsmr, distribution-fit, resampling, fft-capture, casp, quadrature, interpolation, signal-state]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -74,6 +74,12 @@ jobs:
               cargo test --locked -p fsci-opt --lib trf_lsmr::tests -- --nocapture
               cargo test --locked -p fsci-opt --test least_squares_lsmr_scipy -- --nocapture
               cargo test --locked -p fsci-opt --test linear_least_squares_scipy -- --nocapture
+              ;;
+            global-optimization)
+              cargo test --locked -p fsci-opt --lib milp -- --nocapture
+              cargo test --locked -p fsci-opt --lib shgo -- --nocapture
+              cargo test --locked -p fsci-opt --test milp_scipy -- --nocapture
+              cargo test --locked -p fsci-opt --test shgo_scipy -- --nocapture
               ;;
             sparse-lsmr)
               cargo test --locked -p fsci-sparse --no-default-features --lib cg_ -- --nocapture
