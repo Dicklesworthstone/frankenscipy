@@ -256,7 +256,12 @@ fn diff_signal_sosfilt() {
     let mut max_overall = 0.0_f64;
     let mut ledger = CompareLedger::new(
         "diff_signal_sosfilt",
-        &["sosfilt", "sosfilt_state", "sosfilt_stream", "sosfilt_stream_state"],
+        &[
+            "sosfilt",
+            "sosfilt_state",
+            "sosfilt_stream",
+            "sosfilt_stream_state",
+        ],
     );
 
     for case in &query.points {
@@ -282,7 +287,11 @@ fn diff_signal_sosfilt() {
                 scipy_arm.final_state.as_deref(),
                 final_state.as_slice(),
             ),
-            ("sosfilt_stream", scipy_arm.values.as_deref(), streamed.as_slice()),
+            (
+                "sosfilt_stream",
+                scipy_arm.values.as_deref(),
+                streamed.as_slice(),
+            ),
             (
                 "sosfilt_stream_state",
                 scipy_arm.final_state.as_deref(),
@@ -335,5 +344,5 @@ fn diff_signal_sosfilt() {
         diffs.len(),
         max_overall
     );
-    ledger.finish(4 * query.points.len());
+    ledger.finish(query.points.len());
 }

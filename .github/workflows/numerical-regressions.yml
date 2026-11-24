@@ -74,6 +74,8 @@ jobs:
               cargo test --locked -p fsci-opt --test linear_least_squares_scipy -- --nocapture
               ;;
             sparse-lsmr)
+              cargo test --locked -p fsci-sparse --no-default-features --lib cg_ -- --nocapture
+              cargo test --locked -p fsci-sparse --no-default-features --test cg_preconditioned_scipy -- --nocapture
               cargo test --locked -p fsci-sparse --no-default-features --lib lsmr -- --nocapture
               cargo test --locked -p fsci-sparse --no-default-features --lib lsqr -- --nocapture
               cargo test --locked -p fsci-sparse --no-default-features --test lsmr_options_scipy -- --nocapture

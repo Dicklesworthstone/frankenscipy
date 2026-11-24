@@ -10168,7 +10168,11 @@ impl SosFilter {
             .iter()
             .map(normalize_sos_section)
             .collect::<Result<_, _>>()?;
-        if coefficients.iter().flatten().any(|value| !value.is_finite()) {
+        if coefficients
+            .iter()
+            .flatten()
+            .any(|value| !value.is_finite())
+        {
             return Err(SignalError::NonFiniteInput {
                 detail: "normalized SOS coefficients must be finite".to_string(),
             });

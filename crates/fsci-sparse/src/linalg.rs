@@ -8646,68 +8646,235 @@ fn cg_curvature_floor(p_sq: f64, ap_sq: f64) -> f64 {
 }
 
 /// Conjugate Gradient for a symmetric positive-definite operator `A`, matrix or matrix-free:
-/// `scipy.sparse.linalg.cg(A, b, x0, rtol=tol, atol=0, maxiter)`. Any [`LinearOperator`] is
-/// accepted (a `&CsrMatrix` coerces); a concrete CSR matrix keeps the persistent-worker kernel.
+/// `scipy.sparse.linalg.cg(A, b, x0, rtol=tol, atol=0, maxiter)`.
+///
+/// A concrete CSR matrix retains the persistent-worker kernel when its initial
+/// squared norms are in the normal range. All returned solutions are checked
+/// against the actual residual. Use [`cg_preconditioned`] for a caller-supplied
+/// inverse preconditioner; [`pcg`] applies an existing ILU factorization.
+///
+/// # Errors
+/// Invalid dimensions, non-finite inputs or operator products, incomplete
+/// products, and errors returned by the operator are propagated.
 pub fn cg(
     a: &dyn LinearOperator,
     b: &[f64],
     x0: Option<&[f64]>,
     options: IterativeSolveOptions,
 ) -> SparseResult<IterativeSolveResult> {
-    let shape = a.shape();
-    if !shape.is_square() {
-        return Err(SparseError::InvalidShape {
-            message: "CG requires a square matrix".to_string(),
-        });
+    cg_solve(a, b, None, x0, options)
+}
+
+/// Preconditioned CG with an arbitrary inverse preconditioner, matching
+/// `scipy.sparse.linalg.cg(A, b, M=M, x0=x0, rtol=tol, atol=0)`.
+///
+/// `preconditioner(r)` computes `M r`, where `M` approximates `A⁻¹`.
+/// Both operators should be symmetric positive definite. The closure can apply
+/// a Jacobi, block, multigrid, or factorized solve without materializing it:
+/// `|r| inverse_operator.matvec(r)`. An ILU factorization can be used as
+/// `|r| ilu.solve(r)`, or through [`pcg`].
+///
+/// The preconditioner is called only when another search direction is needed.
+/// It is never replaced by the identity when it fails. Convergence is measured
+/// using the unpreconditioned residual `b - A x`.
+///
+/// # Errors
+/// Shape mismatches, non-finite or incomplete operator products, non-finite
+/// preconditioner outputs, and errors from either operator are returned.
+pub fn cg_preconditioned<M>(
+    a: &dyn LinearOperator,
+    b: &[f64],
+    preconditioner: M,
+    x0: Option<&[f64]>,
+    options: IterativeSolveOptions,
+) -> SparseResult<IterativeSolveResult>
+where
+    M: Fn(&[f64]) -> SparseResult<Vec<f64>>,
+{
+    cg_solve(a, b, Some(&preconditioner), x0, options)
+}
+
+type CgPreconditioner<'a> = dyn Fn(&[f64]) -> SparseResult<Vec<f64>> + 'a;
+
+/// Preserve the usual ordered dot product. An underflowed product or an
+/// overflowing subtotal instead uses the exponent representation already
+/// shared by LSMR and expm_multiply. A zero scalar then means cancellation,
+/// not that every nonzero product rounded to zero.
+fn cg_dot(left: &[f64], right: &[f64]) -> ScaledValue {
+    let mut sum = 0.0;
+    let mut ordinary = true;
+    for (&x, &y) in left.iter().zip(right) {
+        let product = x * y;
+        ordinary &= product.is_normal() || x == 0.0 || y == 0.0;
+        sum += product;
+        ordinary &= sum.is_finite();
     }
-    let n = shape.rows;
-    if b.len() != n {
+    if ordinary {
+        ScaledValue::from_f64(sum)
+    } else {
+        left.iter()
+            .zip(right)
+            .fold(ScaledValue::default(), |sum, (&x, &y)| {
+                sum.add(ScaledValue::from_f64(x).mul(ScaledValue::from_f64(y)))
+            })
+    }
+}
+
+fn cg_relative_norm(norm: ScaledValue, rhs_norm: ScaledValue) -> f64 {
+    norm.div(rhs_norm).to_f64().unwrap_or(f64::INFINITY)
+}
+
+fn cg_within_tolerance(norm: ScaledValue, rhs_norm: ScaledValue, tolerance: f64) -> bool {
+    // Exact residual zero is valid even when the user requests zero tolerance.
+    norm.mantissa == 0.0 || !rhs_norm.mul(ScaledValue::from_f64(tolerance)).abs_le(norm)
+}
+
+/// Do not let a partial user product inherit a previous iteration's entries.
+fn cg_matvec(a: &dyn LinearOperator, x: &[f64], out: &mut [f64]) -> SparseResult<()> {
+    let expected = Shape2D::new(out.len(), x.len());
+    if a.shape() != expected {
         return Err(SparseError::IncompatibleShape {
-            message: "rhs length must match matrix rows".to_string(),
+            message: "CG operator changed shape during the solve".to_string(),
         });
     }
-    validate_iterative_finite_inputs(a, b, x0, options)?;
+    if x.iter().any(|value| !value.is_finite()) {
+        return Err(SparseError::NonFiniteInput {
+            message: "CG iterate or search direction is not finite".to_string(),
+        });
+    }
+    if a.as_csr().is_none() {
+        out.fill(f64::NAN);
+    }
+    a.matvec_into(x, out)?;
+    if a.shape() != expected {
+        return Err(SparseError::IncompatibleShape {
+            message: "CG operator changed shape while applying a product".to_string(),
+        });
+    }
+    if out.iter().any(|value| !value.is_finite()) {
+        return Err(SparseError::NonFiniteInput {
+            message: "CG operator returned a non-finite or incomplete product".to_string(),
+        });
+    }
+    Ok(())
+}
 
-    let max_iter = options.max_iter.unwrap_or(n * 10);
+fn cg_residual(a: &dyn LinearOperator, b: &[f64], x: &[f64]) -> SparseResult<Vec<f64>> {
+    let mut residual = vec![0.0; b.len()];
+    cg_matvec(a, x, &mut residual)?;
+    for (value, &rhs) in residual.iter_mut().zip(b) {
+        *value = rhs - *value;
+    }
+    if residual.iter().any(|value| !value.is_finite()) {
+        return Err(SparseError::NonFiniteInput {
+            message: "CG residual is outside the finite floating-point range".to_string(),
+        });
+    }
+    Ok(residual)
+}
 
-    // Initialize x
-    let mut x: Vec<f64> = match x0 {
-        Some(initial) => {
-            if initial.len() != n {
-                return Err(SparseError::IncompatibleShape {
-                    message: "initial guess length must match matrix rows".to_string(),
-                });
-            }
-            initial.to_vec()
-        }
-        None => vec![0.0; n],
+fn cg_precondition<'a>(
+    preconditioner: Option<&CgPreconditioner<'_>>,
+    residual: &'a [f64],
+) -> SparseResult<std::borrow::Cow<'a, [f64]>> {
+    let output = match preconditioner {
+        Some(apply) => std::borrow::Cow::Owned(apply_preconditioner(&apply, residual)?),
+        None => std::borrow::Cow::Borrowed(residual),
     };
+    if output.iter().any(|value| !value.is_finite()) {
+        return Err(SparseError::NonFiniteInput {
+            message: "CG preconditioner returned NaN or Inf".to_string(),
+        });
+    }
+    Ok(output)
+}
 
-    // Compute b_norm for relative tolerance
-    let b_norm: f64 = b.iter().map(|v| v * v).sum::<f64>().sqrt();
-    if rhs_is_zero(b_norm) {
-        // b is zero, solution is zero
+/// Keep a coefficient's exponent until after multiplication by the vector
+/// component. In particular, a huge alpha times a tiny p can be a finite step.
+fn cg_add_scaled(base: f64, coefficient: ScaledValue, value: f64) -> SparseResult<f64> {
+    if let Some(factor) = coefficient.to_f64() {
+        let product = factor * value;
+        let sum = base + product;
+        if sum.is_finite() && (product.is_normal() || coefficient.mantissa == 0.0 || value == 0.0) {
+            return Ok(sum);
+        }
+    }
+    ScaledValue::from_f64(base)
+        .add(coefficient.mul(ScaledValue::from_f64(value)))
+        .to_f64()
+        .ok_or_else(|| SparseError::NonFiniteInput {
+            message: "CG recurrence is outside the finite floating-point range".to_string(),
+        })
+}
+
+/// Normalize unusually scaled search directions before the operator product.
+/// Retain every nonzero component: when the vector's exponent span prevents
+/// this, keep the original direction instead. The step coefficient carries the
+/// removed scale, so a tiny A times a tiny p need not underflow to a zero product.
+fn cg_direction_scale(direction: &[f64], normalized: &mut [f64]) -> f64 {
+    let maximum = direction
+        .iter()
+        .map(|value| value.abs())
+        .fold(0.0, f64::max);
+    if maximum == 0.0 {
+        return 1.0;
+    }
+    let exponent = ScaledValue::from_f64(maximum).exponent;
+    if (-256..=256).contains(&exponent) {
+        return 1.0;
+    }
+    let scale = maximum;
+    for (&value, slot) in direction.iter().zip(normalized) {
+        *slot = value / scale;
+        if value != 0.0 && *slot == 0.0 {
+            return 1.0;
+        }
+    }
+    scale
+}
+
+fn cg_solve(
+    a: &dyn LinearOperator,
+    b: &[f64],
+    preconditioner: Option<&CgPreconditioner<'_>>,
+    x0: Option<&[f64]>,
+    options: IterativeSolveOptions,
+) -> SparseResult<IterativeSolveResult> {
+    let mut x = preconditioned_krylov_start("CG", a, b, x0, options)?;
+    if b.iter().chain(&x).any(|value| !value.is_finite()) {
+        return Err(SparseError::NonFiniteInput {
+            message: "CG rhs and initial guess must be finite".to_string(),
+        });
+    }
+    let rhs_norm = cg_dot(b, b).sqrt();
+    if rhs_norm.mantissa == 0.0 {
         return Ok(IterativeSolveResult {
-            solution: vec![0.0; n],
-            // status: ‖b‖ = 0 (rhs_is_zero), so x = 0 solves exactly
+            solution: vec![0.0; b.len()],
+            // status: the scaled squared norm is exactly zero, so every rhs entry is zero
             converged: true,
             iterations: 0,
             residual_norm: 0.0,
         });
     }
 
-    // r = b - A*x
-    let ax = a.matvec(&x)?;
-    let mut r: Vec<f64> = b.iter().zip(ax.iter()).map(|(bi, axi)| bi - axi).collect();
-
-    // Large systems run a persistent worker team instead of respawning a
-    // `thread::scope` per iteration: thread creation drops from
-    // O(iterations * workers) to O(workers). The team reads CSR storage directly, so it is
-    // only for a concrete matrix; any other operator takes the serial loop below.
+    let mut residual = cg_residual(a, b, &x)?;
+    let max_iter = options
+        .max_iter
+        .unwrap_or_else(|| b.len().saturating_mul(10));
+    let mut completed = 0;
+    let raw_rhs_squared = b.iter().map(|value| value * value).sum::<f64>();
+    let raw_residual_squared = residual.iter().map(|value| value * value).sum::<f64>();
     let persistent = a.as_csr().and_then(|matrix| {
-        let workers = if CG_FORCE_ITERATION_SCOPES.load(std::sync::atomic::Ordering::Relaxed)
+        let workers = if preconditioner.is_some()
+            || !raw_rhs_squared.is_normal()
+            || !raw_residual_squared.is_normal()
+            || CG_FORCE_ITERATION_SCOPES.load(std::sync::atomic::Ordering::Relaxed)
             || matrix.nnz() < 1 << 18
-            || n < 256
+            || b.len() < 256
+            || matrix
+                .data()
+                .iter()
+                .any(|&value| value != 0.0 && !(value * value).is_normal())
         {
             1
         } else {
@@ -8718,89 +8885,438 @@ pub fn cg(
                 .map(std::num::NonZero::get)
                 .unwrap_or(1)
                 .min(matrix.nnz() >> shift)
-                .min(n)
+                .min(b.len())
                 .max(1)
         };
         (workers > 1).then_some((matrix, workers))
     });
-    if let Some((matrix, persistent_workers)) = persistent {
-        return Ok(cg_persistent_workers(
+    if let Some((matrix, workers)) = persistent {
+        let fast = cg_persistent_workers(
             matrix,
             x,
-            r,
-            b_norm,
+            residual,
+            raw_rhs_squared.sqrt(),
             max_iter,
             options.tol,
-            persistent_workers,
+            workers,
+        );
+        x = fast.solution;
+        completed = fast.iterations;
+        residual = cg_residual(a, b, &x)?;
+        let norm = cg_dot(&residual, &residual).sqrt();
+        if cg_within_tolerance(norm, rhs_norm, options.tol) || completed >= max_iter {
+            return Ok(IterativeSolveResult {
+                solution: x,
+                converged: fast.converged && cg_within_tolerance(norm, rhs_norm, options.tol),
+                iterations: completed,
+                residual_norm: cg_relative_norm(norm, rhs_norm),
+            });
+        }
+        // A finite early breakdown or optimistic recursive residual can resume
+        // from the actual residual, within the original iteration budget.
+    }
+
+    let mut direction = vec![0.0; b.len()];
+    let mut normalized = vec![0.0; b.len()];
+    let mut image = vec![0.0; b.len()];
+    let mut previous_rho = ScaledValue::default();
+    let mut restart = true;
+
+    while completed < max_iter {
+        let norm = cg_dot(&residual, &residual).sqrt();
+        if cg_within_tolerance(norm, rhs_norm, options.tol) {
+            residual = cg_residual(a, b, &x)?;
+            let actual_norm = cg_dot(&residual, &residual).sqrt();
+            if cg_within_tolerance(actual_norm, rhs_norm, options.tol) {
+                return Ok(IterativeSolveResult {
+                    solution: x,
+                    // status: the actual scaled norm of b - A*x is zero or below tol*norm(b)
+                    converged: true,
+                    iterations: completed,
+                    residual_norm: cg_relative_norm(actual_norm, rhs_norm),
+                });
+            }
+            restart = true;
+        }
+        let z = cg_precondition(preconditioner, &residual)?;
+        let rho = cg_dot(&residual, &z);
+        if rho.mantissa == 0.0 {
+            break;
+        }
+        if restart {
+            direction.copy_from_slice(&z);
+            restart = false;
+        } else {
+            let beta = rho.div(previous_rho);
+            for (entry, &zi) in direction.iter_mut().zip(z.iter()) {
+                *entry = cg_add_scaled(zi, beta, *entry)?;
+            }
+        }
+        let scale = cg_direction_scale(&direction, &mut normalized);
+        let search = if scale == 1.0 {
+            &direction
+        } else {
+            &normalized
+        };
+        cg_matvec(a, search, &mut image)?;
+        let curvature = cg_dot(search, &image);
+        let floor = ScaledValue::from_f64(f64::EPSILON * 100.0)
+            .mul(cg_dot(search, search).sqrt())
+            .mul(cg_dot(&image, &image).sqrt());
+        if curvature.abs_le(floor) {
+            break;
+        }
+        let step = rho.div(ScaledValue::from_f64(scale)).div(curvature);
+        let negative_step = ScaledValue {
+            mantissa: -step.mantissa,
+            exponent: step.exponent,
+        };
+        let mut changed = false;
+        for index in 0..x.len() {
+            let next = cg_add_scaled(x[index], step, search[index])?;
+            changed |= next != x[index];
+            x[index] = next;
+            residual[index] = cg_add_scaled(residual[index], negative_step, image[index])?;
+        }
+        completed += 1;
+        previous_rho = rho;
+        if !changed {
+            // A rounded-away update cannot justify an apparent residual reduction.
+            break;
+        }
+    }
+
+    let residual = cg_residual(a, b, &x)?;
+    let norm = cg_dot(&residual, &residual).sqrt();
+    Ok(IterativeSolveResult {
+        solution: x,
+        // Keep the existing maxiter contract: exhausting the budget is a
+        // non-converged result, even if its last step happened to solve exactly.
+        converged: completed < max_iter && cg_within_tolerance(norm, rhs_norm, options.tol),
+        iterations: completed,
+        residual_norm: cg_relative_norm(norm, rhs_norm),
+    })
+}
+
+#[cfg(test)]
+mod cg_checked_tests {
+    use super::*;
+    use crate::{DenseLinearOperator, FunctionOperator};
+    use std::cell::Cell;
+
+    fn dense(rows: &[Vec<f64>]) -> DenseLinearOperator {
+        DenseLinearOperator::from_rows(rows).expect("finite square fixture")
+    }
+
+    fn options() -> IterativeSolveOptions {
+        IterativeSolveOptions {
+            tol: 1e-12,
+            max_iter: Some(100),
+            ..IterativeSolveOptions::default()
+        }
+    }
+
+    #[test]
+    fn cg_nonzero_rhs_survives_squared_norm_underflow_and_overflow() {
+        let a = dense(&[vec![1.0]]);
+        for scale in [
+            f64::from_bits(1),
+            1e-320,
+            1e-200,
+            1.0,
+            1e200,
+            1e308,
+            f64::MAX,
+        ] {
+            for preconditioned in [false, true] {
+                let result = if preconditioned {
+                    cg_preconditioned(&a, &[scale], |r| Ok(r.to_vec()), None, options())
+                } else {
+                    cg(&a, &[scale], None, options())
+                }
+                .expect("finite identity system");
+                assert!(result.converged, "scale={scale:e}: {result:?}");
+                assert_eq!(result.solution, vec![scale]);
+                assert_eq!(result.iterations, 1);
+                assert_eq!(result.residual_norm, 0.0);
+            }
+        }
+        // The Euclidean norm itself is outside f64, but every solution component fits.
+        let a = dense(&[vec![1.0, 0.0], vec![0.0, 1.0]]);
+        let b = [1.5e308, -1.5e308];
+        let result = cg(&a, &b, None, options()).expect("scaled norm");
+        assert!(result.converged);
+        assert_eq!(result.solution, b);
+    }
+
+    #[test]
+    fn cg_scales_search_products_and_preserves_finite_solution_steps() {
+        for scale in [1e-300, 1e-200, 1.0, 1e200, 1e300, f64::MAX] {
+            let a = dense(&[vec![scale]]);
+            let result = cg(&a, &[scale], None, options()).expect("scaled identity system");
+            assert!(result.converged, "scale={scale:e}: {result:?}");
+            assert_eq!(result.solution, vec![1.0]);
+        }
+        let base = [
+            vec![4.0, -1.0, 0.0],
+            vec![-1.0, 4.0, -1.0],
+            vec![0.0, -1.0, 3.0],
+        ];
+        for matrix_scale in [1e-200, 1.0, 1e200] {
+            let matrix: Vec<Vec<f64>> = base
+                .iter()
+                .map(|row| row.iter().map(|value| value * matrix_scale).collect())
+                .collect();
+            let a = dense(&matrix);
+            for rhs_scale in [1e-100, 1.0, 1e100] {
+                let b = [2.0 * rhs_scale, 4.0 * rhs_scale, 7.0 * rhs_scale];
+                let expected = [
+                    rhs_scale / matrix_scale,
+                    2.0 * rhs_scale / matrix_scale,
+                    3.0 * rhs_scale / matrix_scale,
+                ];
+                let initial: Vec<f64> = expected.iter().map(|value| value * 0.25).collect();
+                for start in [None, Some(initial.as_slice())] {
+                    for preconditioned in [false, true] {
+                        let result = if preconditioned {
+                            cg_preconditioned(
+                                &a,
+                                &b,
+                                |r| {
+                                    Ok(r.iter()
+                                        .enumerate()
+                                        .map(|(i, ri)| ri / matrix[i][i])
+                                        .collect())
+                                },
+                                start,
+                                options(),
+                            )
+                        } else {
+                            cg(&a, &b, start, options())
+                        }
+                        .expect("finite scaled SPD system");
+                        assert!(
+                            result.converged,
+                            "{matrix_scale:e}/{rhs_scale:e}: {result:?}"
+                        );
+                        for (&actual, &expected) in result.solution.iter().zip(&expected) {
+                            assert!((actual / expected - 1.0).abs() < 1e-11);
+                        }
+                        assert!(result.residual_norm < 1e-12);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cg_inverse_preconditioner_scale_cancels_without_losing_the_recurrence() {
+        let matrix = [
+            vec![4.0, -1.0, 0.0],
+            vec![-1.0, 4.0, -1.0],
+            vec![0.0, -1.0, 3.0],
+        ];
+        let a = dense(&matrix);
+        for scale in [1e-200, 1.0, 1e200] {
+            let result = cg_preconditioned(
+                &a,
+                &[2.0, 4.0, 7.0],
+                |r| {
+                    Ok(r.iter()
+                        .enumerate()
+                        .map(|(i, ri)| ri / matrix[i][i] * scale)
+                        .collect())
+                },
+                None,
+                options(),
+            )
+            .expect("scaled inverse preconditioner");
+            assert!(result.converged, "scale={scale:e}: {result:?}");
+            for (&actual, expected) in result.solution.iter().zip([1.0, 2.0, 3.0]) {
+                assert!((actual - expected).abs() < 1e-11);
+            }
+        }
+    }
+
+    #[test]
+    fn cg_general_preconditioner_solves_a_large_matrix_free_system_in_one_step() {
+        let n = 20_000;
+        let diagonal: Vec<f64> = (0..n).map(|i| 1.0 + i as f64).collect();
+        let products = Cell::new(0);
+        let applies = Cell::new(0);
+        let a = FunctionOperator::new(Shape2D::new(n, n), |x: &[f64]| {
+            products.set(products.get() + 1);
+            Ok(x.iter().zip(&diagonal).map(|(x, d)| x * d).collect())
+        });
+        let limited = IterativeSolveOptions {
+            max_iter: Some(2),
+            ..options()
+        };
+        assert!(!cg(&a, &diagonal, None, limited).unwrap().converged);
+        products.set(0);
+        let result = cg_preconditioned(
+            &a,
+            &diagonal,
+            |r| {
+                applies.set(applies.get() + 1);
+                Ok(r.iter().zip(&diagonal).map(|(r, d)| r / d).collect())
+            },
+            None,
+            limited,
+        )
+        .expect("Jacobi-preconditioned diagonal system");
+        assert!(result.converged);
+        assert_eq!(result.iterations, 1);
+        assert_eq!(applies.get(), 1);
+        assert!(
+            products.get() <= 4,
+            "the operator must not be materialized or probed column by column"
+        );
+        assert!(result.solution.iter().all(|x| (x - 1.0).abs() < 1e-12));
+    }
+
+    #[test]
+    fn cg_preconditioner_errors_and_invalid_products_are_never_ignored() {
+        let a = dense(&[vec![2.0, -1.0], vec![-1.0, 2.0]]);
+        let b = [1.0, 0.0];
+        for fail_at in [1, 2] {
+            let calls = Cell::new(0);
+            let error = cg_preconditioned(
+                &a,
+                &b,
+                |r| {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == fail_at {
+                        Err(SparseError::SingularMatrix {
+                            message: "preconditioner failed".to_string(),
+                        })
+                    } else {
+                        Ok(r.to_vec())
+                    }
+                },
+                None,
+                options(),
+            )
+            .expect_err("propagate a preconditioner failure at any iteration");
+            assert!(matches!(error, SparseError::SingularMatrix { .. }));
+            assert_eq!(calls.get(), fail_at);
+        }
+        for length in [1, 3] {
+            assert!(matches!(
+                cg_preconditioned(&a, &b, |_| Ok(vec![1.0; length]), None, options()),
+                Err(SparseError::IncompatibleShape { .. })
+            ));
+        }
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(matches!(
+                cg_preconditioned(&a, &b, |_| Ok(vec![value; 2]), None, options()),
+                Err(SparseError::NonFiniteInput { .. })
+            ));
+        }
+        let result = cg_preconditioned(&a, &b, |_| Ok(vec![0.0; 2]), None, options())
+            .expect("zero preconditioner yields a breakdown");
+        assert!(!result.converged);
+        assert_eq!(result.iterations, 0);
+
+        let small = CooMatrix::from_triplets(Shape2D::new(1, 1), vec![1.0], vec![0], vec![0], true)
+            .unwrap()
+            .to_csc()
+            .unwrap();
+        let ilu = spilu(&small, IluOptions::default()).unwrap();
+        assert!(matches!(
+            pcg(&a, &b, &ilu, None, options()),
+            Err(SparseError::IncompatibleShape { .. })
+        ));
+        assert!(matches!(
+            pcg(&a, &[0.0, 0.0], &ilu, None, options()),
+            Err(SparseError::IncompatibleShape { .. })
         ));
     }
 
-    let mut p = r.clone();
-    let mut rs_old: f64 = r.iter().map(|v| v * v).sum();
-    // Reused A·p buffer: hoisted out of the loop so each CG iteration writes into
-    // it instead of allocating a fresh Vec. frankenscipy-... (byte-identical).
-    let mut ap = vec![0.0; r.len()];
-
-    for iteration in 0..max_iter {
-        let r_norm = rs_old.sqrt();
-        if r_norm / b_norm < options.tol {
-            return Ok(IterativeSolveResult {
-                solution: x,
-                // status: ‖r‖/‖b‖ < tol
-                converged: true,
-                iterations: iteration,
-                residual_norm: r_norm / b_norm,
-            });
+    #[test]
+    fn cg_checks_partial_products_including_the_final_residual() {
+        struct PartialOperator {
+            fail_at: usize,
+            calls: Cell<usize>,
         }
-
-        a.matvec_into(&p, &mut ap)?;
-        // The two operand norms that scale the breakdown test are fused into the
-        // pᵀAp pass: same memory traffic, and `p_ap` keeps its original
-        // single-accumulator order so the iterate stays bit-identical.
-        let mut p_ap = 0.0;
-        let mut p_sq = 0.0;
-        let mut ap_sq = 0.0;
-        for (pi, api) in p.iter().zip(ap.iter()) {
-            p_ap += pi * api;
-            p_sq += pi * pi;
-            ap_sq += api * api;
+        impl LinearOperator for PartialOperator {
+            fn shape(&self) -> Shape2D {
+                Shape2D::new(2, 2)
+            }
+            fn matvec_into(&self, x: &[f64], out: &mut [f64]) -> SparseResult<()> {
+                self.calls.set(self.calls.get() + 1);
+                out[0] = x[0];
+                if self.calls.get() != self.fail_at {
+                    out[1] = x[1];
+                }
+                Ok(())
+            }
         }
-
-        if p_ap.is_nan() || p_ap.abs() <= cg_curvature_floor(p_sq, ap_sq) {
-            // Curvature indistinguishable from zero (NaN included): the matrix
-            // is not SPD, or is too ill-conditioned for this direction.
-            return Ok(IterativeSolveResult {
-                solution: x,
-                converged: false,
-                iterations: iteration,
-                residual_norm: r_norm / b_norm,
-            });
+        for fail_at in [1, 2, 3] {
+            let a = PartialOperator {
+                fail_at,
+                calls: Cell::new(0),
+            };
+            assert!(matches!(
+                cg(&a, &[1.0, 2.0], None, options()),
+                Err(SparseError::NonFiniteInput { .. })
+            ));
         }
-
-        let alpha = rs_old / p_ap;
-
-        for i in 0..n {
-            x[i] += alpha * p[i];
-            r[i] -= alpha * ap[i];
-        }
-
-        let rs_new: f64 = r.iter().map(|v| v * v).sum();
-        let beta = rs_new / rs_old;
-
-        for i in 0..n {
-            p[i] = r[i] + beta * p[i];
-        }
-
-        rs_old = rs_new;
+        let a = PartialOperator {
+            fail_at: usize::MAX,
+            calls: Cell::new(0),
+        };
+        assert!(cg(&a, &[1.0, 2.0], None, options()).unwrap().converged);
     }
 
-    let final_norm = rs_old.sqrt() / b_norm;
-    Ok(IterativeSolveResult {
-        solution: x,
-        converged: false,
-        iterations: max_iter,
-        residual_norm: final_norm,
-    })
+    #[test]
+    fn cg_does_not_turn_an_unrepresentable_solution_into_false_convergence() {
+        let a = dense(&[vec![1e300]]);
+        let result = cg(&a, &[1e-300], None, options()).expect("finite operator products");
+        assert!(!result.converged);
+        assert_eq!(result.solution, vec![0.0]);
+        assert_eq!(result.residual_norm, 1.0);
+    }
+
+    #[test]
+    fn cg_exact_starts_and_zero_rhs_need_no_preconditioner() {
+        let a = dense(&[vec![1.0, 0.0], vec![0.0, 1.0]]);
+        let b = [1.0, 2.0];
+        let result = cg_preconditioned(
+            &a,
+            &b,
+            |_| panic!("an exact initial solution needs no preconditioner"),
+            Some(&b),
+            options(),
+        )
+        .unwrap();
+        assert!(result.converged);
+        assert_eq!(result.iterations, 0);
+        let result = cg_preconditioned(
+            &a,
+            &[0.0, 0.0],
+            |_| panic!("the zero rhs needs no preconditioner"),
+            Some(&b),
+            options(),
+        )
+        .unwrap();
+        assert!(result.converged);
+        assert_eq!(result.solution, vec![0.0, 0.0]);
+        for budget in [0, 1] {
+            let result = cg(
+                &a,
+                &b,
+                None,
+                IterativeSolveOptions {
+                    max_iter: Some(budget),
+                    ..options()
+                },
+            )
+            .unwrap();
+            assert!(!result.converged, "maxiter contract");
+            assert_eq!(result.iterations, budget);
+        }
+    }
 }
 
 /// Large-system CG kernel with one safe scoped worker team per solve.
@@ -9158,12 +9674,12 @@ fn csr_matvec_into_impl(
     });
 }
 
-/// Preconditioned Conjugate Gradient solver.
+/// Apply an ILU factorization as the inverse preconditioner for [`cg_preconditioned`].
 ///
-/// Solves Ax = b using CG with an incomplete-LU preconditioner M = L·U ≈ A from [`spilu`].
-/// The preconditioner solves M*z = r at each iteration instead of using r directly.
-/// Matches `scipy.sparse.linalg.cg(A, b, M=spilu(A).solve)`. `A` may be any
-/// [`LinearOperator`].
+/// Solves `A x = b` using `preconditioner.solve(r)`. Both the matrix and
+/// inverse preconditioner should be positive definite for CG. Factorization
+/// errors and shape mismatches propagate; an invalid factorization is never
+/// silently replaced by the identity.
 pub fn pcg(
     a: &dyn LinearOperator,
     b: &[f64],
@@ -9172,117 +9688,12 @@ pub fn pcg(
     options: IterativeSolveOptions,
 ) -> SparseResult<IterativeSolveResult> {
     let shape = a.shape();
-    if !shape.is_square() {
-        return Err(SparseError::InvalidShape {
-            message: "PCG requires a square matrix".to_string(),
-        });
-    }
-    let n = shape.rows;
-    if b.len() != n {
+    if preconditioner.shape != (shape.rows, shape.cols) {
         return Err(SparseError::IncompatibleShape {
-            message: "rhs length must match matrix rows".to_string(),
+            message: "PCG preconditioner shape must match the operator".to_string(),
         });
     }
-    validate_iterative_finite_inputs(a, b, x0, options)?;
-
-    let max_iter = options.max_iter.unwrap_or(n * 10);
-
-    let mut x: Vec<f64> = match x0 {
-        Some(initial) => {
-            if initial.len() != n {
-                return Err(SparseError::IncompatibleShape {
-                    message: "initial guess length must match matrix rows".to_string(),
-                });
-            }
-            initial.to_vec()
-        }
-        None => vec![0.0; n],
-    };
-
-    let b_norm: f64 = b.iter().map(|v| v * v).sum::<f64>().sqrt();
-    if rhs_is_zero(b_norm) {
-        return Ok(IterativeSolveResult {
-            solution: vec![0.0; n],
-            // status: ‖b‖ = 0 (rhs_is_zero), so x = 0 solves exactly
-            converged: true,
-            iterations: 0,
-            residual_norm: 0.0,
-        });
-    }
-
-    // r = b - A*x
-    let ax = a.matvec(&x)?;
-    let mut r: Vec<f64> = b.iter().zip(ax.iter()).map(|(bi, axi)| bi - axi).collect();
-
-    // z = M^{-1} * r (preconditioner application)
-    let mut z = preconditioner.solve(&r).unwrap_or_else(|_| r.clone());
-
-    let mut p = z.clone();
-    let mut rz: f64 = r.iter().zip(z.iter()).map(|(ri, zi)| ri * zi).sum();
-    // Reused A·p buffer hoisted out of the PCG loop (byte-identical). frankenscipy-2hclc.
-    let mut ap = vec![0.0; r.len()];
-
-    for iteration in 0..max_iter {
-        let r_norm: f64 = r.iter().map(|v| v * v).sum::<f64>().sqrt();
-        if r_norm / b_norm < options.tol {
-            return Ok(IterativeSolveResult {
-                solution: x,
-                // status: ‖r‖/‖b‖ < tol
-                converged: true,
-                iterations: iteration,
-                residual_norm: r_norm / b_norm,
-            });
-        }
-
-        a.matvec_into(&p, &mut ap)?;
-        // Same fused pass as `cg`: the two operand norms that scale the
-        // breakdown test ride along with pᵀAp, whose accumulation order is
-        // unchanged, so the iterate stays bit-identical (frankenscipy-bd2wq).
-        let mut p_ap = 0.0;
-        let mut p_sq = 0.0;
-        let mut ap_sq = 0.0;
-        for (pi, api) in p.iter().zip(ap.iter()) {
-            p_ap += pi * api;
-            p_sq += pi * pi;
-            ap_sq += api * api;
-        }
-
-        if p_ap.is_nan() || p_ap.abs() <= cg_curvature_floor(p_sq, ap_sq) {
-            return Ok(IterativeSolveResult {
-                solution: x,
-                converged: false,
-                iterations: iteration,
-                residual_norm: r_norm / b_norm,
-            });
-        }
-
-        let alpha = rz / p_ap;
-
-        for i in 0..n {
-            x[i] += alpha * p[i];
-            r[i] -= alpha * ap[i];
-        }
-
-        // z = M^{-1} * r
-        z = preconditioner.solve(&r).unwrap_or_else(|_| r.clone());
-
-        let rz_new: f64 = r.iter().zip(z.iter()).map(|(ri, zi)| ri * zi).sum();
-        let beta = rz_new / rz;
-
-        for i in 0..n {
-            p[i] = z[i] + beta * p[i];
-        }
-
-        rz = rz_new;
-    }
-
-    let final_norm: f64 = r.iter().map(|v| v * v).sum::<f64>().sqrt() / b_norm;
-    Ok(IterativeSolveResult {
-        solution: x,
-        converged: false,
-        iterations: max_iter,
-        residual_norm: final_norm,
-    })
+    cg_preconditioned(a, b, |r| preconditioner.solve(r), x0, options)
 }
 
 /// The Krylov dimension [`gmres`] restarts at, capped at `n`: SciPy's default `restart=20`
@@ -30871,6 +31282,16 @@ mod tests {
     }
 
     #[test]
+    fn cg_preserves_a_nonzero_rhs_when_its_squared_norm_underflows() {
+        let a = identity_csr(1);
+        let result = cg(&a, &[1e-200], None, IterativeSolveOptions::default())
+            .expect("a finite identity system is solvable");
+        assert!(result.converged);
+        assert_eq!(result.solution, vec![1e-200]);
+        assert_eq!(result.iterations, 1);
+    }
+
+    #[test]
     fn cg_with_initial_guess() {
         let a = spd_csr_3x3();
         let b = vec![5.0, 5.0, 3.0];
@@ -50982,8 +51403,10 @@ mod linear_operator_solver_tests {
         let poisoned =
             FunctionOperator::new(Shape2D::new(n, n), |x: &[f64]| Ok(vec![f64::NAN; x.len()]));
         let b = rhs(n);
-        let result = cg(&poisoned, &b, None, options()).expect("cg");
-        assert!(!result.converged);
+        assert!(matches!(
+            cg(&poisoned, &b, None, options()),
+            Err(SparseError::NonFiniteInput { .. })
+        ));
         let result = gmres(&poisoned, &b, None, options()).expect("gmres");
         assert!(!result.converged);
     }
