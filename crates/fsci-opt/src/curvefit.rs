@@ -474,7 +474,9 @@ pub struct LeastSquaresOptions {
     pub max_nfev: Option<usize>,
     /// Numerical Jacobian scheme, used when `jac` is absent. `ThreePoint` uses
     /// central differences away from bounds and second-order one-sided differences
-    /// near a bound. Applies to `Trf`, `Dogbox`, and `Lm`.
+    /// near a bound, using the actual representable node spacing. An interval
+    /// containing only two representable points uses their secant. Applies to
+    /// `Trf`, `Dogbox`, and `Lm`.
     pub diff_method: FiniteDiffMethod,
     /// Relative finite-difference step for all methods. `None` selects SciPy's
     /// `ε^(1/2)` (two-point) or `ε^(1/3)` (three-point), scaled by `max(1, |x|)`.
@@ -1240,59 +1242,152 @@ fn fd_step_scipy(value: f64, method: FiniteDiffMethod, rel_step: Option<f64>) ->
     }
 }
 
-/// Bound-aware points shared by dense and grouped numerical Jacobians. The
-/// boolean marks a one-sided stencil; the points are actual representable
-/// coordinates, so the denominator includes rounding of the perturbation.
+/// Bound-aware, representable points shared by dense and grouped Jacobians.
+/// A two-point stencil is also used when a bounded interval contains only two
+/// floating-point coordinates: a distinct third sample does not exist there.
+#[derive(Clone, Copy)]
+struct FiniteDifferenceStencil {
+    first: f64,
+    second: Option<f64>,
+}
+
 fn fd_points_scipy(
     x: &[f64],
     lb: &[f64],
     ub: &[f64],
     method: FiniteDiffMethod,
     rel_step: Option<f64>,
-) -> Vec<(f64, f64, bool)> {
-    let n = x.len();
-    let unbounded =
-        lb.iter().all(|v| *v == f64::NEG_INFINITY) && ub.iter().all(|v| *v == f64::INFINITY);
-    let mut points = Vec::with_capacity(n);
-    for i in 0..n {
+) -> Result<Vec<FiniteDifferenceStencil>, OptError> {
+    let mut points = Vec::with_capacity(x.len());
+    for i in 0..x.len() {
+        // Even an unbounded problem can only sample finite coordinates.
+        let lower_bound = lb[i].max(-f64::MAX);
+        let upper_bound = ub[i].min(f64::MAX);
         let mut h = fd_step_scipy(x[i], method, rel_step);
+        if !h.is_finite() {
+            h = fd_step_scipy(x[i], method, None);
+        }
         let mut one_sided = method == FiniteDiffMethod::TwoPoint;
         if method == FiniteDiffMethod::ThreePoint {
             h = h.abs();
         }
-        if !unbounded {
-            let lower = x[i] - lb[i];
-            let upper = ub[i] - x[i];
-            if method == FiniteDiffMethod::TwoPoint {
-                let trial = x[i] + h;
-                let violated = trial < lb[i] || trial > ub[i];
-                let fitting = h.abs() <= lower.max(upper);
-                if violated && fitting {
-                    h = -h;
-                } else if !fitting {
-                    h = if upper >= lower { upper } else { -lower };
-                }
-            } else if lower < h || upper < h {
-                // A three-point one-sided stencil needs two steps into the box.
-                // If shortening that step also permits a central stencil, use
-                // the latter: it avoids cancellation in -3*f0 + 4*f1 - f2.
-                h = if upper >= lower {
-                    h.min(0.5 * upper)
-                } else {
-                    -h.min(0.5 * lower)
-                };
-                one_sided = true;
-                if h.abs() <= lower.min(upper) {
-                    h = lower.min(upper);
-                    one_sided = false;
-                }
+        let lower = x[i] - lower_bound;
+        let upper = upper_bound - x[i];
+        if method == FiniteDiffMethod::TwoPoint {
+            let trial = x[i] + h;
+            let violated = trial < lower_bound || trial > upper_bound;
+            let fitting = h.abs() <= lower.max(upper);
+            if violated && fitting {
+                h = -h;
+            } else if !fitting {
+                h = if upper >= lower { upper } else { -lower };
+            }
+        } else if lower < h || upper < h {
+            // A three-point one-sided stencil needs two steps into the box.
+            // Prefer a central stencil when the shortened step permits it.
+            h = if upper >= lower {
+                h.min(0.5 * upper)
+            } else {
+                -h.min(0.5 * lower)
+            };
+            one_sided = true;
+            if h.abs() <= lower.min(upper) {
+                h = lower.min(upper);
+                one_sided = false;
             }
         }
-        let first = if one_sided { x[i] + h } else { x[i] - h };
-        let second = if one_sided { x[i] + 2.0 * h } else { x[i] + h };
-        points.push((first, second, one_sided));
+        let mut first = if one_sided { x[i] + h } else { x[i] - h };
+        let mut second = if one_sided { x[i] + 2.0 * h } else { x[i] + h };
+        if one_sided && !second.is_finite() {
+            // 2*h can overflow even when the final coordinate is finite.
+            second = (x[i] + h) + h;
+        }
+        first = first.clamp(lower_bound, upper_bound);
+        second = second.clamp(lower_bound, upper_bound);
+        let admissible = |point: f64| {
+            point.is_finite()
+                && point >= lower_bound
+                && point <= upper_bound
+                && point != x[i]
+        };
+        if !admissible(first) {
+            if method == FiniteDiffMethod::ThreePoint && admissible(second) {
+                first = second;
+            } else {
+                let candidates = if h >= 0.0 {
+                    [x[i].next_up(), x[i].next_down()]
+                } else {
+                    [x[i].next_down(), x[i].next_up()]
+                };
+                first = candidates.into_iter().find(|&point| admissible(point)).ok_or_else(|| {
+                    OptError::InvalidArgument {
+                        detail: String::from(
+                            "numerical differentiation requires a distinct finite point within bounds; supply an analytic Jacobian",
+                        ),
+                    }
+                })?;
+            }
+        }
+        let second = if method == FiniteDiffMethod::TwoPoint {
+            None
+        } else if admissible(second) && second != first {
+            Some(second)
+        } else {
+            // Rounding can collapse half-ULP or uneven one-sided steps.
+            // Use a third representable point if the interval contains one.
+            let candidates = if first > x[i] {
+                [first.next_up(), x[i].next_down()]
+            } else {
+                [first.next_down(), x[i].next_up()]
+            };
+            candidates
+                .into_iter()
+                .find(|&point| admissible(point) && point != first)
+        };
+        points.push(FiniteDifferenceStencil { first, second });
     }
-    points
+    Ok(points)
+}
+
+/// Preserve the ordinary difference quotient while avoiding overflow in a
+/// subtraction when the quotient itself is representable.
+fn fd_quotient(fa: f64, fb: f64, xa: f64, xb: f64) -> f64 {
+    let df = fa - fb;
+    let dx = xa - xb;
+    if df.is_finite() && dx.is_finite() {
+        df / dx
+    } else if dx.is_finite() {
+        fa / dx - fb / dx
+    } else {
+        (0.5 * fa - 0.5 * fb) / (0.5 * xa - 0.5 * xb)
+    }
+}
+
+/// Differentiate the quadratic through the actual floating-point nodes.
+/// Combining secant slopes removes a constant residual offset before the
+/// weighted sum, unlike the nominal -3*f0 + 4*f1 - f2 formula.
+fn fd_three_point(x: f64, first: f64, second: f64, f0: f64, f1: f64, f2: f64) -> f64 {
+    let d1 = first - x;
+    let d2 = second - x;
+    if d1 == -d2 {
+        return fd_quotient(f2, f1, second, first);
+    }
+    let span = second - first;
+    let weight = if d1.is_finite() && span.is_finite() {
+        d1 / span
+    } else {
+        (0.5 * first - 0.5 * x) / (0.5 * second - 0.5 * first)
+    };
+    let slope1 = fd_quotient(f1, f0, first, x);
+    let slope2 = fd_quotient(f2, f0, second, x);
+    let derivative = slope1 + weight * (slope1 - slope2);
+    if derivative.is_finite() || !slope1.is_finite() || !slope2.is_finite() {
+        return derivative;
+    }
+    // Opposite large slopes can overflow their difference even when the
+    // weighted derivative is finite.
+    let scale = slope1.abs().max(slope2.abs());
+    scale * (slope1 / scale + weight * (slope1 / scale - slope2 / scale))
 }
 
 /// SciPy's dense two-/three-point `approx_derivative`.
@@ -1308,36 +1403,27 @@ fn fd_jacobian_scipy<F>(
 where
     F: Fn(&[f64]) -> Vec<f64>,
 {
-    let points = fd_points_scipy(x, lb, ub, method, rel_step);
+    let points = fd_points_scipy(x, lb, ub, method, rel_step)?;
     let mut columns = Vec::with_capacity(x.len());
     let mut x1 = x.to_vec();
     let mut x2 = x.to_vec();
-    for (i, &(first, second, one_sided)) in points.iter().enumerate() {
+    for (i, &FiniteDifferenceStencil { first, second }) in points.iter().enumerate() {
         x1[i] = first;
         let f1 = residuals(&x1);
         check_jacobian_residual_shape(&f1, f0.len())?;
-        let column: Vec<f64> = if method == FiniteDiffMethod::TwoPoint {
-            let dx = x1[i] - x[i];
-            f1.iter().zip(f0).map(|(a, b)| (a - b) / dx).collect()
-        } else {
+        let column: Vec<f64> = if let Some(second) = second {
             x2[i] = second;
             let f2 = residuals(&x2);
             check_jacobian_residual_shape(&f2, f0.len())?;
-            let dx = if one_sided {
-                x2[i] - x[i]
-            } else {
-                x2[i] - x1[i]
-            };
             f0.iter()
                 .zip(&f1)
                 .zip(&f2)
-                .map(|((f0, f1), f2)| {
-                    if one_sided {
-                        (-3.0 * f0 + 4.0 * f1 - f2) / dx
-                    } else {
-                        (f2 - f1) / dx
-                    }
-                })
+                .map(|((&f0, &f1), &f2)| fd_three_point(x[i], first, second, f0, f1, f2))
+                .collect()
+        } else {
+            f1.iter()
+                .zip(f0)
+                .map(|(&a, &b)| fd_quotient(a, b, first, x[i]))
                 .collect()
         };
         x1[i] = x[i];
@@ -1365,41 +1451,38 @@ fn fd_jacobian_grouped<F>(
 where
     F: Fn(&[f64]) -> Vec<f64>,
 {
-    let points = fd_points_scipy(x, lb, ub, method, rel_step);
+    let points = fd_points_scipy(x, lb, ub, method, rel_step)?;
     let mut data = vec![0.0; sparsity.nnz()];
     let mut x1 = x.to_vec();
     let mut x2 = x.to_vec();
     for group in &sparsity.groups {
         for &c in group {
-            x1[c] = points[c].0;
-            x2[c] = points[c].1;
+            x1[c] = points[c].first;
+            x2[c] = points[c].second.unwrap_or(x[c]);
         }
         let f1 = residuals(&x1);
         check_jacobian_residual_shape(&f1, f0.len())?;
-        if method == FiniteDiffMethod::TwoPoint {
-            for &c in group {
-                let dx = x1[c] - x[c];
-                for &(r, entry) in &sparsity.column_entries[c] {
-                    data[entry] = (f1[r] - f0[r]) / dx;
-                }
-            }
+        let f2 = if group.iter().any(|&c| points[c].second.is_some()) {
+            let values = residuals(&x2);
+            check_jacobian_residual_shape(&values, f0.len())?;
+            Some(values)
         } else {
-            let f2 = residuals(&x2);
-            check_jacobian_residual_shape(&f2, f0.len())?;
-            for &c in group {
-                let one_sided = points[c].2;
-                let dx = if one_sided {
-                    x2[c] - x[c]
+            None
+        };
+        for &c in group {
+            for &(r, entry) in &sparsity.column_entries[c] {
+                data[entry] = if let Some(second) = points[c].second {
+                    fd_three_point(
+                        x[c],
+                        points[c].first,
+                        second,
+                        f0[r],
+                        f1[r],
+                        f2.as_ref().expect("three-point group has a second sample")[r],
+                    )
                 } else {
-                    x2[c] - x1[c]
+                    fd_quotient(f1[r], f0[r], points[c].first, x[c])
                 };
-                for &(r, entry) in &sparsity.column_entries[c] {
-                    data[entry] = if one_sided {
-                        (-3.0 * f0[r] + 4.0 * f1[r] - f2[r]) / dx
-                    } else {
-                        (f2[r] - f1[r]) / dx
-                    };
-                }
             }
         }
         for &c in group {
@@ -5277,6 +5360,217 @@ mod tests {
                 "numerical Jacobian calls are counted separately"
             );
             assert_eq!(result.njev, 1);
+        }
+    }
+
+    #[test]
+    fn least_squares_three_point_does_not_reverse_gradients_in_one_ulp_bounds() {
+        let lower = 1.0_f64;
+        let upper = lower.next_up();
+        let width = upper - lower;
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            for diff_method in [FiniteDiffMethod::TwoPoint, FiniteDiffMethod::ThreePoint] {
+                for sparse in [false, true] {
+                    let result = least_squares_bounded(
+                        |x| {
+                            assert!(lower <= x[0] && x[0] <= upper);
+                            vec![(x[0] - lower) / width - 1.0]
+                        },
+                        &[lower],
+                        &[lower],
+                        &[upper],
+                        LeastSquaresOptions {
+                            method: Some(method),
+                            diff_method,
+                            jac_sparsity: sparse.then(|| {
+                                JacobianSparsity::from_rows(vec![vec![0]], 1).unwrap()
+                            }),
+                            ..LeastSquaresOptions::default()
+                        },
+                    )
+                    .expect("a nonconstant residual in a one-ULP interval can be minimized");
+                    // The old three-point stencil sampled the base point twice,
+                    // reversed the gradient, and falsely declared the lower bound
+                    // optimal. A feasible secant recovers the exact linear slope.
+                    assert!(
+                        result.success,
+                        "{method:?}/{diff_method:?}, sparse={sparse}: {result:?}"
+                    );
+                    assert_eq!(result.x, vec![upper]);
+                    assert_eq!(result.fun, vec![0.0]);
+                    assert_eq!(result.cost, 0.0);
+                    assert_eq!(result.jac.to_dense().unwrap(), vec![vec![1.0 / width]]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn least_squares_three_point_uses_actual_unequal_node_spacing() {
+        let lower = 1.0_f64;
+        let ulp = lower.next_up() - lower;
+        let upper = lower + 3.0 * ulp;
+        let residuals = |x: &[f64]| {
+            let t = (x[0] - lower) / ulp;
+            vec![t * t + 2.0 * t + 3.0]
+        };
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            for sparse in [false, true] {
+                let options = LeastSquaresOptions {
+                    method: Some(method),
+                    diff_method: FiniteDiffMethod::ThreePoint,
+                    jac_sparsity: sparse.then(|| {
+                        JacobianSparsity::from_rows(vec![vec![0]], 1).unwrap()
+                    }),
+                    max_nfev: Some(1),
+                    ..LeastSquaresOptions::default()
+                };
+                for start in [lower, upper] {
+                    let result = least_squares_bounded(
+                        |x| {
+                            assert!(lower <= x[0] && x[0] <= upper);
+                            residuals(x)
+                        },
+                        &[start],
+                        &[lower],
+                        &[upper],
+                        options.clone(),
+                    )
+                    .expect("quadratic derivative in a three-ULP interval");
+                    let t = (result.x[0] - lower) / ulp;
+                    let exact = (2.0 * t + 2.0) / ulp;
+                    let actual = result.jac.to_dense().unwrap()[0][0];
+                    assert!(
+                        (actual / exact - 1.0).abs() < 1e-14,
+                        "{method:?}, sparse={sparse}, start={start}: {actual} != {exact}"
+                    );
+                }
+                // At a power of two the lower ULP is half the upper ULP.
+                // This nominally central stencil therefore has unequal spacing.
+                let result = least_squares(
+                    residuals,
+                    &[lower],
+                    LeastSquaresOptions {
+                        diff_step: Some(0.6 * ulp),
+                        ..options
+                    },
+                )
+                .expect("quadratic derivative on an asymmetric central stencil");
+                let exact = 2.0 / ulp;
+                let actual = result.jac.to_dense().unwrap()[0][0];
+                assert!(
+                    (actual / exact - 1.0).abs() < 1e-14,
+                    "{method:?}, sparse={sparse}: {actual} != {exact}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn least_squares_three_point_groups_mix_secants_and_quadratics() {
+        let lower = 1.0_f64;
+        let upper = lower.next_up();
+        let width = upper - lower;
+        let pattern = JacobianSparsity::from_rows(vec![vec![0], vec![1]], 2).unwrap();
+        assert_eq!(pattern.color_count(), 1);
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            let result = least_squares_bounded(
+                |x| {
+                    assert!(lower <= x[0] && x[0] <= upper);
+                    assert!(0.0 <= x[1] && x[1] <= 2.0);
+                    vec![
+                        (x[0] - lower) / width - 1.0,
+                        x[1] * x[1] + 2.0 * x[1] + 3.0,
+                    ]
+                },
+                &[lower, 1.0],
+                &[lower, 0.0],
+                &[upper, 2.0],
+                LeastSquaresOptions {
+                    method: Some(method),
+                    diff_method: FiniteDiffMethod::ThreePoint,
+                    diff_step: Some(1.0),
+                    jac_sparsity: Some(pattern.clone()),
+                    max_nfev: Some(1),
+                    ..LeastSquaresOptions::default()
+                },
+            )
+            .expect("a sparse color can combine two-point and three-point columns");
+            assert_eq!(
+                result.jac.to_dense().unwrap(),
+                vec![vec![1.0 / width, 0.0], vec![0.0, 4.0]]
+            );
+        }
+    }
+
+    #[test]
+    fn finite_difference_stencils_preserve_finite_slopes_and_constant_offsets() {
+        let residuals = |x: &[f64]| vec![1.0e308 * (x[0] - 1.0), 1.0e308];
+        let pattern = JacobianSparsity::from_rows(vec![vec![0], vec![0]], 1).unwrap();
+        for initial in [0.0, 1.0] {
+            let x = [initial];
+            let f0 = residuals(&x);
+            let dense = fd_jacobian_scipy(
+                &residuals,
+                &x,
+                &f0,
+                &[0.0],
+                &[2.0],
+                FiniteDiffMethod::ThreePoint,
+                Some(1.0),
+            )
+            .expect("finite values and derivatives must not overflow intermediate differences");
+            let sparse = fd_jacobian_grouped(
+                &residuals,
+                &x,
+                &f0,
+                &[0.0],
+                &[2.0],
+                FiniteDiffMethod::ThreePoint,
+                Some(1.0),
+                &pattern,
+            )
+            .unwrap()
+            .to_dense()
+            .unwrap();
+            assert_eq!(dense, sparse);
+            assert!((dense[0][0] / 1.0e308 - 1.0).abs() < 1e-9);
+            assert_eq!(dense[1][0], 0.0);
+        }
+    }
+
+    #[test]
+    fn least_squares_numerical_jacobians_never_sample_infinite_parameters() {
+        for initial in [-f64::MAX, f64::MAX] {
+            for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+                for diff_method in [FiniteDiffMethod::TwoPoint, FiniteDiffMethod::ThreePoint] {
+                    for sparse in [false, true] {
+                        let result = least_squares(
+                            |x| {
+                                assert!(x[0].is_finite(), "numerical sample must remain finite");
+                                vec![x[0] / f64::MAX]
+                            },
+                            &[initial],
+                            LeastSquaresOptions {
+                                method: Some(method),
+                                diff_method,
+                                jac_sparsity: sparse.then(|| {
+                                    JacobianSparsity::from_rows(vec![vec![0]], 1).unwrap()
+                                }),
+                                max_nfev: Some(1),
+                                ..LeastSquaresOptions::default()
+                            },
+                        )
+                        .expect("finite one-sided samples exist at either end of f64 range");
+                        let actual = result.jac.to_dense().unwrap()[0][0];
+                        let exact = 1.0 / f64::MAX;
+                        assert!(
+                            (actual / exact - 1.0).abs() < 1e-8,
+                            "{method:?}/{diff_method:?}, sparse={sparse}, initial={initial}: {actual}"
+                        );
+                    }
+                }
+            }
         }
     }
 
