@@ -10,7 +10,7 @@
 //! - `PchipInterpolator` — Monotonicity-preserving cubic Hermite interpolator
 //! - `RegularGridInterpolator` — N-D interpolation on regular grids
 //! - `NearestNDInterpolator` — Nearest-neighbor for scattered N-D data
-//! - `LinearNDInterpolator` — Linear interpolation for scattered 2D data
+//! - `LinearNDInterpolator` — Linear interpolation for scattered N-D data
 //! - `CloughTocher2DInterpolator` — Smooth scattered 2D interpolation
 //! - `SmoothBivariateSpline` — Smooth bivariate approximation for scattered 2D data
 
@@ -3772,28 +3772,92 @@ impl NearestNDInterpolator {
 pub enum GriddataMethod {
     Nearest,
     Linear,
-    /// Cubic C¹ interpolation (2-D only), matching SciPy's `method='cubic'`
-    /// which uses the Clough-Tocher scheme. Like SciPy, only 2-D scattered
-    /// points are supported for cubic.
+    /// Cubic interpolation: not-a-knot splines in 1-D, or the C¹
+    /// Clough-Tocher scheme in 2-D, matching SciPy's `method='cubic'`.
     Cubic,
 }
 
 /// Interpolate scattered data on arbitrary points.
 ///
 /// Matches `scipy.interpolate.griddata(points, values, xi, method)`.
-/// `Nearest` and `Linear` accept N-D points; `Cubic` (Clough-Tocher) is 2-D only
-/// (as in SciPy).
+/// `Nearest` accepts N-D points; `Linear` accepts 1-D through 7-D points.
+/// `Cubic` accepts 1-D or 2-D points. One-dimensional linear and cubic
+/// interpolation sorts the data sites before fitting; queries outside the
+/// convex hull return `NaN`. Nearest-neighbor interpolation extends outside it.
 pub fn griddata(
     points: &[Vec<f64>],
     values: &[f64],
     xi: &[Vec<f64>],
     method: GriddataMethod,
 ) -> Result<Vec<f64>, InterpError> {
+    if points.first().is_some_and(|point| point.len() == 1)
+        && method != GriddataMethod::Nearest
+    {
+        return griddata_1d(points, values, xi, method);
+    }
     match method {
         GriddataMethod::Nearest => NearestNDInterpolator::new(points, values)?.eval_many(xi),
         GriddataMethod::Linear => LinearNDInterpolator::new(points, values)?.eval_many(xi),
         GriddataMethod::Cubic => CloughTocher2DInterpolator::new(points, values)?.eval_many(xi),
     }
+}
+
+fn griddata_1d(
+    points: &[Vec<f64>],
+    values: &[f64],
+    queries: &[Vec<f64>],
+    method: GriddataMethod,
+) -> Result<Vec<f64>, InterpError> {
+    if points.len() != values.len() {
+        return Err(InterpError::LengthMismatch {
+            x_len: points.len(),
+            y_len: values.len(),
+        });
+    }
+    if points.iter().chain(queries).any(|point| point.len() != 1) {
+        return Err(InterpError::InvalidArgument {
+            detail: "one-dimensional griddata requires one coordinate per point".to_string(),
+        });
+    }
+    if points.iter().any(|point| !point[0].is_finite()) {
+        return Err(InterpError::NonFiniteX);
+    }
+    let mut data: Vec<(f64, f64)> = points
+        .iter()
+        .zip(values)
+        .map(|(point, &value)| (point[0], value))
+        .collect();
+    data.sort_by(|left, right| left.0.total_cmp(&right.0));
+    if data.len() == 1 && method == GriddataMethod::Linear {
+        return Ok(queries
+            .iter()
+            .map(|query| {
+                if query[0] == data[0].0 {
+                    data[0].1
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect());
+    }
+    let (x, y): (Vec<_>, Vec<_>) = data.into_iter().unzip();
+    let interpolator = Interp1d::new(
+        &x,
+        &y,
+        Interp1dOptions {
+            kind: match method {
+                GriddataMethod::Nearest => InterpKind::Nearest,
+                GriddataMethod::Linear => InterpKind::Linear,
+                GriddataMethod::Cubic => InterpKind::CubicSpline,
+            },
+            bounds_error: false,
+            fill_value: Some(f64::NAN),
+            spline_bc: SplineBc::NotAKnot,
+            ..Interp1dOptions::default()
+        },
+    )?;
+    let coordinates: Vec<f64> = queries.iter().map(|query| query[0]).collect();
+    interpolator.eval_many(&coordinates)
 }
 
 /// Interpolation method for RegularGridInterpolator.
@@ -5607,28 +5671,84 @@ fn barycentric(a: (f64, f64), b: (f64, f64), c: (f64, f64), p: (f64, f64)) -> (f
     (1.0 - l2 - l3, l2, l3)
 }
 
+/// Options for [`LinearNDInterpolator`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LinearNDOptions {
+    /// Value returned outside the convex hull of the input points.
+    pub fill_value: f64,
+    /// Rescale every coordinate axis to unit range before triangulation.
+    ///
+    /// Useful when coordinates represent different units or have very different
+    /// magnitudes. This changes the triangulation, as SciPy's `rescale=True` does.
+    pub rescale: bool,
+}
+
+impl Default for LinearNDOptions {
+    fn default() -> Self {
+        Self {
+            fill_value: f64::NAN,
+            rescale: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum LinearNDTriangulation {
+    Planar(Box<Delaunay2D>),
+    HigherDimensional(Box<fsci_spatial::Delaunay>),
+}
+
+/// Piecewise-linear interpolation of scalar values on scattered 2-D through 7-D points.
+///
+/// Each query is located in a Delaunay simplex and interpolated with its barycentric
+/// coordinates, as in `scipy.interpolate.LinearNDInterpolator`. Queries outside the
+/// convex hull return `fill_value` (`NaN` by default). The existing 2-D triangulator
+/// retains its indexed fast path; higher dimensions use [`fsci_spatial::Delaunay`]
+/// and its cached transforms.
 #[derive(Debug, Clone)]
 pub struct LinearNDInterpolator {
-    delaunay: Delaunay2D,
+    delaunay: LinearNDTriangulation,
+    ndim: usize,
     values: Vec<f64>,
+    fill_value: f64,
+    offset: Vec<f64>,
+    scale: Vec<f64>,
+    rescale: bool,
 }
 
 impl LinearNDInterpolator {
     pub fn new(points: &[Vec<f64>], values: &[f64]) -> Result<Self, InterpError> {
+        Self::with_options(points, values, LinearNDOptions::default())
+    }
+
+    pub fn with_options(
+        points: &[Vec<f64>],
+        values: &[f64],
+        options: LinearNDOptions,
+    ) -> Result<Self, InterpError> {
         if points.is_empty() {
             return Err(InterpError::TooFewPoints {
                 minimum: 3,
                 actual: 0,
             });
         }
+        let ndim = points[0].len();
+        if !(2..=7).contains(&ndim) {
+            return Err(InterpError::InvalidArgument {
+                detail: format!("LinearND requires dimensions 2 through 7; got {ndim}"),
+            });
+        }
         for (i, point) in points.iter().enumerate() {
-            if point.len() != 2 {
+            if point.len() != ndim {
                 return Err(InterpError::InvalidArgument {
                     detail: format!(
-                        "LinearND only supports 2D points; point {i} has dimension {}",
+                        "LinearND point {i} has dimension {}; expected {ndim}",
                         point.len()
                     ),
                 });
+            }
+            if point.iter().any(|coordinate| !coordinate.is_finite()) {
+                return Err(InterpError::NonFiniteX);
             }
         }
         if points.len() != values.len() {
@@ -5637,32 +5757,188 @@ impl LinearNDInterpolator {
                 y_len: values.len(),
             });
         }
-        let pts: Vec<(f64, f64)> = points.iter().map(|p| (p[0], p[1])).collect();
-        Ok(Self {
-            delaunay: Delaunay2D::new(&pts)?,
-            values: values.to_vec(),
-        })
-    }
-    pub fn eval(&self, query: &[f64]) -> Result<f64, InterpError> {
-        if query.len() != 2 {
-            return Err(InterpError::InvalidArgument {
-                detail: "query must be 2D".to_string(),
+        if points.len() < ndim + 1 {
+            return Err(InterpError::TooFewPoints {
+                minimum: ndim + 1,
+                actual: points.len(),
             });
         }
-        match self.delaunay.find_simplex((query[0], query[1])) {
-            Some((idx, l1, l2, l3)) => {
-                let (a, b, c) = self.delaunay.simplices[idx];
-                Ok(l1 * self.values[a] + l2 * self.values[b] + l3 * self.values[c])
+
+        let mut offset = Vec::new();
+        let mut scale = Vec::new();
+        let scaled_points;
+        let triangulation_points = if options.rescale {
+            offset = vec![0.0; ndim];
+            scale = vec![0.0; ndim];
+            for axis in 0..ndim {
+                let mut minimum = f64::INFINITY;
+                let mut maximum = f64::NEG_INFINITY;
+                for point in points {
+                    minimum = minimum.min(point[axis]);
+                    maximum = maximum.max(point[axis]);
+                    offset[axis] += point[axis] / points.len() as f64;
+                }
+                scale[axis] = maximum - minimum;
+                if !offset[axis].is_finite() || !scale[axis].is_finite() {
+                    return Err(InterpError::InvalidArgument {
+                        detail: format!("LinearND cannot rescale coordinate axis {axis}"),
+                    });
+                }
+                if scale[axis] == 0.0 {
+                    // Keep constant coordinates finite; the triangulator reports the
+                    // resulting rank deficiency instead of receiving division by zero.
+                    scale[axis] = 1.0;
+                }
             }
-            None => Ok(f64::NAN),
+            scaled_points = points
+                .iter()
+                .map(|point| {
+                    point
+                        .iter()
+                        .zip(offset.iter().zip(&scale))
+                        .map(|(coordinate, (origin, span))| (coordinate - origin) / span)
+                        .collect()
+                })
+                .collect::<Vec<Vec<f64>>>();
+            &scaled_points
+        } else {
+            points
+        };
+
+        let delaunay = if ndim == 2 {
+            let pts: Vec<(f64, f64)> = triangulation_points
+                .iter()
+                .map(|p| (p[0], p[1]))
+                .collect();
+            let triangulation = Delaunay2D::new(&pts)?;
+            if triangulation.simplices.is_empty() {
+                return Err(InterpError::InvalidArgument {
+                    detail: "LinearND requires non-collinear points".to_string(),
+                });
+            }
+            LinearNDTriangulation::Planar(Box::new(triangulation))
+        } else {
+            let triangulation = fsci_spatial::Delaunay::new(triangulation_points).map_err(|error| {
+                InterpError::InvalidArgument {
+                    detail: format!("LinearND triangulation error: {error}"),
+                }
+            })?;
+            LinearNDTriangulation::HigherDimensional(Box::new(triangulation))
+        };
+        Ok(Self {
+            delaunay,
+            ndim,
+            values: values.to_vec(),
+            fill_value: options.fill_value,
+            offset,
+            scale,
+            rescale: options.rescale,
+        })
+    }
+
+    fn scale_query(&self, query: &[f64]) -> Vec<f64> {
+        query
+            .iter()
+            .zip(self.offset.iter().zip(&self.scale))
+            .map(|(coordinate, (origin, span))| (coordinate - origin) / span)
+            .collect()
+    }
+
+    pub fn eval(&self, query: &[f64]) -> Result<f64, InterpError> {
+        if query.len() != self.ndim {
+            return Err(InterpError::InvalidArgument {
+                detail: format!("query must have {} coordinates", self.ndim),
+            });
+        }
+        let scaled_query;
+        let query = if self.rescale {
+            scaled_query = self.scale_query(query);
+            &scaled_query
+        } else {
+            query
+        };
+        match &self.delaunay {
+            LinearNDTriangulation::Planar(triangulation) => {
+                match triangulation.find_simplex((query[0], query[1])) {
+                    Some((idx, l1, l2, l3)) => {
+                        let (a, b, c) = triangulation.simplices[idx];
+                        Ok(l1 * self.values[a] + l2 * self.values[b] + l3 * self.values[c])
+                    }
+                    None => Ok(self.fill_value),
+                }
+            }
+            LinearNDTriangulation::HigherDimensional(triangulation) => {
+                let simplex = triangulation
+                    .find_simplex(&[query.to_vec()], false, None)
+                    .map_err(|error| InterpError::InvalidArgument {
+                        detail: format!("LinearND query error: {error}"),
+                    })?[0];
+                Ok(self.nd_value(triangulation, query, simplex))
+            }
         }
     }
+
     pub fn eval_many(&self, queries: &[Vec<f64>]) -> Result<Vec<f64>, InterpError> {
-        // Each query independently locates its simplex and evaluates the barycentric
-        // interpolant; parallelize across queries (bit-identical, query-order preserved).
-        // Low work weight: the simplex lookup is cheap, so only batch-parallelize when the
-        // query count is large enough to amortize the spawn (avoids a small-m regression).
-        par_query_try_map(queries, 6, |q| self.eval(q))
+        match &self.delaunay {
+            LinearNDTriangulation::Planar(_) => {
+                // Preserve the indexed 2-D path, including its small-batch serial threshold.
+                par_query_try_map(queries, 6, |q| self.eval(q))
+            }
+            LinearNDTriangulation::HigherDimensional(triangulation) => {
+                if queries.iter().any(|query| query.len() != self.ndim) {
+                    return Err(InterpError::InvalidArgument {
+                        detail: format!("queries must have {} coordinates", self.ndim),
+                    });
+                }
+                let scaled_queries;
+                let queries = if self.rescale {
+                    scaled_queries = queries
+                        .iter()
+                        .map(|query| self.scale_query(query))
+                        .collect::<Vec<_>>();
+                    &scaled_queries
+                } else {
+                    queries
+                };
+                // Locate the whole batch so the N-D neighbor walk can start each query
+                // from the preceding simplex, instead of restarting at simplex zero.
+                let simplices = triangulation
+                    .find_simplex(queries, false, None)
+                    .map_err(|error| InterpError::InvalidArgument {
+                        detail: format!("LinearND query error: {error}"),
+                    })?;
+                Ok(queries
+                    .iter()
+                    .zip(simplices)
+                    .map(|(query, simplex)| self.nd_value(triangulation, query, simplex))
+                    .collect())
+            }
+        }
+    }
+
+    fn nd_value(
+        &self,
+        triangulation: &fsci_spatial::Delaunay,
+        query: &[f64],
+        simplex: isize,
+    ) -> f64 {
+        let Ok(simplex) = usize::try_from(simplex) else {
+            return self.fill_value;
+        };
+        let vertices = &triangulation.simplices[simplex];
+        let transform = &triangulation.transform[simplex];
+        let mut remaining_weight = 1.0;
+        let mut value = 0.0;
+        for (row, &vertex) in transform[..self.ndim].iter().zip(vertices) {
+            let weight: f64 = row
+                .iter()
+                .zip(query.iter().zip(&transform[self.ndim]))
+                .map(|(coefficient, (coordinate, origin))| coefficient * (coordinate - origin))
+                .sum();
+            remaining_weight -= weight;
+            value += weight * self.values[vertex];
+        }
+        value + remaining_weight * self.values[vertices[self.ndim]]
     }
 }
 

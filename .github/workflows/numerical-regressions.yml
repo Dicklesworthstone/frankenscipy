@@ -6,6 +6,8 @@ on:
     paths:
       - "crates/fsci-opt/**"
       - "crates/fsci-integrate/**"
+      - "crates/fsci-interpolate/**"
+      - "crates/fsci-spatial/**"
       - "crates/fsci-linalg/**"
       - "crates/fsci-sparse/**"
       - "crates/fsci-stats/**"
@@ -40,7 +42,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [least-squares, sparse-lsmr, distribution-fit, fft-capture, casp, quadrature, signal-state]
+        lane: [least-squares, sparse-lsmr, distribution-fit, fft-capture, casp, quadrature, interpolation, signal-state]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -87,6 +89,10 @@ jobs:
               cargo test --locked -p fsci-integrate --test differential_integrate sampled_simpson -- --nocapture
               cargo test --locked -p fsci-integrate --test differential_integrate gauss_kronrod_global_error_matches_live_scipy -- --nocapture
               cargo test --locked -p fsci-conformance --no-default-features --test diff_integrate diff_integrate_tanhsinh -- --nocapture
+              ;;
+            interpolation)
+              cargo test --locked -p fsci-interpolate --test linear_nd -- --nocapture
+              cargo test --locked -p fsci-interpolate --test linear_nd_scipy -- --nocapture
               ;;
             casp)
               cargo test --locked -p fsci-integrate --lib casp -- --nocapture
