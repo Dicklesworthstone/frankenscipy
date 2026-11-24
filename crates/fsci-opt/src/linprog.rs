@@ -261,7 +261,7 @@ pub fn linprog(
     Ok(assemble(&lp, c, a_ub, b_ub, a_eq, b_eq, &lb, &ub, solved))
 }
 
-fn validate_problem(
+pub(crate) fn validate_problem(
     c: &[f64],
     a_ub: &[Vec<f64>],
     b_ub: &[f64],

@@ -1252,20 +1252,30 @@ pub enum Integrality {
 /// Result of a mixed-integer linear programming problem.
 #[derive(Debug, Clone)]
 pub struct MilpResult {
-    /// Solution vector.
+    /// Best feasible solution, or empty when no incumbent was found.
     pub x: Vec<f64>,
-    /// Optimal objective value `c^T x`.
+    /// Incumbent objective `c^T x`, or NaN when there is no incumbent.
     pub fun: f64,
-    /// Whether the solver succeeded.
+    /// Whether the search proved optimality to the requested gap tolerances.
     pub success: bool,
-    /// Solver status: 0 = optimal, 1 = node/iteration limit, 2 = infeasible, 3 = unbounded.
+    /// 0 = optimal (within requested gap), 1 = node/iteration limit,
+    /// 2 = infeasible, 3 = unbounded, 4 = unresolved numerical failure.
     pub status: u8,
     /// Human-readable message.
     pub message: String,
-    /// Number of LP relaxations solved.
+    /// Number of branch-and-bound nodes processed. An unbounded relaxation
+    /// may additionally require a feasibility LP at the same node.
     pub mip_node_count: usize,
     /// Accumulated LP iteration count.
     pub nit: usize,
+    /// Global lower bound on the minimum objective, including pending and
+    /// unresolved nodes. Negative infinity means no finite bound is available;
+    /// positive infinity certifies infeasibility. At an exhausted, solved tree
+    /// this equals `fun`, subject to the LP solver's feasibility tolerances.
+    pub mip_dual_bound: f64,
+    /// `(fun - mip_dual_bound) / abs(fun)`. Zero when the bounds coincide,
+    /// infinity without an incumbent or with a nonzero gap at a zero objective.
+    pub mip_gap: f64,
 }
 
 /// Problem definition for `milp`.
@@ -1285,6 +1295,179 @@ pub struct MilpProblem<'a> {
 pub struct MilpOptions {
     pub max_nodes: Option<usize>,
     pub lp_maxiter: Option<usize>,
+    /// Stop when the relative incumbent/global-bound gap is at most this
+    /// value. Must be finite and nonnegative. The default zero retains the
+    /// exhaustive-search behavior; a positive value permits an approximate optimum.
+    pub mip_rel_gap: f64,
+    /// Absolute objective gap accepted in addition to `mip_rel_gap`. Useful
+    /// when the optimum is zero. Must be finite and nonnegative; default zero.
+    pub mip_abs_gap: f64,
+}
+
+/// A pending subproblem carries the bound already proved by its ancestors.
+/// Best-bound ordering keeps that evidence available even before its LP runs.
+#[derive(Debug)]
+struct MilpNode {
+    bounds: Vec<(f64, f64)>,
+    lower_bound: f64,
+    depth: usize,
+    sequence: usize,
+}
+
+impl PartialEq for MilpNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.sequence == other.sequence
+    }
+}
+
+impl Eq for MilpNode {}
+
+impl PartialOrd for MilpNode {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MilpNode {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // BinaryHeap is a max-heap. Lower bounds come first; depth-first ties
+        // find an incumbent promptly, with insertion order as a stable tiebreaker.
+        other
+            .lower_bound
+            .total_cmp(&self.lower_bound)
+            .then_with(|| self.depth.cmp(&other.depth))
+            .then_with(|| other.sequence.cmp(&self.sequence))
+    }
+}
+
+fn milp_relative_gap(upper: f64, lower: f64) -> f64 {
+    if upper == lower {
+        return 0.0;
+    }
+    if !upper.is_finite() || !lower.is_finite() || upper == 0.0 {
+        return f64::INFINITY;
+    }
+    let difference = upper - lower;
+    if difference.is_finite() {
+        (difference / upper.abs()).max(0.0)
+    } else {
+        // Opposite-sign finite endpoints may have an overflowing difference
+        // even though the relative gap itself is representable.
+        (upper / upper.abs() - lower / upper.abs()).max(0.0)
+    }
+}
+
+fn milp_result(
+    best: Option<LinprogResult>,
+    status: u8,
+    message: String,
+    lower_bound: f64,
+    node_count: usize,
+    nit: usize,
+) -> MilpResult {
+    let (x, fun) = best.map_or((Vec::new(), f64::NAN), |best| (best.x, best.fun));
+    let lower_bound = if fun.is_finite() {
+        lower_bound.min(fun)
+    } else {
+        lower_bound
+    };
+    MilpResult {
+        x,
+        fun,
+        // status: exhausted search or a certified global gap met the requested tolerance
+        success: status == 0,
+        status,
+        message,
+        mip_node_count: node_count,
+        nit,
+        mip_dual_bound: lower_bound,
+        mip_gap: milp_relative_gap(fun, lower_bound),
+    }
+}
+
+/// Bound the Lagrangian over a variable box. Any nonpositive inequality
+/// multipliers and unrestricted equality multipliers give a valid lower bound;
+/// they need not satisfy the LP's reduced-cost tolerances. Outward rounding
+/// retains the residual coefficients instead of silently treating them as zero.
+/// This matters for infinite bounds and for objectives much smaller than 1e-9.
+fn milp_lower_bound(
+    problem: MilpProblem<'_>,
+    bounds: &[(f64, f64)],
+    dual: Option<&LinprogResult>,
+) -> f64 {
+    let mut reduced: Vec<(f64, f64)> = problem.c.iter().map(|&c| (c, c)).collect();
+    let mut value = 0.0;
+    if let Some(dual) = dual {
+        for (rows, rhs, multipliers, inequality) in [
+            (problem.a_ub, problem.b_ub, &dual.ineqlin.marginals, true),
+            (problem.a_eq, problem.b_eq, &dual.eqlin.marginals, false),
+        ] {
+            if multipliers.len() != rows.len() {
+                return f64::NEG_INFINITY;
+            }
+            for ((row, &rhs), &multiplier) in rows.iter().zip(rhs).zip(multipliers) {
+                if !multiplier.is_finite() {
+                    return f64::NEG_INFINITY;
+                }
+                let multiplier = if inequality {
+                    multiplier.min(0.0)
+                } else {
+                    multiplier
+                };
+                if multiplier == 0.0 {
+                    continue;
+                }
+                if rhs != 0.0 {
+                    value = (value + (multiplier * rhs).next_down()).next_down();
+                }
+                for ((low, high), &coefficient) in reduced.iter_mut().zip(row) {
+                    if coefficient != 0.0 {
+                        let product = coefficient * multiplier;
+                        *low = (*low - product.next_up()).next_down();
+                        *high = (*high - product.next_down()).next_up();
+                    }
+                }
+            }
+        }
+    }
+    for ((low, high), &(lo, hi)) in reduced.into_iter().zip(bounds) {
+        if !low.is_finite()
+            || !high.is_finite()
+            || (low < 0.0 && hi == f64::INFINITY)
+            || (high > 0.0 && lo == f64::NEG_INFINITY)
+        {
+            return f64::NEG_INFINITY;
+        }
+        let mut contribution = f64::INFINITY;
+        for coefficient in [low, high] {
+            if coefficient == 0.0 {
+                contribution = contribution.min(0.0);
+            } else {
+                for endpoint in [lo, hi] {
+                    if endpoint.is_finite() {
+                        let product = coefficient * endpoint;
+                        let lower = if endpoint == 0.0 {
+                            0.0
+                        } else {
+                            product.next_down()
+                        };
+                        contribution = contribution.min(lower);
+                    }
+                }
+            }
+        }
+        if contribution != 0.0 {
+            value = (value + contribution).next_down();
+        }
+        if !value.is_finite() {
+            return f64::NEG_INFINITY;
+        }
+    }
+    if value.is_finite() {
+        value
+    } else {
+        f64::NEG_INFINITY
+    }
 }
 
 fn validate_variable_bounds(index: usize, lo: f64, hi: f64) -> Result<(), OptError> {
@@ -1354,6 +1537,12 @@ fn is_integral_with_tol(value: f64, tol: f64) -> bool {
 /// bound is positive. Its active interval requires a finite nonnegative lower
 /// bound; an infinite upper bound is allowed. An empty active interval leaves
 /// only zero, including an interval containing no integer for `SemiInteger`.
+///
+/// Pending nodes are visited in best-bound order. The result retains a global
+/// lower bound and an optimality gap even when a node or LP iteration budget is
+/// exhausted. Optional relative/absolute gaps allow an early, quantified stop.
+/// An unbounded LP relaxation first triggers an integer-feasibility search:
+/// relaxation unboundedness alone never certifies an unbounded integer problem.
 pub fn milp(problem: MilpProblem<'_>, options: MilpOptions) -> Result<MilpResult, OptError> {
     let MilpProblem {
         c,
@@ -1369,6 +1558,16 @@ pub fn milp(problem: MilpProblem<'_>, options: MilpOptions) -> Result<MilpResult
     if n == 0 {
         return Err(OptError::InvalidArgument {
             detail: "c must not be empty".to_string(),
+        });
+    }
+    linprog::validate_problem(c, a_ub, b_ub, a_eq, b_eq)?;
+    if !options.mip_rel_gap.is_finite()
+        || options.mip_rel_gap < 0.0
+        || !options.mip_abs_gap.is_finite()
+        || options.mip_abs_gap < 0.0
+    {
+        return Err(OptError::InvalidArgument {
+            detail: "MILP gap tolerances must be finite and nonnegative".to_string(),
         });
     }
     if options.max_nodes == Some(0) {
@@ -1435,90 +1634,164 @@ pub fn milp(problem: MilpProblem<'_>, options: MilpOptions) -> Result<MilpResult
             bound.0 = bound.0.max(0.0);
             bound.1 = bound.1.min(1.0);
         }
+        if matches!(kind, Integrality::Integer | Integrality::Binary) {
+            bound.0 = bound.0.ceil();
+            bound.1 = bound.1.floor();
+        }
         if bound.0.is_nan() || bound.1.is_nan() {
             return Err(OptError::InvalidBounds {
                 detail: format!("variable {i}: bounds became NaN after integrality adjustment"),
             });
         }
         if bound.0 > bound.1 {
-            return Ok(MilpResult {
-                x: vec![0.0; n],
-                fun: 0.0,
-                success: false,
-                status: 2,
-                message: format!(
-                    "variable {i}: bounds are infeasible after integrality restrictions"
-                ),
-                mip_node_count: 0,
-                nit: 0,
-            });
+            return Ok(milp_result(
+                None,
+                2,
+                format!("variable {i}: bounds are infeasible after integrality restrictions"),
+                f64::INFINITY,
+                0,
+                0,
+            ));
         }
     }
 
     let max_nodes = options.max_nodes.unwrap_or(2_048);
-    let tol = 1e-9;
     let mut node_count = 0usize;
     let mut total_nit = 0usize;
     let mut best: Option<LinprogResult> = None;
-    let mut root_status = None;
-    // Node LPs that failed for a reason OTHER than infeasibility (iteration limit, unbounded,
-    // numerical trouble). Pruning one is not a proof that its subtree holds nothing better, so
-    // any such node leaves the incumbent unproven (frankenscipy-szq1n.7).
-    let mut unresolved_nodes = 0usize;
-    let mut stack = vec![root_bounds];
+    // A failed LP does not discharge its subtree. Retain its inherited bound
+    // in the global certificate instead of silently pruning it as infeasible.
+    let mut unresolved_bound = f64::INFINITY;
+    let mut unresolved_status = 0;
+    let mut sequence = 0usize;
+    let mut pending = std::collections::BinaryHeap::from([MilpNode {
+        lower_bound: milp_lower_bound(problem, &root_bounds, None),
+        bounds: root_bounds,
+        depth: 0,
+        sequence,
+    }]);
+    let zero_objective = vec![0.0; n];
 
-    while let Some(node_bounds) = stack.pop() {
-        if node_count >= max_nodes {
-            return Ok(match best {
-                Some(best) => MilpResult {
-                    x: best.x,
-                    fun: best.fun,
-                    success: false,
-                    status: 1,
-                    message: "MILP node limit exceeded after finding an incumbent".to_string(),
-                    mip_node_count: node_count,
-                    nit: total_nit,
-                },
-                None => MilpResult {
-                    x: vec![0.0; n],
-                    fun: 0.0,
-                    success: false,
-                    status: 1,
-                    message: "MILP node limit exceeded before finding a feasible solution"
-                        .to_string(),
-                    mip_node_count: node_count,
-                    nit: total_nit,
-                },
-            });
+    loop {
+        let lower_bound = pending
+            .peek()
+            .map_or(f64::INFINITY, |node| node.lower_bound)
+            .min(unresolved_bound);
+        if let Some(incumbent) = &best {
+            let lower_bound = lower_bound.min(incumbent.fun);
+            let gap = milp_relative_gap(incumbent.fun, lower_bound);
+            if gap <= options.mip_rel_gap || incumbent.fun - lower_bound <= options.mip_abs_gap {
+                return Ok(milp_result(
+                    best,
+                    0,
+                    "Optimization terminated successfully within the requested MIP gap".to_string(),
+                    lower_bound,
+                    node_count,
+                    total_nit,
+                ));
+            }
         }
-
+        if pending.is_empty() {
+            let (status, message) = if unresolved_status != 0 {
+                (
+                    unresolved_status,
+                    "MILP search has unresolved LP subproblems".to_string(),
+                )
+            } else {
+                (2, "Problem is infeasible".to_string())
+            };
+            return Ok(milp_result(
+                best,
+                status,
+                message,
+                lower_bound,
+                node_count,
+                total_nit,
+            ));
+        }
+        if node_count >= max_nodes {
+            return Ok(milp_result(
+                best,
+                1,
+                "MILP node limit reached; the incumbent and global bound are retained".to_string(),
+                lower_bound,
+                node_count,
+                total_nit,
+            ));
+        }
+        let node = pending.pop().expect("pending node checked above");
+        if best
+            .as_ref()
+            .is_some_and(|incumbent| node.lower_bound >= incumbent.fun)
+        {
+            continue;
+        }
+        let node_bounds = node.bounds;
+        let bounds = bounds_to_options(&node_bounds);
         node_count += 1;
-        let lp = linprog(
+        let mut lp = linprog(
             c,
             a_ub,
             b_ub,
             a_eq,
             b_eq,
-            &bounds_to_options(&node_bounds),
+            &bounds,
             LinprogOptions {
                 maxiter: options.lp_maxiter,
                 ..LinprogOptions::default()
             },
         )?;
         total_nit += lp.nit;
-
-        if root_status.is_none() {
-            root_status = Some(lp.status);
+        let unbounded = lp.status == 3;
+        if unbounded && node.lower_bound.is_finite() {
+            // A finite independent lower bound contradicts an unbounded LP
+            // verdict. Keep the subproblem unresolved instead of turning a
+            // numerical inconsistency into a certificate of unboundedness.
+            unresolved_bound = unresolved_bound.min(node.lower_bound);
+            unresolved_status = 4;
+            continue;
+        }
+        if unbounded {
+            // For rational input data, a mixed-integer feasible point plus an
+            // unbounded continuous relaxation implies a mixed-integer recession
+            // direction (scale the rational ray to integral coordinates). First
+            // establish that feasible point, branching when necessary. A point
+            // such as x=0.5 on an integer equality must never certify unboundedness.
+            lp = linprog(
+                &zero_objective,
+                a_ub,
+                b_ub,
+                a_eq,
+                b_eq,
+                &bounds,
+                LinprogOptions {
+                    maxiter: options.lp_maxiter,
+                    ..LinprogOptions::default()
+                },
+            )?;
+            total_nit += lp.nit;
         }
         if !lp.success {
-            if lp.status != 2 {
-                unresolved_nodes += 1;
+            if lp.status != 2 || unbounded {
+                unresolved_bound = unresolved_bound.min(node.lower_bound);
+                unresolved_status = unresolved_status.max(if lp.status == 1 { 1 } else { 4 });
             }
             continue;
         }
+        if !lp.fun.is_finite() || lp.x.len() != n || lp.x.iter().any(|x| !x.is_finite()) {
+            unresolved_bound = unresolved_bound.min(node.lower_bound);
+            unresolved_status = 4;
+            continue;
+        }
+        let lower_bound = if unbounded {
+            node.lower_bound
+        } else {
+            node.lower_bound
+                .max(milp_lower_bound(problem, &node_bounds, Some(&lp)))
+        };
         if best
             .as_ref()
-            .is_some_and(|incumbent| lp.fun >= incumbent.fun - tol)
+            .is_some_and(|incumbent| lower_bound >= incumbent.fun)
         {
             continue;
         }
@@ -1541,7 +1814,7 @@ pub fn milp(problem: MilpProblem<'_>, options: MilpOptions) -> Result<MilpResult
             } else if matches!(
                 kind,
                 Integrality::Integer | Integrality::Binary | Integrality::SemiInteger
-            ) && !is_integral_with_tol(lp.x[i], tol)
+            ) && !is_integral_with_tol(lp.x[i], 1e-9)
             {
                 Some((i, lp.x[i].floor(), lp.x[i].ceil()))
             } else {
@@ -1550,68 +1823,47 @@ pub fn milp(problem: MilpProblem<'_>, options: MilpOptions) -> Result<MilpResult
         });
 
         match branch {
-            None => best = Some(lp),
+            None if unbounded => {
+                return Ok(milp_result(
+                    None,
+                    3,
+                    "Problem is unbounded after establishing mixed-integer feasibility".to_string(),
+                    f64::NEG_INFINITY,
+                    node_count,
+                    total_nit,
+                ));
+            }
+            None => {
+                if best.as_ref().is_none_or(|incumbent| lp.fun < incumbent.fun) {
+                    best = Some(lp);
+                }
+            }
             Some((i, left_upper, right_lower)) => {
                 let mut lower_branch = node_bounds.clone();
                 lower_branch[i].1 = lower_branch[i].1.min(left_upper);
-                if lower_branch[i].0 <= lower_branch[i].1 {
-                    stack.push(lower_branch);
-                }
-
-                let mut upper_branch = node_bounds;
+                let mut upper_branch = node_bounds.clone();
                 upper_branch[i].0 = upper_branch[i].0.max(right_lower);
-                if upper_branch[i].0 <= upper_branch[i].1 {
-                    stack.push(upper_branch);
+                // Retain upper-first depth ties from the previous DFS while
+                // allowing a stronger lower bound elsewhere to order the queue.
+                for child in [upper_branch, lower_branch] {
+                    if child[i].0 <= child[i].1 && child[i] != node_bounds[i] {
+                        sequence += 1;
+                        pending.push(MilpNode {
+                            bounds: child,
+                            lower_bound,
+                            depth: node.depth + 1,
+                            sequence,
+                        });
+                    } else if child[i] == node_bounds[i] {
+                        // A numerical endpoint outside its selected branch must
+                        // not recreate the same node or disappear from the proof.
+                        unresolved_bound = unresolved_bound.min(lower_bound);
+                        unresolved_status = 4;
+                    }
                 }
             }
         }
     }
-
-    Ok(match best {
-        Some(best) if unresolved_nodes > 0 => MilpResult {
-            x: best.x,
-            fun: best.fun,
-            success: false,
-            status: 1,
-            message: format!(
-                "incumbent not proven optimal: {unresolved_nodes} node LP relaxation(s) stopped without an optimum (raise lp_maxiter)"
-            ),
-            mip_node_count: node_count,
-            nit: total_nit,
-        },
-        Some(best) => MilpResult {
-            x: best.x,
-            fun: best.fun,
-            // status: B&B stack exhausted, integral incumbent, zero unresolved node LPs
-            success: true,
-            status: 0,
-            message: "Optimization terminated successfully".to_string(),
-            mip_node_count: node_count,
-            nit: total_nit,
-        },
-        None => {
-            let (status, message) = match root_status {
-                Some(3) => (3, "LP relaxation is unbounded".to_string()),
-                // An LP stopped at its iteration limit proves nothing about feasibility.
-                _ if unresolved_nodes > 0 => (
-                    1,
-                    format!(
-                        "no feasible solution found and {unresolved_nodes} node LP relaxation(s) stopped without an optimum (raise lp_maxiter)"
-                    ),
-                ),
-                _ => (2, "Problem is infeasible".to_string()),
-            };
-            MilpResult {
-                x: vec![0.0; n],
-                fun: 0.0,
-                success: false,
-                status,
-                message,
-                mip_node_count: node_count,
-                nit: total_nit,
-            }
-        }
-    })
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -7526,6 +7778,198 @@ mod tests {
 
     // ── milp tests ──────────────────────────────────────────────────
 
+    #[test]
+    fn milp_preserves_global_bounds_and_gap_at_node_limits() {
+        for max_nodes in [1, 2, 3] {
+            let result = one_variable_milp(
+                Integrality::SemiContinuous,
+                1.0,
+                (Some(2.0), Some(5.0)),
+                Some(1.0),
+                None,
+                MilpOptions {
+                    max_nodes: Some(max_nodes),
+                    ..Default::default()
+                },
+            );
+            assert!(result.mip_dual_bound <= 2.0, "{result:?}");
+            if max_nodes < 3 {
+                assert_eq!(result.status, 1, "{result:?}");
+                assert!(!result.success);
+                assert!((result.mip_dual_bound - 1.0).abs() < 1e-13, "{result:?}");
+            }
+            match max_nodes {
+                1 => {
+                    assert!(result.x.is_empty());
+                    assert!(result.fun.is_nan());
+                    assert!(result.mip_gap.is_infinite());
+                }
+                2 => {
+                    assert_eq!(result.x, vec![2.0]);
+                    assert!((result.mip_gap - 0.5).abs() < 1e-13, "{result:?}");
+                }
+                _ => {
+                    assert!(result.success, "{result:?}");
+                    assert_eq!(result.mip_dual_bound, result.fun);
+                    assert_eq!(result.mip_gap, 0.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn milp_requested_gap_stops_with_quantified_incumbent() {
+        for options in [
+            MilpOptions {
+                mip_rel_gap: 0.51,
+                ..Default::default()
+            },
+            MilpOptions {
+                mip_abs_gap: 1.01,
+                ..Default::default()
+            },
+        ] {
+            let result = one_variable_milp(
+                Integrality::SemiContinuous,
+                1.0,
+                (Some(2.0), Some(5.0)),
+                Some(1.0),
+                None,
+                options,
+            );
+            assert!(result.success, "{result:?}");
+            assert_eq!(result.mip_node_count, 2);
+            assert_eq!(result.fun, 2.0);
+            assert!(
+                result.mip_gap > 0.49 && result.mip_gap <= 0.51,
+                "{result:?}"
+            );
+        }
+        let zero = milp(
+            MilpProblem {
+                c: &[-1.0, 1.0],
+                integrality: &[Integrality::Integer, Integrality::Continuous],
+                a_ub: &[vec![2.0, -1.0]],
+                b_ub: &[1.0],
+                a_eq: &[],
+                b_eq: &[],
+                bounds: &[(Some(0.0), Some(1.0)), (Some(0.0), Some(2.0))],
+            },
+            MilpOptions {
+                mip_abs_gap: 0.51,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(zero.success, "{zero:?}");
+        assert_eq!(zero.fun, 0.0);
+        assert!(zero.mip_gap.is_infinite());
+        assert!((zero.mip_dual_bound + 0.5).abs() < 1e-13);
+        assert_eq!(zero.mip_node_count, 2);
+    }
+
+    #[test]
+    fn milp_unbounded_relaxation_requires_integer_feasibility() {
+        for fixed_integer in [0.5, 1.0] {
+            let result = milp(
+                MilpProblem {
+                    c: &[0.0, -1.0],
+                    integrality: &[Integrality::Integer, Integrality::Continuous],
+                    a_ub: &[],
+                    b_ub: &[],
+                    a_eq: &[vec![1.0, 0.0]],
+                    b_eq: &[fixed_integer],
+                    bounds: &[(Some(0.0), Some(1.0)), (Some(0.0), None)],
+                },
+                MilpOptions::default(),
+            )
+            .unwrap();
+            assert!(!result.success, "{result:?}");
+            assert_eq!(
+                result.status,
+                if fixed_integer == 0.5 { 2 } else { 3 },
+                "{result:?}"
+            );
+            assert!(result.x.is_empty());
+            assert!(result.fun.is_nan());
+            assert_eq!(
+                result.mip_dual_bound,
+                if fixed_integer == 0.5 {
+                    f64::INFINITY
+                } else {
+                    f64::NEG_INFINITY
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn milp_does_not_prune_a_better_incumbent_with_an_absolute_epsilon() {
+        let result = milp(
+            MilpProblem {
+                c: &[-1.0, -1.000_000_000_1],
+                integrality: &[Integrality::Integer; 2],
+                a_ub: &[vec![1.0, 1.0]],
+                b_ub: &[1.5],
+                a_eq: &[],
+                b_eq: &[],
+                bounds: &[(Some(0.0), Some(1.0)); 2],
+            },
+            MilpOptions::default(),
+        )
+        .unwrap();
+        assert!(result.success, "{result:?}");
+        assert_eq!(result.x, vec![0.0, 1.0], "{result:?}");
+        assert_eq!(result.fun, -1.000_000_000_1);
+    }
+
+    #[test]
+    fn milp_gap_controls_and_empty_integer_domains_are_validated() {
+        for gap in [-1.0, f64::NAN, f64::INFINITY] {
+            for options in [
+                MilpOptions {
+                    mip_rel_gap: gap,
+                    ..Default::default()
+                },
+                MilpOptions {
+                    mip_abs_gap: gap,
+                    ..Default::default()
+                },
+            ] {
+                assert!(
+                    milp(
+                        MilpProblem {
+                            c: &[1.0],
+                            integrality: &[],
+                            a_ub: &[],
+                            b_ub: &[],
+                            a_eq: &[],
+                            b_eq: &[],
+                            bounds: &[],
+                        },
+                        options
+                    )
+                    .is_err()
+                );
+            }
+        }
+        let empty = one_variable_milp(
+            Integrality::Integer,
+            1.0,
+            (Some(0.2), Some(0.8)),
+            None,
+            None,
+            MilpOptions::default(),
+        );
+        assert_eq!(empty.status, 2);
+        assert_eq!(empty.mip_node_count, 0);
+        assert!(empty.x.is_empty());
+        assert!(empty.fun.is_nan());
+        assert_eq!(super::milp_relative_gap(1e308, -1e308), 2.0);
+        assert_eq!(super::milp_relative_gap(0.0, 0.0), 0.0);
+        assert!(super::milp_relative_gap(0.0, -1.0).is_infinite());
+    }
+
     fn one_variable_milp(
         kind: Integrality,
         cost: f64,
@@ -8001,8 +8445,7 @@ mod tests {
         assert!(matches!(err, crate::OptError::InvalidArgument { .. }));
     }
 
-    // MilpOptions has exactly two fields and both are solver budgets:
-    // `max_nodes` (covered above) and `lp_maxiter`. `linprog` follows SciPy and
+    // `max_nodes` (covered above) and `lp_maxiter` are solver budgets. `linprog` follows SciPy and
     // answers maxiter == Some(0) with an iteration-limit result (status 1), so milp
     // rejects a zero LP budget itself. Without that check a zero LP iteration
     // budget would silently become a synthetic result -- exactly the failure mode
