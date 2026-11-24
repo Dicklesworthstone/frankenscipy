@@ -1630,12 +1630,14 @@ impl From<OdeSolverAction> for SolverKind {
     }
 }
 
-/// Finite-difference Jacobian stiffness probe at `(t0, y0)` (`frankenscipy-7tb8d.9`).
+/// Jacobian stiffness probe at `(t0, y0)` (`frankenscipy-7tb8d.9`).
 ///
 /// # Formula
-/// 1. Evaluates $f_0 = f(t_0, y_0)$ and $n$ forward-difference columns
+/// 1. Uses a supplied dense or sparse analytic Jacobian, with one Jacobian evaluation
+///    and no RHS evaluations. Sparse callbacks retain CSC storage throughout the probe.
+///    Without an analytic callback, evaluates $f_0 = f(t_0, y_0)$ and $n$ forward-difference columns
 ///    $J_{:,j} = (f(t_0, y_0 + \delta_j e_j) - f_0) / \delta_j$ ($n + 1$ RHS evaluations total,
-///    counted in [`SolveIvpResult::nfev`]). With `jac_sparsity` and no analytic `jac`, columns
+///    counted in [`SolveIvpResult::nfev`]). With `jac_sparsity` and no analytic callback, columns
 ///    with disjoint row supports are perturbed together: one RHS call per color plus $f_0$,
 ///    and only declared nonzeros are stored. The derivative and power-iteration formulas
 ///    are unchanged.
@@ -1666,8 +1668,12 @@ pub struct OdeStiffnessProbe {
     /// Combined stiffness ratio estimate fed into [`OdeSolverPortfolio`].
     pub stiffness_ratio_estimate: f64,
     /// RHS evaluations consumed by the probe: $n + 1$ for dense differences,
-    /// `jac_sparsity.group_count() + 1` for grouped differences, or $0$ when skipped.
+    /// `jac_sparsity.group_count() + 1` for grouped differences, or $0$ for an
+    /// analytic Jacobian. A skipped probe retains evaluations already made.
     pub probe_nfev: usize,
+    /// Analytic Jacobian evaluations consumed by the probe, counted in the
+    /// complete CASP result's `njev`. Numerical differences count only in `nfev`.
+    pub probe_njev: usize,
 }
 
 impl Default for OdeStiffnessProbe {
@@ -1679,17 +1685,59 @@ impl Default for OdeStiffnessProbe {
             step_bound_ratio: 0.0,
             stiffness_ratio_estimate: 1.0,
             probe_nfev: 0,
+            probe_njev: 0,
         }
     }
 }
 
-/// Probe the ODE right-hand side at `(t0, y0)` using $n + 1$ finite-difference evaluations and
-/// $\le 20$ power iterations (`frankenscipy-7tb8d.9`).
-/// A supplied `jac_sparsity` without `jac` reduces the evaluations to one per color plus
-/// the initial RHS and uses storage proportional to its nonzeros. Invalid inputs, including
-/// a pattern of the wrong dimension, return a skipped probe; CASP solve entry points reject
-/// a mismatched pattern with [`IntegrateValidationError::InvalidJacobianSparsity`].
+#[derive(Default)]
+struct ProbeEvaluations {
+    nfev: usize,
+    njev: usize,
+}
+
+/// Preserve ordinary norm arithmetic, using a scaled fallback when squaring
+/// finite Jacobian entries or power-iteration vectors loses their range.
+fn stiffness_probe_norm(values: impl Iterator<Item = f64> + Clone) -> f64 {
+    let squared = values.clone().map(|value| value * value).sum::<f64>();
+    if squared.is_finite()
+        && (squared >= f64::MIN_POSITIVE
+            || (squared == 0.0 && values.clone().all(|value| value == 0.0)))
+    {
+        squared.sqrt()
+    } else {
+        values.fold(0.0, f64::hypot)
+    }
+}
+
+/// Probe the initial Jacobian using an analytic callback when available, otherwise
+/// finite differences, followed by $\le 20$ power iterations (`frankenscipy-7tb8d.9`).
+/// Analytic callbacks take precedence over `jac_sparsity`; sparse callbacks require
+/// storage proportional to their nonzeros and make no RHS calls. Without a callback,
+/// `jac_sparsity` reduces the evaluations to one per color plus the initial RHS.
+/// Invalid inputs return a skipped probe, retaining any evaluation counts. The CASP
+/// solve entry points return the corresponding validation error and audit it instead.
+/// Packed LSODA Jacobians are not supported by the CASP portfolio; use `solve_ivp`
+/// with `method = Lsoda` for that callback format.
 pub fn probe_ode_stiffness<F>(fun: &mut F, options: &SolveIvpOptions<'_>) -> OdeStiffnessProbe
+where
+    F: FnMut(f64, &[f64]) -> Vec<f64>,
+{
+    let mut evaluations = ProbeEvaluations::default();
+    probe_ode_stiffness_checked(fun, options, &mut evaluations).unwrap_or_else(|_| {
+        OdeStiffnessProbe {
+            probe_nfev: evaluations.nfev,
+            probe_njev: evaluations.njev,
+            ..OdeStiffnessProbe::default()
+        }
+    })
+}
+
+fn probe_ode_stiffness_checked<F>(
+    fun: &mut F,
+    options: &SolveIvpOptions<'_>,
+    evaluations: &mut ProbeEvaluations,
+) -> Result<OdeStiffnessProbe, IntegrateValidationError>
 where
     F: FnMut(f64, &[f64]) -> Vec<f64>,
 {
@@ -1704,36 +1752,74 @@ where
         || !options.rtol.is_finite()
         || options.rtol <= 0.0
     {
-        return OdeStiffnessProbe::default();
+        return Ok(OdeStiffnessProbe::default());
     }
     if let Some(first_step) = options.first_step
         && (!first_step.is_finite() || first_step <= 0.0)
     {
-        return OdeStiffnessProbe::default();
+        return Ok(OdeStiffnessProbe::default());
     }
     let span = (tf - t0).abs();
     if span == 0.0 {
-        return OdeStiffnessProbe::default();
+        return Ok(OdeStiffnessProbe::default());
+    }
+
+    if options.jac.is_some() && options.jac_sparse.is_some() {
+        return Err(IntegrateValidationError::ConflictingJacobians);
+    }
+    if options.jac.is_some()
+        && options.method == SolverKind::Lsoda
+        && (options.lband.is_some() || options.uband.is_some())
+    {
+        // CASP selects among RK23/RK45/DOP853/BDF/Radau, none of which accepts
+        // LSODA's packed band callback. Do not reinterpret it as a dense Jacobian.
+        return Err(IntegrateValidationError::NotYetImplemented {
+            function: "CASP with a packed LSODA Jacobian",
+        });
     }
 
     let pattern = options
         .jac_sparsity
         .filter(|_| options.jac.is_none() && options.jac_sparse.is_none());
     if pattern.is_some_and(|pattern| pattern.dimension() != n) {
-        return OdeStiffnessProbe::default();
+        return Ok(OdeStiffnessProbe::default());
     }
 
-    let f0 = fun(t0, options.y0);
-    if f0.len() != n || f0.iter().any(|v| !v.is_finite()) {
-        return OdeStiffnessProbe {
-            probe_nfev: 1,
-            ..OdeStiffnessProbe::default()
-        };
-    }
+    let analytic_dense = if let Some(jac) = options.jac {
+        evaluations.njev += 1;
+        Some(crate::validation::evaluate_jacobian(jac, t0, options.y0)?)
+    } else {
+        None
+    };
+    let analytic_sparse = if let Some(jac) = options.jac_sparse {
+        evaluations.njev += 1;
+        Some(crate::bdf::evaluate_sparse_jacobian(
+            jac,
+            t0,
+            options.y0,
+            options.mode,
+        )?)
+    } else {
+        None
+    };
+
+    let f0 = if analytic_dense.is_some() || analytic_sparse.is_some() {
+        Vec::new()
+    } else {
+        let f0 = fun(t0, options.y0);
+        evaluations.nfev += 1;
+        if f0.len() != n || f0.iter().any(|v| !v.is_finite()) {
+            return Ok(OdeStiffnessProbe {
+                probe_nfev: evaluations.nfev,
+                ..OdeStiffnessProbe::default()
+            });
+        }
+        f0
+    };
 
     let sqrt_eps = 1.490_116_119_384_765_6e-8_f64;
     let mut y_pert = options.y0.to_vec();
-    let mut jac = if pattern.is_none() {
+    let mut jac = if pattern.is_none() && analytic_sparse.is_none() {
         vec![0.0_f64; n * n]
     } else {
         Vec::new()
@@ -1746,7 +1832,7 @@ where
             .collect::<Vec<_>>()
     });
     let mut col_norms = vec![0.0_f64; n];
-    let mut probe_nfev = 1usize;
+    let mut probe_nfev = evaluations.nfev;
 
     let deltas: Vec<f64> = options
         .y0
@@ -1764,7 +1850,22 @@ where
         })
         .collect();
 
-    if let (Some(pattern), Some(columns)) = (pattern, sparse_jac.as_mut()) {
+    if let Some(matrix) = analytic_sparse.as_ref() {
+        for (j, norm) in col_norms.iter_mut().enumerate() {
+            *norm = stiffness_probe_norm(
+                matrix.data()[matrix.indptr()[j]..matrix.indptr()[j + 1]]
+                    .iter()
+                    .copied(),
+            );
+        }
+    } else if let Some(matrix) = analytic_dense {
+        for j in 0..n {
+            for i in 0..n {
+                jac[i * n + j] = matrix[(i, j)];
+            }
+            col_norms[j] = stiffness_probe_norm((0..n).map(|i| jac[i * n + j]));
+        }
+    } else if let (Some(pattern), Some(columns)) = (pattern, sparse_jac.as_mut()) {
         for group in pattern.column_groups() {
             for &j in group {
                 y_pert[j] = options.y0[j] + deltas[j];
@@ -1775,10 +1876,10 @@ where
                 y_pert[j] = options.y0[j];
             }
             if f_pert.len() != n {
-                return OdeStiffnessProbe {
+                return Ok(OdeStiffnessProbe {
                     probe_nfev,
                     ..OdeStiffnessProbe::default()
-                };
+                });
             }
             for &j in group {
                 let mut col_sq = 0.0_f64;
@@ -1798,10 +1899,10 @@ where
             probe_nfev += 1;
             y_pert[j] = options.y0[j];
             if f_pert.len() != n {
-                return OdeStiffnessProbe {
+                return Ok(OdeStiffnessProbe {
                     probe_nfev,
                     ..OdeStiffnessProbe::default()
-                };
+                });
             }
             let mut col_sq = 0.0_f64;
             for i in 0..n {
@@ -1834,17 +1935,22 @@ where
     let mut rho_power = 0.0_f64;
     let mut w = vec![0.0_f64; n];
     for _iter in 0..20 {
-        let mut w_sq = 0.0_f64;
-        if let (Some(pattern), Some(columns)) = (pattern, sparse_jac.as_ref()) {
+        if let Some(matrix) = analytic_sparse.as_ref() {
+            w.fill(0.0);
+            // Ascending CSC columns preserve each dense row's summation order
+            // without materializing any of the structural zeros.
+            for (j, &vj) in v.iter().enumerate() {
+                for k in matrix.indptr()[j]..matrix.indptr()[j + 1] {
+                    w[matrix.indices()[k]] += matrix.data()[k] * vj;
+                }
+            }
+        } else if let (Some(pattern), Some(columns)) = (pattern, sparse_jac.as_ref()) {
             w.fill(0.0);
             // Ascending columns preserve the dense path's summation order in each row.
             for (j, (rows, values)) in pattern.column_rows.iter().zip(columns).enumerate() {
                 for (&i, &value) in rows.iter().zip(values) {
                     w[i] += value * v[j];
                 }
-            }
-            for &value in &w {
-                w_sq += value * value;
             }
         } else {
             for i in 0..n {
@@ -1854,11 +1960,10 @@ where
                     s += row[j] * v[j];
                 }
                 w[i] = s;
-                w_sq += s * s;
             }
         }
-        let w_norm = w_sq.sqrt();
-        if !w_norm.is_finite() || w_norm <= 1e-300 {
+        let w_norm = stiffness_probe_norm(w.iter().copied());
+        if !w_norm.is_finite() || w_norm == 0.0 {
             rho_power = 0.0;
             break;
         }
@@ -1872,7 +1977,18 @@ where
         }
     }
 
-    let max_diag = if let (Some(pattern), Some(columns)) = (pattern, sparse_jac.as_ref()) {
+    let max_diag = if let Some(matrix) = analytic_sparse.as_ref() {
+        (0..n)
+            .filter_map(|j| {
+                let start = matrix.indptr()[j];
+                let end = matrix.indptr()[j + 1];
+                matrix.indices()[start..end]
+                    .binary_search(&j)
+                    .ok()
+                    .map(|k| matrix.data()[start + k].abs())
+            })
+            .fold(0.0_f64, f64::max)
+    } else if let (Some(pattern), Some(columns)) = (pattern, sparse_jac.as_ref()) {
         pattern
             .column_rows
             .iter()
@@ -1908,14 +2024,15 @@ where
         stiffness_indicator.max(1e-6)
     };
 
-    OdeStiffnessProbe {
+    Ok(OdeStiffnessProbe {
         spectral_radius,
         span,
         stiffness_indicator,
         step_bound_ratio,
         stiffness_ratio_estimate,
         probe_nfev,
-    }
+        probe_njev: evaluations.njev,
+    })
 }
 
 std::thread_local! {
@@ -1951,6 +2068,9 @@ pub struct OdePortfolioResult {
 /// Probes the initial Jacobian at `(t0, y0)`, selects among `DOP853`, `RK45`, `RK23`, `BDF`,
 /// and `Radau`, monitors the per-step Hairer-Wanner embedded-pair stiffness test during explicit
 /// stepping, retries with the next action on failure, and feeds the conformal calibrator once per call.
+/// An analytic sparse Jacobian restricts both attempts to BDF and Radau, which
+/// preserve its storage. Probe RHS and analytic-Jacobian evaluations are included
+/// in the returned `nfev` and `njev` respectively.
 /// If either the options or the portfolio requests Hardened mode, every attempted solver
 /// runs in Hardened mode, including validation and resource budgets.
 pub fn solve_ivp_with_casp_portfolio<F>(
@@ -2041,7 +2161,11 @@ where
     {
         pattern.validate_dimension(resolved_opts.y0.len())?;
     }
-    let probe = probe_ode_stiffness(fun, &resolved_opts);
+    let probe = probe_ode_stiffness_checked(
+        fun,
+        &resolved_opts,
+        &mut ProbeEvaluations::default(),
+    )?;
     let mut effective_stiffness =
         if stiffness_ratio_estimate.is_finite() && stiffness_ratio_estimate > 0.0 {
             if stiffness_ratio_estimate < 1.0 && probe.stiffness_ratio_estimate <= 10.0 {
@@ -2056,8 +2180,22 @@ where
         };
 
     let conformal_fallback_used = portfolio.calibrator().should_fallback();
+    let incompatible_actions = if resolved_opts.jac_sparse.is_some() {
+        vec![
+            OdeSolverAction::RK45,
+            OdeSolverAction::RK23,
+            OdeSolverAction::DOP853,
+        ]
+    } else {
+        Vec::new()
+    };
     let (mut action, mut posterior, mut expected_losses, mut chosen_loss) =
-        portfolio.select_action_with_tol(effective_stiffness, is_algebraic_dae, options.rtol);
+        portfolio.select_action_excluding(
+            effective_stiffness,
+            is_algebraic_dae,
+            options.rtol,
+            &incompatible_actions,
+        );
 
     resolved_opts.method = action.into();
 
@@ -2081,6 +2219,7 @@ where
     let mut attempts = vec![(action, res.success)];
     let fallback_active = if res.success {
         res.nfev += probe.probe_nfev;
+        res.njev += probe.probe_njev;
         portfolio.observe_step(true);
         portfolio.record_evidence(OdeSolverEvidenceEntry {
             component: "fsci-integrate",
@@ -2098,6 +2237,8 @@ where
         // First attempt failed or triggered Hairer-Wanner stiffness abort: record the failed
         // first attempt (without double-feeding the calibrator) and retry with the next action.
         let mut accumulated_nfev = probe.probe_nfev + res.nfev;
+        let mut accumulated_njev = probe.probe_njev + res.njev;
+        let mut accumulated_nlu = res.nlu;
         portfolio.observe_step(false);
         portfolio.push_evidence_only(OdeSolverEvidenceEntry {
             component: "fsci-integrate",
@@ -2111,7 +2252,8 @@ where
             step_rejections: Some(diag.step_rejections.max(1)),
         });
 
-        let mut excluded = vec![action];
+        let mut excluded = incompatible_actions;
+        excluded.push(action);
         if diag.hw_aborted || (is_explicit && !forced_fail) {
             effective_stiffness = effective_stiffness.max(1e5);
             for exp_action in [
@@ -2141,7 +2283,11 @@ where
         let (mut retry_res, _retry_diag) =
             solve_ivp_impl_with_diag(fun, &resolved_opts, audit, None)?;
         accumulated_nfev += retry_res.nfev;
+        accumulated_njev += retry_res.njev;
+        accumulated_nlu += retry_res.nlu;
         retry_res.nfev = accumulated_nfev;
+        retry_res.njev = accumulated_njev;
+        retry_res.nlu = accumulated_nlu;
         attempts.push((action, retry_res.success));
         res = retry_res;
 
@@ -2208,11 +2354,14 @@ where
 
 /// Solve an initial value problem using CASP condition-aware portfolio selection.
 ///
-/// Probes the initial Jacobian at `(t0, y0)` using one base evaluation plus one per column
-/// (or sparsity color), then at most 20 power iterations. Selects among `DOP853`, `RK45`,
+/// Probes the initial Jacobian at `(t0, y0)` using a supplied analytic callback, or
+/// one base RHS evaluation plus one per column (or sparsity color) for finite differences.
+/// At most 20 power iterations estimate stiffness. Selects among `DOP853`, `RK45`,
 /// `RK23`, `BDF`, and `Radau` via Bayesian
 /// expected-loss minimization, monitors the per-step Hairer-Wanner stiffness detector during
 /// explicit stepping, and feeds the conformal calibrator once per call (`frankenscipy-7tb8d.9`).
+/// An analytic sparse Jacobian restricts selection and retry to BDF or Radau.
+/// Probe evaluations are included in the returned `nfev` and `njev`.
 pub fn solve_ivp_with_casp<F>(
     fun: &mut F,
     options: &SolveIvpOptions<'_>,
@@ -5360,16 +5509,283 @@ mod tests {
             jac_sparsity: Some(&ignored_pattern),
             ..SolveIvpOptions::default()
         };
-        let mut rhs = |_t: f64, y: &[f64]| y.iter().map(|value| -2.0 * value).collect();
-        let probe = probe_ode_stiffness(&mut rhs, &options);
-        assert_eq!(
-            probe.probe_nfev, 3,
-            "analytic jac disables the sparsity hint"
+        let probe = probe_ode_stiffness(
+            &mut |_t, _y| panic!("analytic probes must not evaluate the RHS"),
+            &options,
         );
+        assert_eq!(probe.probe_nfev, 0);
+        assert_eq!(probe.probe_njev, 1);
+        assert!((probe.spectral_radius - 2.0).abs() < 1e-14);
+        let mut rhs = |_t: f64, y: &[f64]| y.iter().map(|value| -2.0 * value).collect();
         let mut portfolio = OdeSolverPortfolio::new(RuntimeMode::Strict, 4);
         let result = solve_ivp_with_casp(&mut rhs, &options, &mut portfolio)
             .expect("ignored sparsity pattern must not invalidate a usable Jacobian");
         assert!(result.result.success);
+    }
+
+    #[test]
+    fn casp_sparse_analytic_probe_scales_to_twenty_thousand_states() {
+        fn jacobian(_t: f64, y: &[f64]) -> fsci_sparse::CscMatrix {
+            IMPLICIT_JAC_CALLS.with(|calls| calls.set(calls.get() + 1));
+            let n = y.len();
+            fsci_sparse::CscMatrix::from_components(
+                fsci_sparse::Shape2D::new(n, n),
+                vec![-2.0; n],
+                (0..n).collect(),
+                (0..=n).collect(),
+                true,
+            )
+            .unwrap()
+        }
+        IMPLICIT_JAC_CALLS.with(|calls| calls.set(0));
+        let y0 = vec![1.0; 20_000];
+        let probe = probe_ode_stiffness(
+            &mut |_t, _y| panic!("a sparse analytic probe must not use finite differences"),
+            &SolveIvpOptions {
+                t_span: (0.0, 1.0),
+                y0: &y0,
+                jac_sparse: Some(jacobian),
+                ..SolveIvpOptions::default()
+            },
+        );
+        assert_eq!(probe.probe_nfev, 0);
+        assert_eq!(probe.probe_njev, 1);
+        assert_eq!(IMPLICIT_JAC_CALLS.with(|calls| calls.get()), 1);
+        assert!((probe.spectral_radius - 2.0).abs() < 1e-12);
+        assert!((probe.stiffness_indicator - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn casp_sparse_analytic_probe_matches_dense_after_canonicalizing_duplicates() {
+        fn dense(_t: f64, _y: &[f64]) -> Vec<Vec<f64>> {
+            vec![vec![-3.0, 1.0, 0.0], vec![1.0, -4.0, 1.0], vec![0.0, 1.0, -5.0]]
+        }
+        fn sparse(_t: f64, _y: &[f64]) -> fsci_sparse::CscMatrix {
+            fsci_sparse::CscMatrix::from_components(
+                fsci_sparse::Shape2D::new(3, 3),
+                vec![1.0, -1.0, -2.0, 1.0, 1.0, -4.0, -5.0, 1.0],
+                vec![1, 0, 0, 2, 0, 1, 2, 1],
+                vec![0, 3, 6, 8],
+                false,
+            )
+            .unwrap()
+        }
+        let ignored_pattern = crate::JacobianSparsity::from_rows(&[vec![0]]).unwrap();
+        for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+            let options = SolveIvpOptions {
+                t_span: (0.0, 2.0),
+                y0: &[1.0, 2.0, 3.0],
+                jac_sparsity: Some(&ignored_pattern),
+                mode,
+                ..SolveIvpOptions::default()
+            };
+            let dense_probe = probe_ode_stiffness(
+                &mut |_t, _y| panic!("dense analytic probe must not call RHS"),
+                &SolveIvpOptions { jac: Some(dense), ..options.clone() },
+            );
+            let sparse_probe = probe_ode_stiffness(
+                &mut |_t, _y| panic!("sparse analytic probe must not call RHS"),
+                &SolveIvpOptions { jac_sparse: Some(sparse), ..options },
+            );
+            assert_eq!(sparse_probe, dense_probe);
+            assert!(sparse_probe.spectral_radius > 5.0);
+            assert_eq!(sparse_probe.probe_nfev, 0);
+            assert_eq!(sparse_probe.probe_njev, 1);
+        }
+    }
+
+    #[test]
+    fn casp_sparse_analytic_selection_and_retry_preserve_callbacks_and_counts() {
+        fn jacobian(_t: f64, _y: &[f64]) -> fsci_sparse::CscMatrix {
+            IMPLICIT_JAC_CALLS.with(|calls| calls.set(calls.get() + 1));
+            fsci_sparse::CscMatrix::from_components(
+                fsci_sparse::Shape2D::new(2, 2),
+                vec![-2.0, -2.0],
+                vec![0, 1],
+                vec![0, 1, 2],
+                true,
+            )
+            .unwrap()
+        }
+        for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+            for force_retry in [false, true] {
+                IMPLICIT_JAC_CALLS.with(|calls| calls.set(0));
+                let mut rhs_calls = 0;
+                let mut portfolio = OdeSolverPortfolio::new(mode, 8);
+                let options = SolveIvpOptions {
+                    t_span: (0.0, 0.2),
+                    y0: &[1.0, 2.0],
+                    jac_sparse: Some(jacobian),
+                    rtol: 1e-7,
+                    atol: ToleranceValue::Scalar(1e-10),
+                    mode,
+                    ..SolveIvpOptions::default()
+                };
+                if force_retry {
+                    force_next_casp_first_attempt_failure();
+                }
+                let result = solve_ivp_with_casp(
+                    &mut |_t, y| {
+                        rhs_calls += 1;
+                        vec![-2.0 * y[0], -2.0 * y[1]]
+                    },
+                    &options,
+                    &mut portfolio,
+                )
+                .expect("CASP must select solvers that accept the supplied sparse Jacobian");
+                assert!(result.result.success, "{mode:?}: {}", result.result.message);
+                assert_eq!(result.attempts.len(), if force_retry { 2 } else { 1 });
+                assert!(result.attempts.iter().all(|(action, _)| matches!(
+                    action, OdeSolverAction::BDF | OdeSolverAction::Radau
+                )));
+                if force_retry {
+                    assert!(result.fallback_active);
+                    assert_ne!(result.attempts[0].0, result.attempts[1].0);
+                    assert!(!result.attempts[0].1);
+                }
+                assert_eq!(result.result.nfev, rhs_calls);
+                assert_eq!(result.result.njev, IMPLICIT_JAC_CALLS.with(|calls| calls.get()));
+                assert_eq!(result.stiffness_probe.probe_nfev, 0);
+                assert_eq!(result.stiffness_probe.probe_njev, 1);
+                assert!(result.result.njev >= 2);
+                assert!(result.result.nlu > 0);
+                let final_y = result.result.y.last().unwrap();
+                let decay = (-0.4_f64).exp();
+                assert!((final_y[0] - decay).abs() < 2e-6);
+                assert!((final_y[1] - 2.0 * decay).abs() < 4e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn casp_analytic_probe_rejects_malformed_jacobians_and_audits_once() {
+        fn wrong_dense(_t: f64, _y: &[f64]) -> Vec<Vec<f64>> {
+            vec![vec![1.0, 2.0]]
+        }
+        fn nonfinite_dense(_t: f64, _y: &[f64]) -> Vec<Vec<f64>> {
+            vec![vec![f64::NAN]]
+        }
+        fn wrong_sparse(_t: f64, _y: &[f64]) -> fsci_sparse::CscMatrix {
+            fsci_sparse::CscMatrix::from_components(
+                fsci_sparse::Shape2D::new(0, 0), vec![], vec![], vec![0], true,
+            ).unwrap()
+        }
+        fn nonfinite_sparse(_t: f64, _y: &[f64]) -> fsci_sparse::CscMatrix {
+            fsci_sparse::CscMatrix::from_components(
+                fsci_sparse::Shape2D::new(1, 1),
+                vec![f64::INFINITY], vec![0], vec![0, 1], true,
+            ).unwrap()
+        }
+        fn overflowing_duplicates(_t: f64, _y: &[f64]) -> fsci_sparse::CscMatrix {
+            fsci_sparse::CscMatrix::from_components(
+                fsci_sparse::Shape2D::new(1, 1),
+                vec![f64::MAX, f64::MAX], vec![0, 0], vec![0, 2], false,
+            ).unwrap()
+        }
+        for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+            for (jac, jac_sparse, error) in [
+                (Some(wrong_dense as JacFn), None, IntegrateValidationError::JacobianWrongShape { expected: 1 }),
+                (Some(nonfinite_dense as JacFn), None, IntegrateValidationError::NonFiniteJacobian),
+                (None, Some(wrong_sparse as crate::SparseJacFn), IntegrateValidationError::JacobianWrongShape { expected: 1 }),
+                (None, Some(nonfinite_sparse as crate::SparseJacFn), IntegrateValidationError::NonFiniteJacobian),
+                (None, Some(overflowing_duplicates as crate::SparseJacFn), IntegrateValidationError::NonFiniteJacobian),
+            ] {
+                let options = SolveIvpOptions {
+                    t_span: (0.0, 1.0), y0: &[1.0], jac, jac_sparse, mode,
+                    ..SolveIvpOptions::default()
+                };
+                let skipped = probe_ode_stiffness(
+                    &mut |_t, _y| panic!("invalid analytic callback must not evaluate RHS"),
+                    &options,
+                );
+                assert_eq!(skipped, OdeStiffnessProbe {
+                    probe_njev: 1, ..OdeStiffnessProbe::default()
+                });
+                let ledger = crate::validation::sync_audit_ledger();
+                let mut portfolio = OdeSolverPortfolio::new(mode, 4);
+                let returned = solve_ivp_with_casp_portfolio_and_audit(
+                    &mut |_t, _y| panic!("invalid analytic callback must fail before solving"),
+                    &options, &mut portfolio, 0.0, false, &ledger,
+                ).unwrap_err();
+                assert_eq!(returned, error);
+                assert_eq!(portfolio.evidence_len(), 0);
+                let guard = ledger.lock().unwrap();
+                assert_eq!(guard.len(), 1);
+                assert!(matches!(
+                    &guard.entries()[0].action,
+                    fsci_runtime::AuditAction::FailClosed { reason }
+                        if reason == error.reason_code()
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn casp_analytic_probe_preserves_extreme_finite_jacobian_scales() {
+        fn dense(_t: f64, y: &[f64]) -> Vec<Vec<f64>> {
+            let scale = y[0];
+            vec![vec![-2.0 * scale, scale], vec![scale, -2.0 * scale]]
+        }
+        fn sparse(_t: f64, y: &[f64]) -> fsci_sparse::CscMatrix {
+            let scale = y[0];
+            fsci_sparse::CscMatrix::from_components(
+                fsci_sparse::Shape2D::new(2, 2),
+                vec![-2.0 * scale, scale, scale, -2.0 * scale],
+                vec![0, 1, 0, 1],
+                vec![0, 2, 4],
+                true,
+            )
+            .unwrap()
+        }
+        for scale in [1e-310, 1e-200, 1e200] {
+            let y0 = [scale, 1.0];
+            let options = SolveIvpOptions {
+                t_span: (0.0, 1.0), y0: &y0,
+                ..SolveIvpOptions::default()
+            };
+            let dense_probe = probe_ode_stiffness(
+                &mut |_t, _y| panic!("analytic probe must not call RHS"),
+                &SolveIvpOptions { jac: Some(dense), ..options.clone() },
+            );
+            let sparse_probe = probe_ode_stiffness(
+                &mut |_t, _y| panic!("analytic probe must not call RHS"),
+                &SolveIvpOptions { jac_sparse: Some(sparse), ..options },
+            );
+            assert_eq!(sparse_probe, dense_probe);
+            assert!((dense_probe.spectral_radius / scale - 3.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn casp_rejects_conflicting_or_packed_jacobians_before_evaluating_callbacks() {
+        fn dense(_t: f64, _y: &[f64]) -> Vec<Vec<f64>> {
+            panic!("unsupported callback options must fail before evaluation");
+        }
+        fn sparse(_t: f64, _y: &[f64]) -> fsci_sparse::CscMatrix {
+            panic!("conflicting callback options must fail before evaluation");
+        }
+        for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+            for (jac_sparse, method, lband, error) in [
+                (Some(sparse as crate::SparseJacFn), SolverKind::Bdf, None,
+                    IntegrateValidationError::ConflictingJacobians),
+                (None, SolverKind::Lsoda, Some(0),
+                    IntegrateValidationError::NotYetImplemented {
+                        function: "CASP with a packed LSODA Jacobian",
+                    }),
+            ] {
+                let options = SolveIvpOptions {
+                    t_span: (0.0, 1.0), y0: &[1.0], jac: Some(dense),
+                    jac_sparse, method, lband, mode,
+                    ..SolveIvpOptions::default()
+                };
+                let mut portfolio = OdeSolverPortfolio::new(mode, 4);
+                let returned = solve_ivp_with_casp(
+                    &mut |_t, _y| panic!("unsupported options must fail before RHS"),
+                    &options, &mut portfolio,
+                ).unwrap_err();
+                assert_eq!(returned, error);
+            }
+        }
     }
 
     #[test]
