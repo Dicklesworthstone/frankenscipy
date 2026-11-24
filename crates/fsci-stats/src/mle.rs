@@ -550,6 +550,223 @@ fn validate_shape_sample(
     crate::validate_finite_fit_data(data, minimum_sample, family)
 }
 
+#[derive(Clone, Copy)]
+struct StudentTObservation {
+    square: f64,
+    log_square: f64,
+}
+
+impl StudentTObservation {
+    fn ratio(self, df: f64) -> (f64, f64, f64) {
+        let ratio = self.square / df;
+        if ratio.is_finite() {
+            (ratio, ratio.ln_1p(), ratio / (1.0 + ratio))
+        } else {
+            let log_ratio = self.log_square - df.ln();
+            let inverse = (-log_ratio).exp();
+            (ratio, log_ratio + inverse.ln_1p(), 1.0 / (1.0 + inverse))
+        }
+    }
+}
+
+/// (log1p(q)-q/(1+q))/q² and (q-log1p(q))/q² for 0 <= q <= 1/8.
+/// Direct subtraction erases the large-df likelihood score and can turn a
+/// Gaussian-boundary supremum into a spurious finite stationary point.
+fn student_t_log_remainders(q: f64) -> (f64, f64) {
+    let mut score = 0.5;
+    let mut likelihood = 0.5;
+    let mut power = -q;
+    for order in 3..=24 {
+        let term = power / f64::from(order);
+        score += f64::from(order - 1) * term;
+        likelihood += term;
+        power *= -q;
+    }
+    (score, likelihood)
+}
+
+/// Positive rescaling of the mean log-likelihood derivative: 2*df*l' below
+/// df=1, and 2*df²*l' above it. Neither scaling can introduce a root.
+fn student_t_shape_score(sample: &[StudentTObservation], df: f64) -> f64 {
+    let normalization = if df < 1.0 {
+        1.0 + df * (crate::digamma(0.5 * (df + 1.0)) - crate::digamma(1.0 + 0.5 * df))
+    } else if df >= 64.0 {
+        let squared = (1.0 / df).powi(2);
+        0.5 + squared * (-0.25 + squared * (0.5 + squared * (-17.0 / 8.0 + 15.5 * squared)))
+    } else {
+        df * (df * (crate::digamma(0.5 * (df + 1.0)) - crate::digamma(0.5 * df)) - 1.0)
+    };
+    normalization
+        + compensated_mean(
+            sample.iter().map(|&observation| {
+                let (q, logarithm, fraction) = observation.ratio(df);
+                if df < 1.0 {
+                    fraction - df * (logarithm - fraction)
+                } else if q <= 0.125 {
+                    let (remainder, _) = student_t_log_remainders(q);
+                    observation.square
+                        * (1.0 / (1.0 + q) - observation.square * remainder)
+                } else {
+                    df * (fraction - df * (logarithm - fraction))
+                }
+            }),
+            sample.len(),
+        )
+}
+
+/// Certify the sign of the score for EVERY larger df, so neither a finite
+/// maximum nor the Gaussian limit is replaced by an arbitrary search cap.
+fn student_t_score_tail_resolved(sample: &[StudentTObservation], df: f64) -> bool {
+    if df < 1.0 {
+        return false;
+    }
+    // A(df) = ψ((df+1)/2)-ψ(df/2)-1/df
+    //       = integral exp(-df*t)*tanh(t/2) dt.
+    // Thus 1/2-1/(4*df²) <= df²*A(df) <= 1/2. Also, with r=q/(1+q),
+    // r²/2 <= log1p(q)-r <= q²/2. Write u=df*r; u increases toward x²
+    // as df grows, and u-u²/2 attains its maximum at u=1.
+    let lower_terms = sample.iter().map(|&observation| {
+        let (_, _, fraction) = observation.ratio(df);
+        let u = df * fraction;
+        u - 0.5 * observation.square * observation.square
+    });
+    let lower = 0.5 - 0.25 * (1.0 / df).powi(2)
+        + compensated_mean(lower_terms, sample.len());
+    let upper_terms = sample.iter().map(|&observation| {
+        let (_, _, fraction) = observation.ratio(df);
+        let u = df * fraction;
+        if observation.square <= 1.0 {
+            observation.square * (1.0 - 0.5 * observation.square)
+        } else if u >= 1.0 {
+            u * (1.0 - 0.5 * u)
+        } else {
+            0.5
+        }
+    });
+    let upper = 0.5 + compensated_mean(upper_terms, sample.len());
+    // Terms capable of cancelling either bound are at most order one;
+    // reserve roundoff headroom before certifying a sign.
+    let margin = 64.0 * f64::EPSILON;
+    lower > margin || upper < -margin
+}
+
+/// Standardized Student's t MLE. A geometric profile brackets likelihood
+/// maxima, bisection solves their score equations, and the normal limit is
+/// compared explicitly. Location and scale are fixed by the concrete type.
+pub(crate) fn student_t_shape_mle(data: &[f64]) -> Result<f64, FitError> {
+    validate_shape_sample(data, 1, "StudentT")?;
+    let sample: Vec<_> = data
+        .iter()
+        .map(|&x| StudentTObservation {
+            square: x * x,
+            log_square: 2.0 * x.abs().ln(),
+        })
+        .collect();
+    let finite_normal_likelihood = sample.iter().all(|value| value.square.is_finite());
+    let advantage = |df: f64| {
+        if finite_normal_likelihood {
+            let adjustment = crate::student_t_log_normalization_adjustment(df);
+            compensated_mean(
+                sample.iter().zip(data).map(|(&observation, &x)| {
+                    let (q, logarithm, _) = observation.ratio(df);
+                    if q <= 0.125 {
+                        let (_, remainder) = student_t_log_remainders(q);
+                        adjustment
+                            + 0.5 * (observation.square * q * remainder - logarithm)
+                    } else {
+                        adjustment + 0.5 * observation.square
+                            - crate::student_t_log_kernel(df, x)
+                    }
+                }),
+                sample.len(),
+            )
+        } else {
+            // A finite t likelihood always beats the -infinite normal
+            // likelihood, but candidate t maxima must still be compared.
+            let distribution = crate::StudentT { df };
+            compensated_mean(data.iter().map(|&x| distribution.logpdf(x)), data.len())
+        }
+    };
+
+    let largest_log_square = sample
+        .iter()
+        .map(|value| value.log_square)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let mut df = 1.0_f64;
+    loop {
+        let log_ratio = largest_log_square - df.ln();
+        let largest_logarithm = log_ratio.max(0.0) + (-log_ratio.abs()).exp().ln_1p();
+        // For df <= 1, 2*df*l' >= 1-df*(2*ln(2)+max log1p(x²/df)).
+        // The subtracted expression increases with df, so this also excludes
+        // a hidden maximum below our first profile point.
+        if df * (2.0 * std::f64::consts::LN_2 + largest_logarithm) < 0.5 {
+            break;
+        }
+        df *= 0.5;
+    }
+    let mut score = student_t_shape_score(&sample, df);
+    let mut best: Option<(f64, f64)> = None;
+    let mut tail_resolved = false;
+    for _ in 0..4096 {
+        let next = (df * std::f64::consts::SQRT_2).min(f64::MAX);
+        if next == df {
+            break;
+        }
+        let next_score = student_t_shape_score(&sample, next);
+        if score.is_nan() || next_score.is_nan() {
+            return Err(FitError::NonConvergent(
+                "StudentT likelihood score is not numerically defined".into(),
+            ));
+        }
+        if score > 0.0 && next_score <= 0.0 {
+            let (mut lower, mut upper) = (df, next);
+            for _ in 0..80 {
+                let middle = lower + 0.5 * (upper - lower);
+                let middle_score = student_t_shape_score(&sample, middle);
+                if middle_score.is_nan() {
+                    return Err(FitError::NonConvergent(
+                        "StudentT likelihood score is not numerically defined".into(),
+                    ));
+                }
+                if middle_score > 0.0 {
+                    lower = middle;
+                } else {
+                    upper = middle;
+                }
+                if upper / lower - 1.0 <= 1.0e-10 {
+                    break;
+                }
+            }
+            let root = lower + 0.5 * (upper - lower);
+            let value = advantage(root);
+            let distribution = crate::StudentT { df: root };
+            if value.is_finite()
+                && (!finite_normal_likelihood || value > 0.0)
+                && data.iter().all(|&x| distribution.logpdf(x).is_finite())
+                && best.as_ref().is_none_or(|&(_, previous)| value > previous)
+            {
+                best = Some((root, value));
+            }
+        }
+        df = next;
+        score = next_score;
+        if student_t_score_tail_resolved(&sample, df) {
+            tail_resolved = true;
+            break;
+        }
+    }
+    if !tail_resolved {
+        return Err(FitError::NonConvergent(
+            "StudentT likelihood could not be distinguished from its Gaussian boundary".into(),
+        ));
+    }
+    best.map(|(df, _)| df).ok_or_else(|| {
+        FitError::NonConvergent(
+            "StudentT likelihood has no resolved finite maximum above its Gaussian limit".into(),
+        )
+    })
+}
+
 /// Fit Cauchy location and scale. Quartiles provide only the initial guess;
 /// unlike the former estimator, the returned parameters maximize the actual
 /// likelihood. Work in interquartile-range units so an optimizer's absolute

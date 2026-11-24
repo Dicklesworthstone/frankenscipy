@@ -13,7 +13,7 @@ use fsci_stats::{
     CrystalBall, DiscreteDistribution, ExponWeibull, FDistribution, FitError, FoldedCauchy,
     GammaDist, JohnsonSU, Kappa3, Landau, LocationScale, LogSeries, Lognormal, Mielke, MleOptions,
     MleParameter, MleResult, Nakagami, NormInvGauss, Normal, RDist, RandInt, Rice, SkewCauchy,
-    StatsError, Trapezoid, TruncNormal, TruncPareto, TruncWeibullMin, Weibull, Zipfian, fit_mle,
+    StatsError, StudentT, Trapezoid, TruncNormal, TruncPareto, TruncWeibullMin, Weibull, Zipfian, fit_mle,
     fit_mle_censored, fit_mle_location_scale, fit_mle_location_scale_censored,
     with_hardened_stats_caps, with_stats_runtime_mode,
 };
@@ -286,6 +286,225 @@ fn standardized_shape_mles_keep_extreme_and_near_boundary_solutions() {
     let fitted = FoldedNormal::try_fit(&near_boundary).unwrap();
     let expected = (6.0 * f64::EPSILON).sqrt();
     assert!((fitted.c / expected - 1.0).abs() < 1e-12);
+}
+
+#[test]
+fn student_t_mle_solves_the_standardized_likelihood() {
+    // Score roots evaluated independently at 70 decimal digits (mpmath).
+    // The old quantile-ratio estimate could not return any df below one,
+    // and rejected a constant sample even though loc and scale are fixed.
+    for (data, expected_df) in [
+        (vec![7.0, 7.0, 7.0], 0.426_146_305_754_734_5),
+        (vec![-20.0, -2.0, 0.0, 1.0, 100.0], 0.396_291_473_268_043_1),
+        (vec![-2.0, -0.3, 0.0, 0.5, 3.0, 10.0], 0.898_808_574_240_352_6),
+    ] {
+        let fitted = StudentT::try_fit(&data).unwrap();
+        assert!(
+            (fitted.df / expected_df - 1.0).abs() < 2.0e-9,
+            "df={} vs {expected_df}",
+            fitted.df
+        );
+        assert_eq!(fitted, StudentT::fit(&data));
+        let nll = likelihood(&fitted, &data);
+        for factor in [0.5, 2.0] {
+            assert!(likelihood(&StudentT::new(factor * fitted.df), &data) > nll + 1.0e-4);
+        }
+        let step = 1.0e-5_f64;
+        let left = StudentT::new(fitted.df * (-step).exp());
+        let right = StudentT::new(fitted.df * step.exp());
+        let score = (likelihood(&right, &data) - likelihood(&left, &data)) / (2.0 * step);
+        assert!(score.abs() < 1.0e-7, "log-df likelihood score={score}");
+    }
+    // Repeated observations and a single observation are identifiable for
+    // this one-parameter standardized model.
+    let single = StudentT::try_fit(&[7.0]).unwrap();
+    assert!((single.df - 0.426_146_305_754_734_5).abs() < 1.0e-9);
+}
+
+#[test]
+fn student_t_mle_rejects_gaussian_boundary_and_invalid_data() {
+    assert!(matches!(
+        StudentT::try_fit(&[]),
+        Err(FitError::InsufficientData { .. })
+    ));
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(matches!(
+            StudentT::try_fit(&[7.0, bad]),
+            Err(FitError::UnsupportedData(_))
+        ));
+    }
+    for data in [vec![0.0; 3], vec![-1.0, 0.0, 1.0], vec![0.1, 0.3, 0.7]] {
+        assert!(matches!(
+            StudentT::try_fit(&data),
+            Err(FitError::NonConvergent(_))
+        ));
+        assert!(StudentT::fit(&data).df.is_nan());
+    }
+    with_stats_runtime_mode(RuntimeMode::Hardened, || {
+        with_hardened_stats_caps(2, 2, || {
+            assert!(matches!(
+                StudentT::try_fit(&[7.0; 3]),
+                Err(FitError::ResourceExhausted { .. })
+            ));
+            assert!(StudentT::try_fit(&[7.0; 2]).is_ok());
+        });
+    });
+}
+
+#[test]
+fn student_t_mle_retains_extreme_tails_and_large_finite_degrees_of_freedom() {
+    let data = [-1.0e200, 0.0, 1.0e200];
+    let fitted = StudentT::try_fit(&data).unwrap();
+    let expected = 0.002_693_896_956_872_523_3;
+    assert!((fitted.df / expected - 1.0).abs() < 2.0e-9);
+    assert!(likelihood(&fitted, &data).is_finite());
+    assert!((StudentT::try_fit(&[1.0e200, 0.0, 1.0e200]).unwrap().df - fitted.df).abs() < 1.0e-12);
+
+    // 100-digit score roots for the exact binary64 observations. These have
+    // finite MLEs close to, but distinct from, the Gaussian boundary.
+    for (x, expected_df) in [
+        (1.5538, 31_058.007_225_042_71),
+        (1.553774, 31_124_588.279_881_88),
+        (1.553773975, 833_335_612.053_296_3),
+    ] {
+        let fitted = StudentT::try_fit(&[x]).unwrap();
+        assert!(
+            (fitted.df / expected_df - 1.0).abs() < 2.0e-6,
+            "x={x}: df={} vs {expected_df}",
+            fitted.df
+        );
+    }
+}
+
+#[test]
+fn student_t_density_keeps_finite_power_law_tails_and_the_gaussian_limit() {
+    // 70-digit references, with 450 digits for df=1e300 and the least
+    // positive subnormal df to resolve the log-gamma difference.
+    for (df, x, expected) in [
+        (0.5, 1.0e200, -692.605_921_209_545_2),
+        (1.0e10, 1.0, -1.418_938_533_254_672_7),
+        (1.0e300, 2.0, -2.918_938_533_204_672_7),
+        (1.0e-300, 1.0e-160, -346.080_911_129_666_8),
+        (f64::from_bits(1), 1.0, -745.133_219_101_941_2),
+        (f64::from_bits(1), 0.0, -372.913_183_141_250_6),
+    ] {
+        let distribution = StudentT::new(df);
+        let actual = distribution.logpdf(x);
+        assert!(
+            (actual - expected).abs() < 2.0e-12,
+            "df={df:e}, x={x:e}: {actual} vs {expected}"
+        );
+        assert_eq!(actual, distribution.logpdf(-x));
+        let density = distribution.pdf(x);
+        let reference = expected.exp();
+        assert!(
+            (density - reference).abs() <= 2.0e-12 * reference + f64::from_bits(1),
+            "df={df:e}, x={x:e}: density={density:e} vs {reference:e}"
+        );
+        let points = [-1.0e200, -2.0, 0.0, 1.0, 1.0e200];
+        let densities = distribution.pdf_many(&points);
+        let log_densities = distribution.logpdf_many(&points);
+        for (index, &point) in points.iter().enumerate() {
+            assert_eq!(densities[index].to_bits(), distribution.pdf(point).to_bits());
+            assert_eq!(log_densities[index].to_bits(), distribution.logpdf(point).to_bits());
+        }
+        assert_eq!(distribution.logpdf(f64::INFINITY), f64::NEG_INFINITY);
+        assert_eq!(distribution.logpdf(f64::NEG_INFINITY), f64::NEG_INFINITY);
+        assert!(distribution.logpdf(f64::NAN).is_nan());
+    }
+    let normal = Normal::new(0.0, 1.0);
+    let gaussian_limit = StudentT::new(f64::INFINITY);
+    for x in [-4.0, 0.0, 1.0, 10.0] {
+        assert!((gaussian_limit.logpdf(x) - normal.logpdf(x)).abs() < 1.0e-13);
+    }
+}
+
+#[test]
+fn student_t_mle_matches_live_scipy_with_fixed_location_and_scale() {
+    let python = std::env::var("FSCI_PYTHON").unwrap_or_else(|_| "python3".into());
+    let required = std::env::var("FSCI_REQUIRE_SCIPY_ORACLE").as_deref() == Ok("1");
+    let available = Command::new(&python)
+        .args(["-c", "import numpy; import scipy"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !available {
+        assert!(!required, "required SciPy oracle is unavailable via {python}");
+        eprintln!("SKIP StudentT MLE: SciPy oracle unavailable; compared cases = 0");
+        return;
+    }
+    let script = r#"
+import os
+import numpy as np
+import scipy
+from scipy import stats, optimize
+print('versions', scipy.__version__, np.__version__)
+if os.environ.get('FSCI_REQUIRE_SCIPY_ORACLE') == '1':
+    assert (scipy.__version__, np.__version__) == ('1.17.1', '2.4.3')
+def accurate_fit(fun, start, args=(), disp=0):
+    return optimize.fmin(fun, start, args=args, disp=disp,
+                         xtol=1e-10, ftol=1e-10, maxiter=2000, maxfun=8000)
+datasets = [stats.t.rvs(df, size=2000,
+                       random_state=np.random.default_rng(85400 + case))
+            for case, df in enumerate([.15, .5, 1., 2., 8., 30.])]
+datasets.extend([np.array([7., 7., 7.]), np.array([-20., -2., 0., 1., 100.]),
+                 np.array([-2., -.3, 0., .5, 3., 10.])])
+for case, data in enumerate(datasets):
+    candidates = [stats.t.fit(data, start, floc=0, fscale=1,
+                              optimizer=accurate_fit)
+                  for start in [.1, 1., 10.]]
+    fitted = min(candidates, key=lambda p: -stats.t.logpdf(data, *p).sum())
+    assert fitted[1:] == (0, 1)
+    nll = -stats.t.logpdf(data, *fitted).sum()
+    assert np.isfinite(nll) and fitted[0] > 0
+    print(case, format(fitted[0], '.17g'), format(nll, '.17g'))
+    print(' '.join(format(x, '.17g') for x in data))
+"#;
+    let output = Command::new(&python).args(["-c", script]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "SciPy StudentT MLE oracle failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut lines = stdout.lines();
+    let versions = lines.next().expect("oracle version metadata");
+    eprintln!("StudentT MLE oracle {versions}");
+    if required {
+        assert_eq!(versions, "versions 1.17.1 2.4.3");
+    }
+    let mut compared = 0;
+    while let Some(header) = lines.next() {
+        let fields: Vec<_> = header.split_whitespace().collect();
+        assert_eq!(fields.len(), 3, "malformed oracle header");
+        let case: usize = fields[0].parse().unwrap();
+        let expected_df: f64 = fields[1].parse().unwrap();
+        let expected_nll: f64 = fields[2].parse().unwrap();
+        let data: Vec<f64> = lines
+            .next()
+            .expect("oracle observations")
+            .split_whitespace()
+            .map(|value| value.parse().unwrap())
+            .collect();
+        assert_eq!(data.len(), if case < 6 { 2000 } else { [3, 5, 6][case - 6] });
+        let fitted = StudentT::try_fit(&data).unwrap();
+        let nll = likelihood(&fitted, &data);
+        assert!(
+            (fitted.df / expected_df - 1.0).abs() < 1.0e-5,
+            "case {case}: df {} vs {expected_df}",
+            fitted.df
+        );
+        assert!(
+            (nll - expected_nll).abs() <= 1.0e-10 * expected_nll.abs().max(1.0),
+            "case {case}: NLL {nll} vs {expected_nll}"
+        );
+        eprintln!(
+            "StudentT/{case}: df fsci={:.12e} SciPy={expected_df:.12e}; NLL fsci={nll:.12e} SciPy={expected_nll:.12e}",
+            fitted.df
+        );
+        compared += 1;
+    }
+    assert_eq!(compared, 9, "all standardized StudentT fits must be compared");
+    eprintln!("StudentT MLE compared cases = {compared}");
 }
 
 #[test]

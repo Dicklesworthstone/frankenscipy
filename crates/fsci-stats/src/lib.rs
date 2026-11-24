@@ -2211,26 +2211,25 @@ impl StudentT {
         Self { df }
     }
 
-    /// Density at many points, hoisting the `gamma_ratio_t(df)` coefficient (a
-    /// gamma-ratio) out of the per-point loop. Byte-identical to mapping `pdf`
-    /// (same `coeff * (...).powf(...)`, coefficient computed once).
+    /// Density at many points, hoisting the logarithmic normalization out of
+    /// the per-point loop. Byte-identical to mapping [`Self::pdf`].
     #[must_use]
     pub fn pdf_many(&self, xs: &[f64]) -> Vec<f64> {
         let v = self.df;
-        let coeff = gamma_ratio_t(v);
+        let log_coeff = log_gamma_ratio_t(v);
         par_continuous_map_min(xs, 65536, |x| {
-            coeff * (1.0 + x * x / v).powf(-0.5 * (v + 1.0))
+            (log_coeff - student_t_log_kernel(v, x)).exp()
         })
     }
 
-    /// Log-density at many points; hoists `gamma_ratio_t(df).ln()` like
+    /// Log-density at many points; hoists the normalization like
     /// [`pdf_many`](Self::pdf_many). Byte-identical to mapping `logpdf`.
     #[must_use]
     pub fn logpdf_many(&self, xs: &[f64]) -> Vec<f64> {
         let v = self.df;
-        let log_coeff = gamma_ratio_t(v).ln();
+        let log_coeff = log_gamma_ratio_t(v);
         par_continuous_map_min(xs, 65536, |x| {
-            log_coeff - 0.5 * (v + 1.0) * (1.0 + x * x / v).ln()
+            log_coeff - student_t_log_kernel(v, x)
         })
     }
 
@@ -2265,16 +2264,11 @@ impl StudentT {
 
 impl ContinuousDistribution for StudentT {
     fn pdf(&self, x: f64) -> f64 {
-        let v = self.df;
-        let coeff = gamma_ratio_t(v);
-        coeff * (1.0 + x * x / v).powf(-0.5 * (v + 1.0))
+        self.logpdf(x).exp()
     }
 
     fn logpdf(&self, x: f64) -> f64 {
-        // log coeff − ½(v+1)·ln(1 + x²/v); finite in the power-law tail where
-        // pdf underflows to 0. frankenscipy-p82v7
-        let v = self.df;
-        gamma_ratio_t(v).ln() - 0.5 * (v + 1.0) * (1.0 + x * x / v).ln()
+        log_gamma_ratio_t(self.df) - student_t_log_kernel(self.df, x)
     }
 
     fn cdf(&self, x: f64) -> f64 {
@@ -2419,100 +2413,20 @@ impl ContinuousDistribution for StudentT {
             - ln_gamma(half_dfp1)
     }
 
+    /// Maximum-likelihood degrees of freedom with location zero and scale one.
+    /// Returns a NaN parameter when no finite maximum exists; use
+    /// [`Self::try_fit`] for a typed error. To fit location and scale too, use
+    /// [`fit_mle_location_scale`].
     fn fit(data: &[f64]) -> Self {
-        fn consider_student_t_df(
-            best_df: &mut f64,
-            best_error: &mut f64,
-            observed_ratio: f64,
-            df: f64,
-        ) {
-            let model = StudentT { df };
-            let model_q75 = model.ppf(0.75);
-            let model_q95 = model.ppf(0.95);
-            if !model_q75.is_finite() || !model_q95.is_finite() || model_q75 <= 0.0 {
-                return;
-            }
-            let error = (model_q95 / model_q75 - observed_ratio).abs();
-            if error < *best_error {
-                *best_error = error;
-                *best_df = df;
-            }
-        }
-
-        if data.is_empty() || data.iter().any(|&x| !x.is_finite()) {
-            return Self { df: f64::NAN };
-        }
-
-        let qs = quantile(data, &[0.5, 0.75, 0.95]);
-        let median = qs[0];
-        let upper_quartile = qs[1];
-        let upper_tail = qs[2];
-        let interquantile = upper_quartile - median;
-        let tail_span = upper_tail - median;
-        if !interquantile.is_finite()
-            || !tail_span.is_finite()
-            || interquantile <= 0.0
-            || tail_span <= 0.0
-        {
-            return Self { df: f64::NAN };
-        }
-
-        let observed_ratio = tail_span / interquantile;
-        let mut best_df = f64::NAN;
-        let mut best_error = f64::INFINITY;
-
-        // Match a scale-free upper-tail quantile ratio so arbitrary loc/scale factors cancel out.
-        for step in 0..=796 {
-            consider_student_t_df(
-                &mut best_df,
-                &mut best_error,
-                observed_ratio,
-                1.0 + 0.25 * step as f64,
-            );
-        }
-        for &df in &[250.0, 500.0, 1.0e3, 1.0e4, 1.0e6] {
-            consider_student_t_df(&mut best_df, &mut best_error, observed_ratio, df);
-        }
-        if best_df.is_finite() {
-            let start = (best_df - 1.0).max(1.01);
-            let end = (best_df + 1.0).min(1.0e6);
-            let mut df = start;
-            while df <= end {
-                consider_student_t_df(&mut best_df, &mut best_error, observed_ratio, df);
-                df += 0.01;
-            }
-        }
-
-        Self {
-            df: if best_df.is_finite() && best_df > 0.0 {
-                best_df
-            } else {
-                f64::NAN
-            },
-        }
+        Self::try_fit(data).unwrap_or(Self { df: f64::NAN })
     }
 
+    /// Fit the standardized Student's t likelihood over all positive degrees
+    /// of freedom, including values below one. A likelihood whose supremum is
+    /// attained only in the Gaussian limit returns [`FitError::NonConvergent`]
+    /// instead of reporting an arbitrary finite upper bound as an estimate.
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        if data.len() < 3 {
-            return Err(FitError::InsufficientData {
-                required: 3,
-                actual: data.len(),
-            });
-        }
-        if let Some(&x) = data.iter().find(|&&x| !x.is_finite()) {
-            return Err(FitError::UnsupportedData(format!(
-                "StudentT fit data contains non-finite value: {x}"
-            )));
-        }
-
-        let fitted = Self::fit(data);
-        if fitted.df.is_finite() && fitted.df > 0.0 {
-            Ok(fitted)
-        } else {
-            Err(FitError::NonConvergent(
-                "StudentT fit could not estimate positive degrees of freedom".to_owned(),
-            ))
-        }
+        mle::student_t_shape_mle(data).map(|df| Self { df })
     }
 
     fn skewness(&self) -> f64 {
@@ -17528,11 +17442,63 @@ fn standard_normal_ppf_as241(p: f64) -> f64 {
     if q < 0.0 { -result } else { result }
 }
 
-/// Gamma function ratio for Student's t PDF coefficient.
-fn gamma_ratio_t(v: f64) -> f64 {
-    // Γ((v+1)/2) / (sqrt(v*π) * Γ(v/2))
-    let ln_coeff = ln_gamma(0.5 * (v + 1.0)) - ln_gamma(0.5 * v) - 0.5 * (v * PI).ln();
-    ln_coeff.exp()
+/// Log of the Student's t normalization relative to the standard normal.
+/// The Stirling difference avoids subtracting two large log-gammas near the
+/// Gaussian limit. The first omitted term is 691/(88*v^11).
+fn student_t_log_normalization_adjustment(v: f64) -> f64 {
+    if v >= 64.0 {
+        let inverse = 1.0 / v;
+        let squared = inverse * inverse;
+        inverse
+            * (-0.25
+                + squared
+                    * (1.0 / 24.0
+                        + squared
+                            * (-1.0 / 20.0
+                                + squared * (17.0 / 112.0 - squared * (31.0 / 36.0)))))
+    } else {
+        log_gamma_ratio_t(v) + 0.5 * (2.0 * PI).ln()
+    }
+}
+
+/// Log Γ((v+1)/2) − log Γ(v/2) − log(v*π)/2, including subnormal v.
+fn log_gamma_ratio_t(v: f64) -> f64 {
+    if v >= 64.0 {
+        -0.5 * (2.0 * PI).ln() + student_t_log_normalization_adjustment(v)
+    } else if v > 0.0 && v <= 1.0 {
+        // Γ(v/2) = Γ(1+v/2)/(v/2); do not form a possibly underflowed v/2
+        // inside the logarithm or multiply v by π before taking its log.
+        ln_gamma(0.5 * (v + 1.0)) - ln_gamma(1.0 + 0.5 * v) + 0.5 * v.ln()
+            - std::f64::consts::LN_2
+            - 0.5 * PI.ln()
+    } else {
+        ln_gamma(0.5 * (v + 1.0)) - ln_gamma(0.5 * v) - 0.5 * (v.ln() + PI.ln())
+    }
+}
+
+/// The nonnegative Student's t log-density penalty, (v+1)*log1p(x*x/v)/2.
+fn student_t_log_kernel(v: f64, x: f64) -> f64 {
+    if v == f64::INFINITY {
+        return (0.5 * x) * x;
+    }
+    let scaled = x / v.sqrt();
+    let ratio = scaled * scaled;
+    let logarithm = if ratio.is_finite() {
+        ratio.ln_1p()
+    } else {
+        // x*x and x*x/v may overflow although the logarithm and, for heavy
+        // tails, even the density itself are perfectly representable.
+        let log_ratio = 2.0 * x.abs().ln() - v.ln();
+        log_ratio + (-log_ratio).exp().ln_1p()
+    };
+    if ratio <= 0.125 {
+        // Keep the x*x term before multiplying a tiny ratio by a huge v.
+        // This also preserves the Gaussian limit when 1+x*x/v rounds to 1.
+        let correction = if ratio == 0.0 { 1.0 } else { logarithm / ratio };
+        0.5 * (x * x) * correction + 0.5 * logarithm
+    } else {
+        (0.5 * v + 0.5) * logarithm
+    }
 }
 
 fn ln_gamma(x: f64) -> f64 {
@@ -85381,19 +85347,21 @@ mod tests {
     }
 
     #[test]
-    fn test_fit_student_t_recovers_quantile_grid() {
+    fn test_fit_student_t_maximizes_likelihood_on_quantile_grid() {
         let reference = StudentT::new(8.0);
         let data: Vec<f64> = (1..200).map(|i| reference.ppf(i as f64 / 200.0)).collect();
         let fitted = StudentT::fit(&data);
         assert!(fitted.df.is_finite(), "student t fit should be finite");
-        assert_close(fitted.df, reference.df, 3.0, "student t fit df");
+        // This grid omits both tails, so its standardized MLE differs from
+        // the generating df. The score root is 11.7845302414.
+        assert_close(fitted.df, 11.7845302414, 1e-5, "student t MLE df");
     }
 
     #[test]
     fn test_fit_student_t_fail_closed_for_invalid_samples() {
         assert!(StudentT::fit(&[]).df.is_nan());
         assert!(StudentT::fit(&[1.0, f64::NAN, 3.0]).df.is_nan());
-        assert!(StudentT::fit(&[7.0, 7.0, 7.0]).df.is_nan());
+        assert!(StudentT::fit(&[0.0, 0.0, 0.0]).df.is_nan());
     }
 
     #[test]
@@ -85451,7 +85419,7 @@ mod tests {
             Err(FitError::UnsupportedData(_))
         ));
         assert!(matches!(
-            StudentT::try_fit(&[7.0, 7.0, 7.0]),
+            StudentT::try_fit(&[0.0, 0.0, 0.0]),
             Err(FitError::NonConvergent(_))
         ));
     }
