@@ -17,6 +17,7 @@ pub mod covariance;
 mod landau;
 mod levy_stable;
 pub mod mle;
+mod permutation;
 pub mod qmc;
 
 pub use audit::{
@@ -27,6 +28,10 @@ pub use covariance::Covariance;
 pub use mle::{
     LocationScale, MleOptions, MleParameter, MleResult, fit_mle, fit_mle_censored,
     fit_mle_discrete, fit_mle_location_scale, fit_mle_location_scale_censored,
+};
+pub use permutation::{
+    PermutationAlternative, PermutationTestOptions, PermutationTestResult, PermutationType,
+    permutation_test_samples,
 };
 pub use qmc::{
     DiscrepancyMethod, GeometricDiscrepancyMethod, HaltonSampler, LatinHypercubeSampler,
@@ -56033,7 +56038,7 @@ fn validate_resampling_controls(
 /// a time, so batching does not change their result or allocation profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PermutationMethod {
-    /// Number of random permutations.
+    /// Resampling budget; smaller finite permutation spaces are enumerated exactly.
     pub n_resamples: usize,
     /// Optional vectorized-callback batch size.
     pub batch: Option<usize>,
@@ -56058,19 +56063,45 @@ impl PermutationMethod {
         validate_resampling_controls(self.n_resamples, self.batch)
     }
 
-    /// Run the existing two-sample permutation engine with this configuration.
+    /// Run a two-sided independent-sample permutation test.
+    /// Invalid samples and statistics return a typed error.
     pub fn test<F>(&self, x: &[f64], y: &[f64], statistic: F) -> Result<(f64, f64), StatsError>
     where
         F: Fn(&[f64], &[f64]) -> f64 + Sync,
     {
+        self.test_samples(
+            &[x, y],
+            |samples| statistic(samples[0], samples[1]),
+            PermutationType::Independent,
+            PermutationAlternative::TwoSided,
+        )
+        .map(|result| (result.statistic, result.pvalue))
+    }
+
+    /// Test one or more samples with an explicit permutation type and alternative,
+    /// retaining the null distribution. Uses the active stats runtime mode.
+    pub fn test_samples<F>(
+        &self,
+        data: &[&[f64]],
+        statistic: F,
+        permutation_type: PermutationType,
+        alternative: PermutationAlternative,
+    ) -> Result<PermutationTestResult, StatsError>
+    where
+        F: Fn(&[&[f64]]) -> f64 + Sync,
+    {
         self.validate()?;
-        Ok(permutation_test(
-            x,
-            y,
+        permutation_test_samples(
+            data,
             statistic,
-            self.n_resamples,
-            self.rng,
-        ))
+            PermutationTestOptions {
+                permutation_type,
+                alternative,
+                n_resamples: self.n_resamples,
+                rng: self.rng,
+                mode: active_stats_mode(),
+            },
+        )
     }
 }
 
@@ -56242,9 +56273,13 @@ impl Default for BootstrapMethod {
     }
 }
 
-/// Permutation test: estimate p-value by random permutation.
+/// Two-sided permutation test for two independent samples.
 ///
-/// Matches `scipy.stats.permutation_test` (simplified).
+/// Enumerates the exact null distribution when its size does not exceed
+/// n_permutations; otherwise uses that many reproducible random permutations.
+/// The p-value is twice the smaller inclusive tail probability. Invalid input
+/// returns a pair of NaNs; use permutation_test_samples or PermutationMethod::test
+/// for typed errors and additional permutation modes.
 pub fn permutation_test<F>(
     x: &[f64],
     y: &[f64],
@@ -56255,77 +56290,18 @@ pub fn permutation_test<F>(
 where
     F: Fn(&[f64], &[f64]) -> f64 + Sync,
 {
-    if x.is_empty()
-        || y.is_empty()
-        || n_permutations == 0
-        || x.iter().any(|v| v.is_nan())
-        || y.iter().any(|v| v.is_nan())
-    {
-        return (f64::NAN, f64::NAN);
-    }
-    let observed = stat_fn(x, y);
-    let obs_abs = observed.abs();
-    let nx = x.len();
-    let n = x.len() + y.len();
-    let combined: Vec<f64> = x.iter().chain(y.iter()).cloned().collect();
-    const A: u64 = 6364136223846793005;
-
-    // Permutation `p` is a pure function of (seed, p): reset to the original sample, jump the RNG to
-    // `p·(n−1)` advances, then run the same Fisher–Yates stream. Deterministic AND thread-count-
-    // independent (unlike a cumulative serial shuffle), so the fan-out below changes nothing observable.
-    let do_chunk = |p_start: usize, p_end: usize, buf: &mut [f64]| -> usize {
-        let mut cnt = 0usize;
-        for p in p_start..p_end {
-            buf.copy_from_slice(&combined);
-            // Jump the shared LCG to permutation p's start (p·(n−1) advances) → independent & reproducible.
-            let (jm, jc) = lcg_jump(A, 1, p * (n - 1));
-            let mut rng = jm.wrapping_mul(seed).wrapping_add(jc);
-            for i in (1..n).rev() {
-                rng = rng.wrapping_mul(A).wrapping_add(1);
-                let j = (rng >> 33) as usize % (i + 1);
-                buf.swap(i, j);
-            }
-            if stat_fn(&buf[..nx], &buf[nx..]).abs() >= obs_abs {
-                cnt += 1;
-            }
-        }
-        cnt
-    };
-
-    let cores = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1);
-    let work = (n as u64).saturating_mul(n_permutations as u64);
-    // ~128 permutations / thread minimum amortizes the ~1.5ms 64-thread spawn floor (see thread-cap memory)
-    let nthreads = if n_permutations < 256 || work < (1 << 18) || cores <= 1 {
-        1
-    } else {
-        cores.min((n_permutations / 128).max(1))
-    };
-
-    let count_extreme = if nthreads <= 1 {
-        let mut buf = combined.clone();
-        do_chunk(0, n_permutations, &mut buf)
-    } else {
-        let chunk = n_permutations.div_ceil(nthreads);
-        let do_chunk = &do_chunk;
-        let mut buffers: Vec<Vec<f64>> = (0..nthreads).map(|_| combined.clone()).collect();
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = buffers
-                .iter_mut()
-                .enumerate()
-                .map(|(t, buf)| {
-                    let start = (t * chunk).min(n_permutations);
-                    let end = ((t + 1) * chunk).min(n_permutations);
-                    scope.spawn(move || do_chunk(start, end, buf.as_mut_slice()))
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).sum()
-        })
-    };
-
-    let pvalue = (count_extreme + 1) as f64 / (n_permutations + 1) as f64;
-    (observed, pvalue)
+    permutation_test_samples(
+        &[x, y],
+        |samples| stat_fn(samples[0], samples[1]),
+        PermutationTestOptions {
+            n_resamples: n_permutations,
+            rng: seed,
+            mode: active_stats_mode(),
+            ..PermutationTestOptions::default()
+        },
+    )
+    .map(|result| (result.statistic, result.pvalue))
+    .unwrap_or((f64::NAN, f64::NAN))
 }
 
 /// Mode-aware and audit-emitting permutation test (`frankenscipy-3cu8u.4`, `frankenscipy-3cu8u.5`).
@@ -56364,9 +56340,27 @@ where
     let max_len = hardened_max_pairwise_len();
     let eff_x = validate_or_project_sample("x", x, max_len, options, ledger, &fp)?;
     let eff_y = validate_or_project_sample("y", y, max_len, options, ledger, &fp)?;
-    run_with_special_guard(options, ledger, &fp, || {
-        permutation_test(&eff_x, &eff_y, stat_fn, n_permutations, seed)
-    })
+    let result = run_with_special_guard(options, ledger, &fp, || {
+        permutation_test_samples(
+            &[eff_x.as_ref(), eff_y.as_ref()],
+            |samples| stat_fn(samples[0], samples[1]),
+            PermutationTestOptions {
+                n_resamples: n_permutations,
+                rng: seed,
+                mode: options.mode,
+                ..PermutationTestOptions::default()
+            },
+        )
+    })?;
+    match result {
+        Ok(result) => Ok((result.statistic, result.pvalue)),
+        Err(err) => {
+            if let Some(ledger) = ledger {
+                record_fail_closed(ledger, &fp, err.reason_code(), &format!("rejected: {err}"));
+            }
+            Err(err)
+        }
+    }
 }
 
 /// Monte Carlo hypothesis test result.
@@ -56455,16 +56449,12 @@ where
         out
     };
 
-    let count_extreme = match alternative {
-        "greater" => null_dist.iter().filter(|&&s| s >= observed).count(),
-        "less" => null_dist.iter().filter(|&&s| s <= observed).count(),
-        _ => null_dist
-            .iter()
-            .filter(|&&s| s.abs() >= observed.abs())
-            .count(),
+    let alternative = match alternative {
+        "greater" => PermutationAlternative::Greater,
+        "less" => PermutationAlternative::Less,
+        _ => PermutationAlternative::TwoSided,
     };
-
-    let pvalue = (count_extreme + 1) as f64 / (n_resamples + 1) as f64;
+    let pvalue = permutation::resampling_pvalue(observed, &null_dist, false, alternative);
 
     MonteCarloTestResult {
         statistic: observed,
@@ -113070,10 +113060,7 @@ mod tests {
             (statistic - (-3.0)).abs() < 1e-10,
             "permutation_test statistic got {statistic}, expected -3.0"
         );
-        assert!(
-            (pvalue - 0.1).abs() < 0.02,
-            "permutation_test pvalue got {pvalue}, expected ~0.1"
-        );
+        assert_eq!(pvalue, 0.1, "all 20 distinct partitions are enumerated");
     }
 
     // ── scipy conformance tests for distributions ───────────────────────
