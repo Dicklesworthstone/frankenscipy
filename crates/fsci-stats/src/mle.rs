@@ -1201,7 +1201,8 @@ pub(crate) fn skew_normal_shape_mle(data: &[f64]) -> Result<f64, FitError> {
                 // Subtracting log Phi(z) from -z²/2 loses this ratio
                 // in the far negative tail.
                 log_mills_zero
-                    - fsci_special::erfcx_scalar(-z * std::f64::consts::FRAC_1_SQRT_2).ln()
+                    - fsci_special::convenience::erfcx_scalar(-z * std::f64::consts::FRAC_1_SQRT_2)
+                        .ln()
             } else {
                 -0.5 * z * z - log_sqrt_two_pi - fsci_special::log_ndtr_scalar(z)
             };
@@ -1327,6 +1328,253 @@ pub(crate) fn erlang_mle(data: &[f64]) -> Result<crate::Erlang, FitError> {
         ));
     }
     Ok(crate::Erlang { k, rate })
+}
+
+/// Log density of the positive Poisson/Gamma mixture. The internal df=0
+/// case is its continuous limiting density, used only to detect an unattained
+/// fitting boundary; it does not make zero degrees of freedom a valid model.
+pub(crate) fn noncentral_chi_squared_log_density(df: f64, nc: f64, x: f64) -> f64 {
+    use std::f64::consts::LN_2;
+
+    if x.is_nan() || !df.is_finite() || df < 0.0 || !nc.is_finite() || nc < 0.0 {
+        return f64::NAN;
+    }
+    if x < 0.0 || x == f64::INFINITY {
+        return f64::NEG_INFINITY;
+    }
+    if nc == 0.0 {
+        return if df > 0.0 {
+            crate::ChiSquared::new(df).logpdf(x)
+        } else {
+            f64::NEG_INFINITY
+        };
+    }
+    if x == 0.0 {
+        return if df == 2.0 {
+            -LN_2 - 0.5 * nc
+        } else if df < 2.0 {
+            f64::INFINITY
+        } else {
+            f64::NEG_INFINITY
+        };
+    }
+
+    let a = 0.5 * df;
+    let offset = a - 1.0;
+    let log_x_half = x.ln() - LN_2;
+    let log_nc_half = nc.ln() - LN_2;
+    let log_product = log_x_half + log_nc_half;
+    let root_x = x.sqrt();
+    let root_nc = nc.sqrt();
+    let z = root_x * root_nc;
+    // The scaled Bessel kernel is accurate in its Hankel regime. Combining
+    // its exponential with the density avoids both exp(z) overflow and
+    // catastrophic cancellation in -(x+nc)/2 + sqrt(x*nc).
+    if z > 100.0 && z.is_finite() && z > offset * offset {
+        let scaled_bessel = fsci_special::ive_scalar(offset, z);
+        if scaled_bessel > 0.0 && scaled_bessel.is_finite() {
+            let difference = (x - nc) / (root_x + root_nc);
+            return -0.5 * difference * difference
+                + 0.5 * offset * (x.ln() - nc.ln())
+                + scaled_bessel.ln()
+                - LN_2;
+        }
+    }
+
+    // t_k = Pois(k; nc/2) * Gamma(x; a+k, scale=2).
+    // t_k/t_(k-1) = (nc*x/4)/(k*(a+k-1)), so this locates a
+    // mode of the *density* mixture rather than the Poisson weights alone.
+    let hypotenuse = offset.hypot(z);
+    let root = if offset >= 0.0 {
+        0.5 * z * (z / (hypotenuse + offset))
+    } else {
+        0.5 * (hypotenuse - offset)
+    };
+    if !root.is_finite() || root >= 4_503_599_627_370_496.0 {
+        return f64::NAN;
+    }
+    let minimum = if a == 0.0 { 1.0 } else { 0.0 };
+    let mut mode = root.floor().max(minimum);
+    // Rounding a-1 to -1 can lose a tiny shape at the zero/one boundary.
+    // Verify adjacent ratios in logs before choosing the anchor.
+    for _ in 0..4 {
+        if mode > minimum && mode.ln() + (a + (mode - 1.0)).ln() > log_product {
+            mode -= 1.0;
+        } else if log_product > (mode + 1.0).ln() + (a + mode).ln() {
+            mode += 1.0;
+        } else {
+            break;
+        }
+    }
+    let shape = a + mode;
+    let anchor = mode * log_nc_half - 0.5 * nc - crate::ln_gamma(mode + 1.0)
+        + (shape - 1.0) * log_x_half
+        - 0.5 * x
+        - crate::ln_gamma(shape)
+        - LN_2;
+    if !anchor.is_finite() {
+        return anchor;
+    }
+
+    let product = (0.5 * x) * (0.5 * nc);
+    let mut sum = 1.0;
+    let mut correction = 0.0;
+    // Both tails have decreasing ratios away from the mode. The stopping
+    // bound controls the *remaining* tail, including ratios close to one.
+    // Failure to sum a wide mixture is explicit, never a partial likelihood.
+    for upward in [false, true] {
+        let mut k = mode;
+        let mut term = 1.0;
+        let mut complete = false;
+        for _ in 0..20_000 {
+            if !upward && k == minimum {
+                complete = true;
+                break;
+            }
+            let factor = if upward {
+                (k + 1.0) * (a + k)
+            } else {
+                k * (a + (k - 1.0))
+            };
+            let ratio =
+                if product > 0.0 && product.is_finite() && factor > 0.0 && factor.is_finite() {
+                    if upward {
+                        product / factor
+                    } else {
+                        factor / product
+                    }
+                } else if upward {
+                    (log_product - (k + 1.0).ln() - (a + k).ln()).exp()
+                } else {
+                    (k.ln() + (a + (k - 1.0)).ln() - log_product).exp()
+                };
+            term *= ratio;
+            if !term.is_finite() {
+                return f64::NAN;
+            }
+            let corrected = term - correction;
+            let next = sum + corrected;
+            correction = (next - sum) - corrected;
+            sum = next;
+            k += if upward { 1.0 } else { -1.0 };
+            if term == 0.0 || (ratio < 1.0 && term <= f64::EPSILON * sum * (1.0 - ratio)) {
+                complete = true;
+                break;
+            }
+        }
+        if !complete {
+            return f64::NAN;
+        }
+    }
+    anchor + sum.ln()
+}
+
+/// Joint fixed-location/scale likelihood fit, including the attainable nc=0
+/// boundary and checking the excluded df=0 limiting likelihood. Multiple starts
+/// reduce local-optimizer sensitivity; no global optimum certificate is implied.
+pub(crate) fn noncentral_chi_squared_mle(
+    data: &[f64],
+) -> Result<crate::NoncentralChiSquared, FitError> {
+    validate_shape_sample(data, 2, "NoncentralChiSquared")?;
+    if data.iter().any(|&x| x < 0.0) {
+        return Err(FitError::UnsupportedData(
+            "NoncentralChiSquared support is [0, infinity)".into(),
+        ));
+    }
+    if data.contains(&0.0) {
+        return Err(FitError::NonConvergent(
+            "NoncentralChiSquared likelihood is singular at a zero observation for df < 2".into(),
+        ));
+    }
+    let maximum = data.iter().copied().fold(0.0_f64, f64::max);
+    let normalized_mean = compensated_mean(data.iter().map(|&x| x / maximum), data.len());
+    let mean = maximum * normalized_mean;
+    let central_df = chi_shape_mle(data, 1.0, 2, "NoncentralChiSquared")?;
+    let scale = mean.max(1.0);
+    let make = |p: &[f64]| {
+        let nc = scale * p[1];
+        (p[0] > 0.0 && p[0].is_finite() && nc >= 0.0 && nc.is_finite())
+            .then_some(crate::NoncentralChiSquared { df: p[0], nc })
+    };
+    let options = MleOptions {
+        max_iterations: 1_200,
+        max_evaluations: 3_000,
+        ..MleOptions::default()
+    };
+    let mut best = fit_mle(
+        data,
+        &[MleParameter::Fixed(central_df), MleParameter::Fixed(0.0)],
+        make,
+        options,
+    )?;
+    let variance = maximum
+        * (maximum
+            * compensated_mean(
+                data.iter()
+                    .map(|&x| (x / maximum - normalized_mean).powi(2)),
+                data.len(),
+            ));
+    let moment_nc = 0.5 * variance - mean;
+    let moment_df = 2.0 * mean - 0.5 * variance;
+    let mut starts = vec![
+        (central_df, 0.0),
+        (0.5 * mean, 0.5 * mean),
+        (0.1 * mean, 0.9 * mean),
+    ];
+    if moment_df > 0.0 && moment_df.is_finite() && moment_nc >= 0.0 && moment_nc.is_finite() {
+        starts.push((moment_df, moment_nc));
+    }
+    for (df, nc) in starts {
+        if df <= 0.0 || !df.is_finite() {
+            continue;
+        }
+        if let Ok(candidate) = fit_mle(
+            data,
+            &[
+                MleParameter::Positive(df),
+                MleParameter::Bounded {
+                    initial: nc / scale,
+                    lower: 0.0,
+                    upper: f64::INFINITY,
+                },
+            ],
+            make,
+            options,
+        ) {
+            let tolerance =
+                32.0 * f64::EPSILON * (data.len() as f64 + best.negative_log_likelihood.abs());
+            if candidate.negative_log_likelihood < best.negative_log_likelihood - tolerance {
+                best = candidate;
+            }
+        }
+    }
+
+    // df=0 has an atom at zero plus a continuous positive density. Since all
+    // observations are strictly positive, only that continuous part belongs in
+    // this limiting comparison. Never return this excluded model as a fit.
+    let boundary = fit_mle(
+        data,
+        &[MleParameter::Positive(mean.max(2.0) / scale)],
+        |p| {
+            let nc = scale * p[0];
+            (nc > 0.0 && nc.is_finite()).then_some(crate::NoncentralChiSquared { df: 0.0, nc })
+        },
+        options,
+    )?;
+    let tolerance = 32.0 * f64::EPSILON * (data.len() as f64 + best.negative_log_likelihood.abs());
+    if boundary.negative_log_likelihood <= best.negative_log_likelihood + tolerance {
+        return Err(FitError::NonConvergent(
+            "NoncentralChiSquared likelihood has no resolved finite maximum above the excluded df=0 boundary"
+                .into(),
+        ));
+    }
+    if best.distribution.nc == 0.0 && mean > central_df * (1.0 + 1e-9) {
+        return Err(FitError::NonConvergent(
+            "NoncentralChiSquared optimization failed to improve the positive noncentrality score"
+                .into(),
+        ));
+    }
+    Ok(best.distribution)
 }
 
 /// With location zero and scale one, the asymmetric Laplace likelihood is

@@ -18,7 +18,8 @@ use fsci_stats::{
     with_hardened_stats_caps, with_stats_runtime_mode,
 };
 use fsci_stats::{
-    Cauchy, DoubleGamma, Erlang, ExponNorm, FoldedNormal, LaplaceAsymmetric, SkewNorm,
+    Cauchy, DoubleGamma, Erlang, ExponNorm, FoldedNormal, LaplaceAsymmetric, NoncentralChiSquared,
+    SkewNorm,
 };
 use rand::{SeedableRng, rngs::StdRng};
 
@@ -61,6 +62,7 @@ cases = [
     ('foldnorm', stats.foldnorm, [(0.0,), (0.8,), (8.0,)]),
     ('skewnorm', stats.skewnorm, [(-5.0,), (0.0,), (4.0,)]),
     ('erlang', stats.erlang, [(1,), (4,), (30,)]),
+    ('ncx2', stats.ncx2, [(1.0, 0.5), (5.0, 2.0), (100.0, 200.0)]),
 ]
 for family_index, (name, dist, shapes) in enumerate(cases):
     for case_index, shape in enumerate(shapes):
@@ -99,6 +101,148 @@ fn likelihood<D: ContinuousDistribution>(distribution: &D, data: &[f64]) -> f64 
 
 fn discrete_likelihood<D: DiscreteDistribution>(distribution: &D, data: &[i64]) -> f64 {
     -data.iter().map(|&x| distribution.logpmf(x)).sum::<f64>()
+}
+
+#[test]
+fn noncentral_chi_squared_mle_fits_interior_and_central_boundaries() {
+    for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+        with_stats_runtime_mode(mode, || {
+            // Underdispersion gives a negative moment estimate for nc.
+            // Its constrained likelihood instead has an attained central fit.
+            let central_data = [9.8, 9.9, 10.0, 10.1, 10.2];
+            let fitted = NoncentralChiSquared::try_fit(&central_data).unwrap();
+            assert_eq!(fitted.nc, 0.0);
+            assert_eq!(fitted.df, ChiSquared::try_fit(&central_data).unwrap().df);
+            assert!((likelihood(&fitted, &central_data) - 12.044_664_477_8).abs() < 1e-9);
+            assert_eq!(fitted, NoncentralChiSquared::fit(&central_data));
+
+            // Variance > 4*mean made the old moment fit reject this valid
+            // positive sample. Independent SciPy multi-start likelihood fit.
+            let data = [0.1_f64, 0.2, 0.4, 0.8, 1.6, 3.2, 6.4, 12.8];
+            let mean = data.iter().sum::<f64>() / data.len() as f64;
+            let variance = data.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / data.len() as f64;
+            assert!(variance > 4.0 * mean);
+            let fitted = NoncentralChiSquared::try_fit(&data).unwrap();
+            assert!(fitted.df > 0.0 && fitted.nc > 0.0);
+            let nll = likelihood(&fitted, &data);
+            assert!((nll - 17.005_520_165_5).abs() < 1e-8);
+            let central = NoncentralChiSquared::new(ChiSquared::try_fit(&data).unwrap().df, 0.0);
+            assert!(nll < likelihood(&central, &data) - 0.1);
+            for factor in [0.95, 1.05] {
+                assert!(
+                    nll < likelihood(
+                        &NoncentralChiSquared::new(fitted.df * factor, fitted.nc),
+                        &data
+                    )
+                );
+                assert!(
+                    nll < likelihood(
+                        &NoncentralChiSquared::new(fitted.df, fitted.nc * factor),
+                        &data
+                    )
+                );
+            }
+
+            let small = [0.001, 0.01, 0.1, 0.5, 1.0, 3.0];
+            let fitted = NoncentralChiSquared::try_fit(&small).unwrap();
+            assert!(fitted.df > 0.0 && fitted.nc > 0.0);
+            assert!((likelihood(&fitted, &small) - 0.636_474_065).abs() < 1e-8);
+        });
+    }
+}
+
+#[test]
+fn noncentral_chi_squared_density_keeps_large_order_and_tail_likelihoods() {
+    // SciPy 1.17.1 reference log densities. The former unconditional six-term
+    // Bessel expansion gave positive log densities for the first two cases,
+    // and the former pdf reconstructed exp(sqrt(nc*x)) and overflowed.
+    for (df, nc, x, expected) in [
+        (100.0, 200.0, 300.0, -4.373_951_302_723_176),
+        (500.0, 1000.0, 1500.0, -5.177_761_867_296_926),
+        (4.0, 10_000.0, 10_000.0, -6.217_293_401_627_874),
+        (2.0, 2000.0, 1e-10, -1000.693_147_130_610),
+        (10.0, 10_000.0, 1.0, -4922.914_488_648_738),
+    ] {
+        let distribution = NoncentralChiSquared::new(df, nc);
+        let actual = distribution.logpdf(x);
+        assert!(
+            (actual - expected).abs() < 1e-10,
+            "{df}/{nc}/{x}: {actual} != {expected}"
+        );
+        assert_eq!(distribution.pdf(x), actual.exp());
+    }
+    // 80-digit positive Poisson/Gamma sums. At tiny df, SciPy's Bessel
+    // order rounds to -1 and drops the k=0 component; its logpdf is not
+    // a valid reference for these cases.
+    for (df, nc, x, expected) in [
+        (1e-8, 4.0, 1e-12, 6.517_393_032_683_641),
+        (1e-16, 4.0, 1e-20, 6.517_393_171_418_901),
+        (1e-10, 1e-5, 1e-10, -0.693_147_181_779_534_4),
+    ] {
+        let actual = NoncentralChiSquared::new(df, nc).logpdf(x);
+        assert!(
+            (actual - expected).abs() < 1e-12,
+            "{df}/{nc}/{x}: {actual} != {expected}"
+        );
+    }
+    let endpoint = NoncentralChiSquared::new(2.0, 4.0);
+    assert_eq!(endpoint.pdf(0.0), 0.0); // Pinned SciPy PDF endpoint convention.
+    assert_eq!(endpoint.logpdf(0.0), -std::f64::consts::LN_2 - 2.0);
+    assert_eq!(endpoint.pdf(f64::INFINITY), 0.0);
+    assert_eq!(endpoint.logpdf(f64::INFINITY), f64::NEG_INFINITY);
+    assert_eq!(endpoint.logpdf(-1.0), f64::NEG_INFINITY);
+    assert!(endpoint.logpdf(f64::NAN).is_nan());
+    for df in [0.5, 2.0, 10.0] {
+        let noncentral = NoncentralChiSquared::new(df, 0.0);
+        let central = ChiSquared::new(df);
+        for x in [0.0, 0.01, 1.0, 10.0] {
+            assert_eq!(noncentral.logpdf(x), central.logpdf(x));
+        }
+    }
+}
+
+#[test]
+fn noncentral_chi_squared_mle_rejects_singular_and_unattained_fits() {
+    // This sample's supremum is at df -> 0, nc approximately 8.34926.
+    // The positive-df family has no attained MLE there.
+    let sample = [1.0, 2.0, 8.0, 30.0];
+    let Err(FitError::NonConvergent(message)) = NoncentralChiSquared::try_fit(&sample) else {
+        panic!("excluded zero-df maximum must not be reported as a finite fit");
+    };
+    assert!(message.contains("df=0"), "{message}");
+    for data in [&[0.0, 0.0][..], &[0.0, 1.0][..]] {
+        assert!(matches!(
+            NoncentralChiSquared::try_fit(data),
+            Err(FitError::NonConvergent(_))
+        ));
+    }
+    assert!(matches!(
+        NoncentralChiSquared::try_fit(&[]),
+        Err(FitError::InsufficientData { .. })
+    ));
+    assert!(matches!(
+        NoncentralChiSquared::try_fit(&[1.0]),
+        Err(FitError::InsufficientData { .. })
+    ));
+    for bad in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(matches!(
+            NoncentralChiSquared::try_fit(&[0.5, bad, 2.0]),
+            Err(FitError::UnsupportedData(_))
+        ));
+    }
+    let panic = std::panic::catch_unwind(|| NoncentralChiSquared::fit(&[0.0, 1.0])).unwrap_err();
+    assert!(matches!(
+        panic.downcast_ref::<FitError>(),
+        Some(FitError::NonConvergent(_))
+    ));
+    with_stats_runtime_mode(RuntimeMode::Hardened, || {
+        with_hardened_stats_caps(2, 2, || {
+            assert!(matches!(
+                NoncentralChiSquared::try_fit(&[0.5, 1.0, 2.0]),
+                Err(FitError::ResourceExhausted { .. })
+            ));
+        });
+    });
 }
 
 #[test]
@@ -3346,6 +3490,10 @@ fn mle_matches_live_scipy_on_seeded_fits() {
         let two_positive = [MleParameter::Positive(1.0), MleParameter::Positive(1.0)];
         let options = MleOptions::default();
         let (actual, nll) = match family {
+            "ncx2" => {
+                let fitted = NoncentralChiSquared::try_fit(&data).unwrap();
+                (vec![fitted.df, fitted.nc], likelihood(&fitted, &data))
+            }
             "skewnorm" => {
                 let fitted = SkewNorm::try_fit(&data).unwrap();
                 (vec![fitted.a], likelihood(&fitted, &data))
@@ -3530,10 +3678,10 @@ fn mle_matches_live_scipy_on_seeded_fits() {
         compared += 1;
     }
     assert_eq!(
-        compared, 84,
+        compared, 87,
         "every seeded case must produce a real comparison"
     );
-    eprintln!("MLE compared cases = {compared}; families = 28; samples per case = 2000");
+    eprintln!("MLE compared cases = {compared}; families = 29; samples per case = 2000");
 }
 
 #[test]

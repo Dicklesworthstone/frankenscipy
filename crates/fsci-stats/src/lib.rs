@@ -1603,24 +1603,6 @@ fn sample_population_variance(data: &[f64]) -> f64 {
     data.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / data.len() as f64
 }
 
-fn sample_standardized_skewness(data: &[f64]) -> f64 {
-    let mean = sample_mean(data);
-    let mut m2 = 0.0_f64;
-    let mut m3 = 0.0_f64;
-    for &x in data {
-        let centered = x - mean;
-        m2 += centered * centered;
-        m3 += centered * centered * centered;
-    }
-    m2 /= data.len() as f64;
-    m3 /= data.len() as f64;
-    if m2 <= 0.0 {
-        f64::NAN
-    } else {
-        m3 / m2.powf(1.5)
-    }
-}
-
 /// Maximum-likelihood shape `c` for Weibull-shaped data on strictly
 /// positive samples `y_i > 0`. Returns `Err(...)` if the data is empty,
 /// non-finite, non-positive, or numerically unable to bracket a finite
@@ -3270,68 +3252,16 @@ impl NoncentralChiSquared {
 
 impl ContinuousDistribution for NoncentralChiSquared {
     fn pdf(&self, x: f64) -> f64 {
-        if x < 0.0 || x.is_nan() {
-            return if x.is_nan() { f64::NAN } else { 0.0 };
-        }
-        if self.nc == 0.0 {
-            return ChiSquared::new(self.df).pdf(x);
-        }
-        if x == 0.0 {
-            return if self.df >= 2.0 { 0.0 } else { f64::INFINITY };
-        }
-
-        // PDF: 0.5 * exp(-(x+λ)/2) * (x/λ)^((k/4)-(1/2)) * I_{k/2-1}(sqrt(λx))
-        let k = self.df;
-        let lam = self.nc;
-
-        let nu = k / 2.0 - 1.0;
-        let sqrt_lam_x = (lam * x).sqrt();
-
-        // Use ive_scalar and convert: I_v(z) = ive(v, z) * exp(|z|)
-        let ive_val = fsci_special::ive_scalar(nu, sqrt_lam_x);
-        let iv_val = ive_val * sqrt_lam_x.abs().exp();
-
-        if iv_val <= 0.0 || !iv_val.is_finite() {
+        if x == 0.0 && self.nc > 0.0 && self.df == 2.0 {
+            // Preserve SciPy's PDF endpoint convention. Its logpdf uses the
+            // finite right-hand density limit here, as our logpdf does.
             return 0.0;
         }
-
-        let log_pdf = -(x + lam) / 2.0 + ((k / 4.0) - 0.5) * (x / lam).ln() + iv_val.ln() - LN_2;
-
-        log_pdf.exp()
+        self.logpdf(x).exp()
     }
 
     fn logpdf(&self, x: f64) -> f64 {
-        // Pure log-space form: ln I_ν(z) = ln(ive(ν,z)) + z (z≥0), avoiding the
-        // I_ν overflow that makes pdf() collapse to 0 for large λx. Finite deep
-        // in the tail where the density underflows. frankenscipy-7m3xk
-        if x < 0.0 || x.is_nan() {
-            return if x.is_nan() {
-                f64::NAN
-            } else {
-                f64::NEG_INFINITY
-            };
-        }
-        if self.nc == 0.0 {
-            return ChiSquared::new(self.df).logpdf(x);
-        }
-        if x == 0.0 {
-            return if self.df >= 2.0 {
-                f64::NEG_INFINITY
-            } else {
-                f64::INFINITY
-            };
-        }
-        let k = self.df;
-        let lam = self.nc;
-        let nu = k / 2.0 - 1.0;
-        let sqrt_lam_x = (lam * x).sqrt();
-        // ln I_ν(z) = log_ive(ν, z) + z; stays finite for all z (vs the pdf's
-        // I_ν = ive·e^z which overflows for z > 709).
-        let log_iv = fsci_special::log_ive_scalar(nu, sqrt_lam_x) + sqrt_lam_x;
-        if !log_iv.is_finite() {
-            return f64::NEG_INFINITY;
-        }
-        -(x + lam) / 2.0 + ((k / 4.0) - 0.5) * (x / lam).ln() + log_iv - LN_2
+        mle::noncentral_chi_squared_log_density(self.df, self.nc, x)
     }
 
     fn cdf(&self, x: f64) -> f64 {
@@ -3428,49 +3358,13 @@ impl ContinuousDistribution for NoncentralChiSquared {
         )
     }
 
-    fn fit(_data: &[f64]) -> Self {
-        Self {
-            df: f64::NAN,
-            nc: f64::NAN,
-        }
-    }
-
+    /// Joint maximum-likelihood fit of df and noncentrality at location zero
+    /// and scale one, including the attainable central (nc=0) subfamily.
+    ///
+    /// The trait's `fit` wrapper uses this estimator and panics with a
+    /// `FitError` if no valid finite fit exists; use `try_fit` to handle failure.
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        // Method-of-moments fit (consistent with the crate's pragmatic per-
-        // distribution estimators). For NCS: E[X] = df + nc and
-        // Var[X] = 2(df + 2*nc), which invert in closed form to
-        //   nc = var/2 - mean,  df = 2*mean - var/2.
-        if data.len() < 2 {
-            return Err(FitError::InsufficientData {
-                required: 2,
-                actual: data.len(),
-            });
-        }
-        let n = data.len() as f64;
-        let mut sum = 0.0;
-        for &x in data {
-            if !x.is_finite() {
-                return Err(FitError::UnsupportedData(format!(
-                    "NoncentralChiSquared data contains non-finite value: {x}"
-                )));
-            }
-            if x < 0.0 {
-                return Err(FitError::UnsupportedData(format!(
-                    "NoncentralChiSquared support is [0, ∞); got {x}"
-                )));
-            }
-            sum += x;
-        }
-        let mean = sum / n;
-        let var = data.iter().map(|&x| (x - mean) * (x - mean)).sum::<f64>() / n;
-        let nc = var / 2.0 - mean;
-        let df = 2.0 * mean - var / 2.0;
-        if !df.is_finite() || df <= 0.0 || !nc.is_finite() || nc < 0.0 {
-            return Err(FitError::NonConvergent(format!(
-                "NoncentralChiSquared MoM produced invalid parameters: df={df}, nc={nc}"
-            )));
-        }
-        Ok(Self { df, nc })
+        mle::noncentral_chi_squared_mle(data)
     }
 
     fn skewness(&self) -> f64 {
@@ -103600,37 +103494,22 @@ mod tests {
     }
 
     #[test]
-    fn noncentral_chi_squared_fit_inverts_moments() {
-        // MoM must invert exactly: E[X]=df+nc, Var=2(df+2nc)
-        //   => nc = var/2 - mean, df = 2*mean - var/2.
-        // var (21) >= 2*mean (14) so MoM yields valid df=3.5, nc=3.5.
-        let data = [0.0_f64, 1.0, 3.0, 5.0, 7.0, 9.0, 11.0, 13.0, 14.0, 7.0];
-        let n = data.len() as f64;
-        let mean = data.iter().sum::<f64>() / n;
-        let var = data.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n;
-        let fitted = NoncentralChiSquared::try_fit(&data).expect("fit");
-        assert!(
-            (fitted.df - (2.0 * mean - var / 2.0)).abs() < 1e-10,
-            "NCS df inversion: got {}",
-            fitted.df
-        );
-        assert!(
-            (fitted.nc - (var / 2.0 - mean)).abs() < 1e-10,
-            "NCS nc inversion: got {}",
-            fitted.nc
-        );
-        // Fitted moments must reproduce the sample moments.
-        assert!(
-            (fitted.mean() - mean).abs() < 1e-9,
-            "mean: {}",
-            fitted.mean()
-        );
-        assert!((fitted.var() - var).abs() < 1e-9, "var: {}", fitted.var());
+    fn noncentral_chi_squared_fit_uses_likelihood_and_preserves_central_boundary() {
+        let data = [9.8, 9.9, 10.0, 10.1, 10.2];
+        let fitted = NoncentralChiSquared::try_fit(&data).expect("central MLE");
+        assert_eq!(fitted.nc, 0.0);
+        assert_eq!(fitted.df, ChiSquared::try_fit(&data).unwrap().df);
+        let nll = -data.iter().map(|&x| fitted.logpdf(x)).sum::<f64>();
+        assert!((nll - 12.044_664_477_8).abs() < 1e-9);
+        assert!(matches!(
+            NoncentralChiSquared::try_fit(&[0.0, 1.0, 3.0]),
+            Err(FitError::NonConvergent(_))
+        ));
     }
 
     #[test]
     fn noncentral_chi_squared_fit_synthetic_recovery() {
-        // Synthesize NCS(df=4, nc=3) via its ppf grid; MoM recovers within 10%.
+        // Synthesize NCS(df=4, nc=3) via its ppf grid; likelihood fit recovers within 10%.
         let truth = NoncentralChiSquared::new(4.0, 3.0);
         let n = 4000;
         let samples: Vec<f64> = (1..=n)
