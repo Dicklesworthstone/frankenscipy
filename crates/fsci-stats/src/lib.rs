@@ -18901,6 +18901,20 @@ impl InverseGaussian {
 }
 
 impl ContinuousDistribution for InverseGaussian {
+    fn mode(&self) -> f64 {
+        let mu = self.mu;
+        if !mu.is_finite() || mu <= 0.0 {
+            return f64::NAN;
+        }
+        // The positive root of x² + 3μ²x - μ² = 0. Rationalize
+        // the subtraction and scale the large-μ branch before squaring.
+        if mu <= 1.0 {
+            mu / (1.0_f64.hypot(1.5 * mu) + 1.5 * mu)
+        } else {
+            1.0 / (mu.recip().hypot(1.5) + 1.5)
+        }
+    }
+
     // erf/ndtr-class cdf (~25-50ns): intermediate cost, pessimized ~3-4x@4096 under the
     // default 2048 gate (break-even ~45-70k). Moderate gate -> parallel only at ~65k+.
     fn cdf_sf_par_min(&self) -> usize {
@@ -19076,6 +19090,22 @@ impl Pearson3 {
 }
 
 impl ContinuousDistribution for Pearson3 {
+    fn mode(&self) -> f64 {
+        if !self.skew.is_finite() {
+            return f64::NAN;
+        }
+        // Use the same normal limit as pdf/logpdf. Otherwise Pearson III
+        // is an affine Gamma with shape 4/skew²; shape <= 1 peaks at
+        // its support boundary, including the reflected negative skew.
+        if self.skew.abs() < 1.6e-5 {
+            0.0
+        } else if self.skew.abs() <= 2.0 {
+            -0.5 * self.skew
+        } else {
+            -2.0 / self.skew
+        }
+    }
+
     fn pdf(&self, x: f64) -> f64 {
         const NORMAL_TRANSITION: f64 = 1.6e-5;
         let skew = self.skew;
@@ -19105,8 +19135,17 @@ impl ContinuousDistribution for Pearson3 {
         let alpha = beta * beta;
         let zeta = -beta;
         let transx = beta * (x - zeta);
-        if transx <= 0.0 {
+        if transx < 0.0 {
             return f64::NEG_INFINITY;
+        }
+        if transx == 0.0 {
+            return if alpha < 1.0 {
+                f64::INFINITY
+            } else if alpha == 1.0 {
+                beta.abs().ln()
+            } else {
+                f64::NEG_INFINITY
+            };
         }
         // pdf = |beta|*transx^(alpha-1)*exp(-transx)/gamma(alpha). The default
         // logpdf = ln(pdf) returns -inf once pdf underflows to 0 in the tail
@@ -21797,6 +21836,14 @@ impl TruncNormal {
 }
 
 impl ContinuousDistribution for TruncNormal {
+    fn mode(&self) -> f64 {
+        if self.a.is_nan() || self.b.is_nan() || self.a >= self.b {
+            return f64::NAN;
+        }
+        // Truncation changes normalization, not the density ordering.
+        0.0_f64.clamp(self.a, self.b)
+    }
+
     fn cdf_sf_par_min(&self) -> usize {
         32768
     }
@@ -26601,6 +26648,11 @@ impl ContinuousDistribution for Mielke {
 pub struct Moyal;
 
 impl ContinuousDistribution for Moyal {
+    fn mode(&self) -> f64 {
+        // d(log pdf)/dx = (exp(-x) - 1)/2.
+        0.0
+    }
+
     // ndtri-class ppf (~50ns, break-even ~67-90k): pessimized ~5x@4096; gate parallel@131k.
     fn ppf_isf_par_min(&self) -> usize {
         65536
@@ -28496,6 +28548,14 @@ impl Gompertz {
 }
 
 impl ContinuousDistribution for Gompertz {
+    fn mode(&self) -> f64 {
+        if !self.c.is_finite() || self.c <= 0.0 {
+            return f64::NAN;
+        }
+        // The unconstrained stationary point is -log(c); support is x >= 0.
+        (-self.c.ln()).max(0.0)
+    }
+
     fn ppf_isf_is_cheap(&self) -> bool {
         true
     }
@@ -28772,6 +28832,13 @@ impl GenLogistic {
 }
 
 impl ContinuousDistribution for GenLogistic {
+    fn mode(&self) -> f64 {
+        if !self.c.is_finite() || self.c <= 0.0 {
+            return f64::NAN;
+        }
+        self.c.ln()
+    }
+
     fn ppf_isf_is_cheap(&self) -> bool {
         true
     }
@@ -29690,6 +29757,26 @@ impl TruncWeibullMin {
 }
 
 impl ContinuousDistribution for TruncWeibullMin {
+    fn mode(&self) -> f64 {
+        if !self.c.is_finite()
+            || self.c <= 0.0
+            || !self.a.is_finite()
+            || self.a < 0.0
+            || !self.b.is_finite()
+            || self.a >= self.b
+        {
+            return f64::NAN;
+        }
+        if self.c <= 1.0 {
+            return self.a;
+        }
+        // Conditional density preserves the Weibull maximum unless a
+        // truncation endpoint cuts it off.
+        ((self.c - 1.0) / self.c)
+            .powf(self.c.recip())
+            .clamp(self.a, self.b)
+    }
+
     fn cdf_sf_is_cheap(&self) -> bool {
         true
     }
@@ -30223,6 +30310,21 @@ impl TruncPareto {
 }
 
 impl ContinuousDistribution for TruncPareto {
+    fn mode(&self) -> f64 {
+        if !self.b.is_finite() || self.b == 0.0 || !self.c.is_finite() || self.c <= 1.0 {
+            return f64::NAN;
+        }
+        // The density is proportional to x^(-b-1), including negative
+        // shapes. b == -1 is uniform and has no unique mode.
+        if self.b > -1.0 {
+            1.0
+        } else if self.b < -1.0 {
+            self.c
+        } else {
+            f64::NAN
+        }
+    }
+
     fn ppf_isf_is_cheap(&self) -> bool {
         true
     }
@@ -30455,6 +30557,14 @@ impl TruncExpon {
 }
 
 impl ContinuousDistribution for TruncExpon {
+    fn mode(&self) -> f64 {
+        if self.b.is_finite() && self.b > 0.0 {
+            0.0
+        } else {
+            f64::NAN
+        }
+    }
+
     fn ppf_isf_is_cheap(&self) -> bool {
         true
     }
@@ -31190,6 +31300,14 @@ impl GenNorm {
 }
 
 impl ContinuousDistribution for GenNorm {
+    fn mode(&self) -> f64 {
+        if self.beta.is_finite() && self.beta > 0.0 {
+            0.0
+        } else {
+            f64::NAN
+        }
+    }
+
     fn pdf(&self, x: f64) -> f64 {
         let b = self.beta;
         b / (2.0 * ln_gamma(1.0 / b).exp()) * (-x.abs().powf(b)).exp()
@@ -31410,6 +31528,14 @@ impl HalfGenNorm {
 }
 
 impl ContinuousDistribution for HalfGenNorm {
+    fn mode(&self) -> f64 {
+        if self.beta.is_finite() && self.beta > 0.0 {
+            0.0
+        } else {
+            f64::NAN
+        }
+    }
+
     fn pdf(&self, x: f64) -> f64 {
         if x < 0.0 {
             return 0.0;
@@ -31593,6 +31719,14 @@ impl LogGamma {
 }
 
 impl ContinuousDistribution for LogGamma {
+    fn mode(&self) -> f64 {
+        if !self.c.is_finite() || self.c <= 0.0 {
+            return f64::NAN;
+        }
+        // d(log pdf)/dx = c - exp(x).
+        self.c.ln()
+    }
+
     fn pdf(&self, x: f64) -> f64 {
         (self.c * x - x.exp() - ln_gamma(self.c)).exp()
     }
@@ -31876,6 +32010,14 @@ impl LaplaceAsymmetric {
 }
 
 impl ContinuousDistribution for LaplaceAsymmetric {
+    fn mode(&self) -> f64 {
+        if self.kappa.is_finite() && self.kappa > 0.0 {
+            0.0
+        } else {
+            f64::NAN
+        }
+    }
+
     fn ppf_isf_is_cheap(&self) -> bool {
         true
     }
@@ -32898,6 +33040,20 @@ impl CrystalBall {
 }
 
 impl ContinuousDistribution for CrystalBall {
+    fn mode(&self) -> f64 {
+        if self.beta_param.is_finite()
+            && self.beta_param > 0.0
+            && self.m.is_finite()
+            && self.m > 1.0
+        {
+            // The power tail increases up to the Gaussian piece, whose
+            // unique maximum remains zero for every admissible shape.
+            0.0
+        } else {
+            f64::NAN
+        }
+    }
+
     // erf/ndtr-class cdf (~25-50ns): intermediate cost, pessimized ~3-4x@4096 under the
     // default 2048 gate (break-even ~45-70k). Moderate gate -> parallel only at ~65k+.
     fn cdf_sf_par_min(&self) -> usize {

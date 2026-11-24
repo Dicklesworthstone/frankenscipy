@@ -114,6 +114,7 @@ jobs:
               cargo test --locked -p fsci-linalg --test differential_linalg default_fast_solve_matches_live_scipy -- --nocapture
               ;;
             distribution-fit)
+              cargo test --locked -p fsci-stats --test mode_scipy -- --nocapture
               cargo test --locked -p fsci-stats --lib student_t -- --nocapture
               cargo test --locked -p fsci-stats --lib fit_only_stats_distributions_expose_typed_try_fit -- --nocapture
               cargo test --locked -p fsci-stats --lib doublegamma_ -- --nocapture
