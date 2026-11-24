@@ -39,6 +39,12 @@
 //! can match on the resulting enum variants instead of substring-parsing
 //! `Display` text.
 
+mod short_time;
+
+pub use short_time::{
+    IstftOptions, StftBoundary, StftOptions, StftWindow, istft_with_options, stft_with_options,
+};
+
 pub use fsci_runtime::{
     AuditAction, AuditEvent, AuditLedger, HARDENED_MAX_DIM, RecoveryPolicy, RuntimeMode,
     SyncSharedAuditLedger,
@@ -17497,7 +17503,7 @@ pub fn get_window_with_fftbins(
 /// Result of the Short-Time Fourier Transform.
 #[derive(Debug, Clone)]
 pub struct StftResult {
-    /// Frequency bins (length = nperseg/2 + 1).
+    /// One-sided frequency bins (length = nfft/2 + 1).
     pub frequencies: Vec<f64>,
     /// Time centers for each segment.
     pub times: Vec<f64>,
@@ -17506,16 +17512,6 @@ pub struct StftResult {
     pub zxx: Vec<Vec<(f64, f64)>>,
 }
 
-/// Compute the Short-Time Fourier Transform.
-///
-/// Matches `scipy.signal.stft(x, fs, window, nperseg, noverlap)`.
-///
-/// # Arguments
-/// * `x` — Input signal.
-/// * `fs` — Sampling frequency (Hz).
-/// * `window` — Window type to use (default: "hann").
-/// * `nperseg` — Length of each segment (default: 256).
-/// * `noverlap` — Overlap between segments (default: nperseg/2).
 // Worker count for the parallel STFT frame loop: 1 (sequential) unless there are
 // enough frames carrying enough total FFT work to amortise thread spawn (each frame
 // is an O(nperseg log nperseg) rfft), then scale with cores capped at frame_count/2.
@@ -17634,6 +17630,14 @@ pub fn check_NOLA(window: &[f64], nperseg: usize, noverlap: usize) -> Result<boo
     Ok(min > 1e-10)
 }
 
+/// Compute the real, one-sided short-time Fourier transform.
+///
+/// Matches `scipy.signal.stft(x, fs, window, nperseg, noverlap)`, including
+/// periodic windows, spectrum scaling, centered zero boundary extension, and
+/// trailing zero padding. Named windows default to Hann with at most 256
+/// samples, and overlap defaults to half the effective segment length.
+/// See [`stft_with_options`] for explicit windows, FFT lengths, detrending,
+/// boundary modes, padding, and PSD scaling.
 pub fn stft(
     x: &[f64],
     fs: f64,
@@ -17641,108 +17645,16 @@ pub fn stft(
     nperseg: Option<usize>,
     noverlap: Option<usize>,
 ) -> Result<StftResult, SignalError> {
-    if x.is_empty() {
-        return Err(SignalError::InvalidArgument(
-            "input must not be empty".to_string(),
-        ));
-    }
-    validate_sampling_frequency(fs)?;
-    validate_spectral_samples(x)?;
-
-    let nperseg = nperseg.unwrap_or_else(|| x.len().min(256));
-    if nperseg == 0 {
-        return Err(SignalError::InvalidArgument(
-            "nperseg must be > 0".to_string(),
-        ));
-    }
-    if nperseg > x.len() {
-        return Err(SignalError::InvalidArgument(format!(
-            "nperseg ({nperseg}) must be <= signal length ({})",
-            x.len()
-        )));
-    }
-
-    let noverlap = noverlap.unwrap_or(nperseg / 2);
-    if noverlap >= nperseg {
-        return Err(SignalError::InvalidArgument(
-            "noverlap must be < nperseg".to_string(),
-        ));
-    }
-
-    let step = nperseg - noverlap;
-    let win_coeffs = get_window(window.unwrap_or("hann"), nperseg)?;
-    let n_freqs = nperseg / 2 + 1;
-
-    // Each frame (window + rfft over a disjoint segment) is independent and expensive,
-    // so for many frames the work is split across threads. Every frame runs the same
-    // deterministic window+rfft, so the result is bit-identical to the sequential loop;
-    // the first FFT error (if any) is returned in frame order.
-    let frame_count = (x.len() - nperseg) / step + 1;
-    let compute_frame = |f: usize| -> Result<(Vec<fsci_fft::Complex64>, f64), SignalError> {
-        let start = f * step;
-        let windowed: Vec<f64> = x[start..start + nperseg]
-            .iter()
-            .zip(&win_coeffs)
-            .map(|(&xi, &wi)| xi * wi)
-            .collect();
-        let opts = fsci_fft::FftOptions::default();
-        let spectrum = fsci_fft::rfft(&windowed, &opts)
-            .map_err(|e| SignalError::InvalidArgument(format!("FFT failed: {e}")))?;
-        Ok((
-            spectrum[..n_freqs].to_vec(),
-            (start as f64 + (nperseg - 1) as f64 / 2.0) / fs,
-        ))
-    };
-
-    let frames: Vec<(Vec<fsci_fft::Complex64>, f64)> = {
-        let nthreads = stft_frame_thread_count(frame_count, nperseg);
-        if nthreads <= 1 {
-            (0..frame_count)
-                .map(&compute_frame)
-                .collect::<Result<Vec<_>, _>>()?
-        } else {
-            let chunk = frame_count.div_ceil(nthreads);
-            let cf = &compute_frame;
-            type FrameChunk = Result<Vec<(Vec<fsci_fft::Complex64>, f64)>, SignalError>;
-            let chunk_results: Vec<FrameChunk> = std::thread::scope(|scope| {
-                let handles: Vec<_> = (0..nthreads)
-                    .filter_map(|t| {
-                        let f0 = t * chunk;
-                        if f0 >= frame_count {
-                            return None;
-                        }
-                        let f1 = (f0 + chunk).min(frame_count);
-                        Some(scope.spawn(move || (f0..f1).map(cf).collect::<Result<Vec<_>, _>>()))
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| h.join().expect("stft worker panicked"))
-                    .collect()
-            });
-            let mut frames = Vec::with_capacity(frame_count);
-            for cr in chunk_results {
-                frames.extend(cr?);
-            }
-            frames
-        }
-    };
-
-    let mut zxx = Vec::with_capacity(frame_count);
-    let mut times = Vec::with_capacity(frame_count);
-    for (spec, time) in frames {
-        zxx.push(spec);
-        times.push(time);
-    }
-
-    let freq_step = fs / nperseg as f64;
-    let frequencies: Vec<f64> = (0..n_freqs).map(|k| k as f64 * freq_step).collect();
-
-    Ok(StftResult {
-        frequencies,
-        times,
-        zxx,
-    })
+    stft_with_options(
+        x,
+        &StftOptions {
+            fs,
+            window: StftWindow::Named(window.unwrap_or("hann")),
+            nperseg,
+            noverlap,
+            ..StftOptions::default()
+        },
+    )
 }
 
 /// Canonical dual window for a real STFT window `win` shifted by `hop` samples.
@@ -18630,89 +18542,25 @@ impl ShortTimeFft {
     }
 }
 
+/// Invert a real, one-sided STFT using periodic Hann and spectrum scaling.
+///
+/// Matches SciPy's default inverse boundary trimming. The segment length and
+/// overlap must match the analysis; the result can retain trailing zero
+/// padding. Use [`istft_with_options`] for other windows, PSD scaling, FFT
+/// lengths, or analysis without boundary extension.
 pub fn istft(
     stft_result: &StftResult,
     nperseg: usize,
     noverlap: Option<usize>,
 ) -> Result<Vec<f64>, SignalError> {
-    if stft_result.zxx.is_empty() {
-        return Err(SignalError::InvalidArgument(
-            "empty STFT result".to_string(),
-        ));
-    }
-
-    let noverlap = noverlap.unwrap_or(nperseg / 2);
-    let step = nperseg - noverlap;
-    let n_segments = stft_result.zxx.len();
-    let output_len = nperseg + (n_segments - 1) * step;
-
-    let window = hann(nperseg);
-    let opts = fsci_fft::FftOptions::default();
-
-    let mut output = vec![0.0; output_len];
-    let mut window_sum = vec![0.0; output_len];
-
-    // Each segment's inverse rfft is independent and dominant, so compute them
-    // across threads; the overlap-add (cheap, order-sensitive) stays serial in
-    // segment order. BYTE-IDENTICAL: deterministic per-segment irfft + unchanged
-    // accumulation order.
-    let compute_seg = |spectrum: &Vec<(f64, f64)>| -> Result<Vec<f64>, SignalError> {
-        fsci_fft::irfft(spectrum, Some(nperseg), &opts)
-            .map_err(|e| SignalError::InvalidArgument(format!("IFFT failed: {e}")))
-    };
-    let nthreads = stft_frame_thread_count(n_segments, nperseg);
-    let segments: Vec<Vec<f64>> = if nthreads <= 1 {
-        stft_result
-            .zxx
-            .iter()
-            .map(&compute_seg)
-            .collect::<Result<Vec<_>, _>>()?
-    } else {
-        let chunk = n_segments.div_ceil(nthreads);
-        let cs = &compute_seg;
-        let zxx = &stft_result.zxx;
-        type SegChunk = Result<Vec<Vec<f64>>, SignalError>;
-        let chunk_results: Vec<SegChunk> = std::thread::scope(|scope| {
-            let handles: Vec<_> =
-                (0..nthreads)
-                    .filter_map(|t| {
-                        let c0 = t * chunk;
-                        if c0 >= n_segments {
-                            return None;
-                        }
-                        let c1 = (c0 + chunk).min(n_segments);
-                        Some(scope.spawn(move || {
-                            zxx[c0..c1].iter().map(cs).collect::<Result<Vec<_>, _>>()
-                        }))
-                    })
-                    .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("istft worker panicked"))
-                .collect()
-        });
-        let mut segments = Vec::with_capacity(n_segments);
-        for cr in chunk_results {
-            segments.extend(cr?);
-        }
-        segments
-    };
-    for (seg_idx, segment) in segments.iter().enumerate() {
-        let start = seg_idx * step;
-        for (j, (&s, &w)) in segment.iter().zip(&window).enumerate() {
-            output[start + j] += s * w;
-            window_sum[start + j] += w * w;
-        }
-    }
-
-    // Normalize by window sum (COLA condition).
-    for (o, &ws) in output.iter_mut().zip(&window_sum) {
-        if ws > 1e-15 {
-            *o /= ws;
-        }
-    }
-
-    Ok(output)
+    istft_with_options(
+        stft_result,
+        &IstftOptions {
+            nperseg: Some(nperseg),
+            noverlap,
+            ..IstftOptions::default()
+        },
+    )
 }
 
 /// Result of the spectrogram computation.
@@ -30830,69 +30678,60 @@ mod tests {
 
     #[test]
     fn stft_istft_roundtrip() {
-        // Generate a simple sinusoidal signal, STFT then ISTFT, compare.
         let fs = 100.0;
         let n = 400;
         let freq = 10.0;
         let x: Vec<f64> = (0..n)
-            .map(|i| (2.0 * std::f64::consts::PI * freq * i as f64 / fs).sin())
+            .map(|i| 1.5 + (2.0 * std::f64::consts::PI * freq * i as f64 / fs).sin())
             .collect();
-
         let nperseg = 64;
         let noverlap = 48;
         let stft_res = stft(&x, fs, None, Some(nperseg), Some(noverlap)).unwrap();
         let reconstructed = istft(&stft_res, nperseg, Some(noverlap)).unwrap();
-
-        // Compare in the well-reconstructed interior (avoiding edge effects).
-        let margin = nperseg;
-        let end = reconstructed.len().min(n) - margin;
-        for i in margin..end {
+        assert_eq!(reconstructed.len(), x.len());
+        for (i, (&actual, &expected)) in reconstructed.iter().zip(&x).enumerate() {
             assert!(
-                (reconstructed[i] - x[i]).abs() < 0.15,
-                "STFT-ISTFT mismatch at {i}: got {}, expected {}",
-                reconstructed[i],
-                x[i]
+                (actual - expected).abs() < 2e-12,
+                "STFT-ISTFT mismatch at {i}: got {actual}, expected {expected}",
             );
         }
     }
 
     #[test]
     fn stft_parallel_is_bit_identical() {
-        // Large enough to cross the parallel gate (flops = frames*nperseg*log2 >= 2^24):
-        // ~4000 frames of nperseg=512 -> ~18M flops -> the threaded frame loop runs.
+        // Cross the existing work gate so the parallel and serial frame paths
+        // see centered boundary extension, a partial final frame, and scaling.
         let nperseg = 512usize;
         let noverlap = 128usize;
-        let step = nperseg - noverlap;
-        let frames = 4200usize;
-        let n = (frames - 1) * step + nperseg;
+        let n = 4200 * (nperseg - noverlap) + 17;
         let x: Vec<f64> = (0..n)
             .map(|i| (i as f64 * 0.01).sin() + 0.3 * (i as f64 * 0.047).cos())
             .collect();
-        let par = stft(&x, 1000.0, Some("hann"), Some(nperseg), Some(noverlap)).expect("stft");
-
-        // Verbatim sequential reference (same window via get_window).
-        let win = get_window("hann", nperseg).expect("window");
-        let n_freqs = nperseg / 2 + 1;
-        let opts = fsci_fft::FftOptions::default();
-        let mut seq: Vec<Vec<(f64, f64)>> = Vec::new();
-        let mut start = 0;
-        while start + nperseg <= x.len() {
-            let windowed: Vec<f64> = x[start..start + nperseg]
-                .iter()
-                .zip(&win)
-                .map(|(&xi, &wi)| xi * wi)
-                .collect();
-            let spectrum = fsci_fft::rfft(&windowed, &opts).expect("rfft");
-            seq.push(spectrum[..n_freqs].to_vec());
-            start += step;
-        }
-
-        assert_eq!(par.zxx.len(), seq.len());
-        for (t, (pr, sr)) in par.zxx.iter().zip(&seq).enumerate() {
-            for (f, (&(pre, pim), &(sre, sim))) in pr.iter().zip(sr).enumerate() {
-                assert_eq!(pre.to_bits(), sre.to_bits(), "stft re mismatch t={t} f={f}");
-                assert_eq!(pim.to_bits(), sim.to_bits(), "stft im mismatch t={t} f={f}");
+        let parallel = stft(&x, 1000.0, Some("hann"), Some(nperseg), Some(noverlap)).unwrap();
+        let serial = with_serial_par_index_fill(|| {
+            stft(&x, 1000.0, Some("hann"), Some(nperseg), Some(noverlap))
+        })
+        .unwrap();
+        assert_eq!(parallel.times, serial.times);
+        assert_eq!(parallel.frequencies, serial.frequencies);
+        assert_eq!(parallel.zxx.len(), serial.zxx.len());
+        for (t, (actual, expected)) in parallel.zxx.iter().zip(&serial.zxx).enumerate() {
+            assert_eq!(actual.len(), expected.len());
+            for (f, (&(re, im), &(expected_re, expected_im))) in
+                actual.iter().zip(expected).enumerate()
+            {
+                assert_eq!(re.to_bits(), expected_re.to_bits(), "real t={t} f={f}");
+                assert_eq!(im.to_bits(), expected_im.to_bits(), "imag t={t} f={f}");
             }
+        }
+        let parallel_inverse = istft(&parallel, nperseg, Some(noverlap)).unwrap();
+        let serial_inverse = with_serial_par_index_fill(|| {
+            istft(&parallel, nperseg, Some(noverlap))
+        })
+        .unwrap();
+        assert_eq!(parallel_inverse.len(), serial_inverse.len());
+        for (i, (&actual, &expected)) in parallel_inverse.iter().zip(&serial_inverse).enumerate() {
+            assert_eq!(actual.to_bits(), expected.to_bits(), "inverse sample {i}");
         }
     }
 

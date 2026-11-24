@@ -1,11 +1,14 @@
-//! Same-process A/B for the parallel STFT: times the shipped (parallel) `stft` against
-//! a verbatim sequential frame loop in ONE process (immune to cross-worker variance),
-//! and checks they are bit-identical. Parallelizing stft also covers spectrogram.
+//! Same-process serial/parallel STFT comparison with spectrum scaling.
+//!
+//! Both paths disable boundary extension and trailing padding, so they perform
+//! the same transforms. The sequential reference checks worker reproducibility.
 
 use std::hint::black_box;
 use std::time::Instant;
 
-use fsci_signal::{StftResult, get_window, stft};
+use fsci_signal::{
+    StftBoundary, StftOptions, StftResult, get_window, stft_with_options,
+};
 
 fn signal(n: usize) -> Vec<f64> {
     (0..n)
@@ -17,11 +20,11 @@ fn signal(n: usize) -> Vec<f64> {
         .collect()
 }
 
-/// Verbatim sequential STFT frame loop (window + rfft per frame). Uses the crate's
-/// own `hann` so the windowing exactly matches `stft`'s `get_window("hann")`.
+/// Sequential reference with the same periodic window and spectrum scaling.
 fn stft_seq(x: &[f64], nperseg: usize, noverlap: usize) -> Vec<Vec<(f64, f64)>> {
     let step = nperseg - noverlap;
     let win = get_window("hann", nperseg).expect("window");
+    let scale = win.iter().sum::<f64>().abs().recip();
     let n_freqs = nperseg / 2 + 1;
     let opts = fsci_fft::FftOptions::default();
     let mut zxx = Vec::new();
@@ -32,11 +35,30 @@ fn stft_seq(x: &[f64], nperseg: usize, noverlap: usize) -> Vec<Vec<(f64, f64)>> 
             .zip(&win)
             .map(|(&xi, &wi)| xi * wi)
             .collect();
-        let spectrum = fsci_fft::rfft(&windowed, &opts).expect("rfft");
+        let mut spectrum = fsci_fft::rfft(&windowed, &opts).expect("rfft");
+        for (re, im) in &mut spectrum {
+            *re *= scale;
+            *im *= scale;
+        }
         zxx.push(spectrum[..n_freqs].to_vec());
         start += step;
     }
     zxx
+}
+
+fn parallel_stft(x: &[f64], nperseg: usize, noverlap: usize) -> StftResult {
+    stft_with_options(
+        x,
+        &StftOptions {
+            fs: 1000.0,
+            nperseg: Some(nperseg),
+            noverlap: Some(noverlap),
+            boundary: StftBoundary::None,
+            padded: false,
+            ..StftOptions::default()
+        },
+    )
+    .expect("stft")
 }
 
 fn digest(zxx: &[Vec<(f64, f64)>]) -> u64 {
@@ -53,7 +75,7 @@ fn digest(zxx: &[Vec<(f64, f64)>]) -> u64 {
 }
 
 fn time_par(iters: usize, x: &[f64], nperseg: usize, noverlap: usize) -> f64 {
-    let f = || stft(x, 1000.0, Some("hann"), Some(nperseg), Some(noverlap)).expect("stft");
+    let f = || parallel_stft(x, nperseg, noverlap);
     black_box(f());
     let start = Instant::now();
     for _ in 0..iters {
@@ -79,10 +101,10 @@ fn main() {
     ] {
         let x = signal(n);
         let noverlap = nperseg / 4;
-        let par: StftResult =
-            stft(&x, 1000.0, Some("hann"), Some(nperseg), Some(noverlap)).expect("stft");
+        let par = parallel_stft(&x, nperseg, noverlap);
         let seq = stft_seq(&x, nperseg, noverlap);
         let exact = digest(&par.zxx) == digest(&seq);
+        assert!(exact, "serial and parallel STFT coefficients must match");
 
         let iters = 8;
         let tp = time_par(iters, &x, nperseg, noverlap);

@@ -13,6 +13,7 @@ on:
       - "crates/fsci-stats/**"
       - "crates/fsci-signal/**"
       - "crates/fsci-conformance/tests/diff_signal_sosfilt.rs"
+      - "crates/fsci-conformance/tests/diff_signal_stft_istft.rs"
       - "crates/fsci-conformance/src/lib.rs"
       - "crates/fsci-conformance/python_oracle/scipy_fft_oracle.py"
       - "crates/fsci-conformance/tests/diff_stats_truncnorm.rs"
@@ -124,6 +125,10 @@ jobs:
               cargo test --locked -p fsci-stats --test permutation_scipy -- --nocapture
               ;;
             signal-state)
+              cargo test --locked -p fsci-signal --lib short_time::tests -- --nocapture
+              cargo test --locked -p fsci-signal --lib test_stft -- --nocapture
+              cargo test --locked -p fsci-signal --doc stft_with_options -- --nocapture
+              cargo test --locked -p fsci-conformance --no-default-features --test diff_signal_stft_istft -- --nocapture
               cargo test --locked -p fsci-signal --test place_poles_scipy -- --nocapture
               cargo test --locked -p fsci-signal --lib sosfilt_ -- --nocapture
               cargo test --locked -p fsci-signal --doc SosFilter -- --nocapture
