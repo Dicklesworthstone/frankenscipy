@@ -10994,12 +10994,40 @@ pub fn zoom(
     Ok(output)
 }
 
-/// Rotate a 2D array by the given angle (in degrees).
+/// Rotate an array in its first two axes by the given angle (in degrees).
 ///
-/// Matches `scipy.ndimage.rotate`.
+/// Matches `scipy.ndimage.rotate` with its default `axes=(1, 0)`. For an
+/// N-dimensional input, each parallel 2D plane is rotated independently; the
+/// other axes retain their lengths and do not participate in spline filtering.
+/// Use [`rotate_axes`] to select a different rotation plane.
 pub fn rotate(
     input: &NdArray,
     angle: f64,
+    reshape: bool,
+    order: usize,
+    mode: BoundaryMode,
+    cval: f64,
+) -> Result<NdArray, NdimageError> {
+    rotate_axes(input, angle, &[1, 0], reshape, order, mode, cval)
+}
+
+/// Rotate an N-dimensional array in a plane selected by two signed axes.
+///
+/// Negative axes count from the end. As in SciPy, the normalized axes are
+/// sorted, so reversing the pair does not reverse the rotation direction.
+/// With `reshape=true`, only the two selected lengths change. Spline
+/// prefiltering and interpolation operate on each 2D plane separately, never
+/// mixing channels, time points, or other coordinates outside the plane.
+///
+/// The input must have at least two dimensions, the axes must be distinct,
+/// and the angle must be finite. An empty selected plane returns
+/// [`NdimageError::EmptyInput`]; a zero-length unselected axis produces an
+/// empty output with the correctly rotated shape. Malformed row-major array
+/// metadata and unrepresentable output shapes return errors.
+pub fn rotate_axes(
+    input: &NdArray,
+    angle: f64,
+    axes: &[isize],
     reshape: bool,
     order: usize,
     mode: BoundaryMode,
@@ -11010,9 +11038,14 @@ pub fn rotate(
             "spline order must be in 0..=5, got {order}"
         )));
     }
-    if input.ndim() != 2 {
+    if input.ndim() < 2 {
         return Err(NdimageError::InvalidArgument(
-            "rotate currently supports 2D arrays only".to_string(),
+            "input array should be at least 2D".to_string(),
+        ));
+    }
+    if axes.len() != 2 {
+        return Err(NdimageError::InvalidArgument(
+            "axes should contain exactly two values".to_string(),
         ));
     }
     if !angle.is_finite() {
@@ -11020,78 +11053,297 @@ pub fn rotate(
             "angle must be finite (no NaN or Inf)".to_string(),
         ));
     }
+    let mut axes = normalize_signed_axes(axes, input.ndim())?;
+    axes.sort_unstable();
+    let [row_axis, col_axis] = [axes[0], axes[1]];
+    if checked_shape_product(&input.shape)? != input.data.len()
+        || checked_strides(&input.shape)? != input.strides
+    {
+        return Err(NdimageError::DimensionMismatch(
+            "rotation requires consistent row-major shape, strides, and data".to_string(),
+        ));
+    }
 
-    let rows = input.shape[0];
-    let cols = input.shape[1];
-    let (cos_a, sin_a) = {
-        let rem = (angle % 360.0 + 360.0) % 360.0;
-        if rem == 0.0 {
-            (1.0, 0.0)
-        } else if (rem - 90.0).abs() < 1e-9 {
-            (0.0, 1.0)
-        } else if (rem - 180.0).abs() < 1e-9 {
-            (-1.0, 0.0)
-        } else if (rem - 270.0).abs() < 1e-9 {
-            (0.0, -1.0)
-        } else {
-            let rad = angle.to_radians();
-            (rad.cos(), rad.sin())
-        }
-    };
-
-    let (out_rows, out_cols) = if reshape {
-        // SciPy 1.17.1 `rotate`: out_bounds = rot_matrix @ [[0, 0, iy, iy], [0, ix, 0, ix]]
-        // with rot_matrix = [[c, s], [-s, c]], and each output extent is
-        // int(ptp(out_bounds) + 0.5). This took the ceiling instead, so a 5x5 image at 45
-        // degrees (extent 7.07) came out 8x8 where SciPy gives 7x7 (frankenscipy-q74y3).
-        let (iy, ix) = (rows as f64, cols as f64);
-        let extent = |a: f64, b: f64| {
-            let bounds = [0.0, b * ix, a * iy, a * iy + b * ix];
-            let hi = bounds.iter().copied().fold(f64::MIN, f64::max);
-            let lo = bounds.iter().copied().fold(f64::MAX, f64::min);
-            (hi - lo + 0.5) as usize
-        };
-        (extent(cos_a, sin_a), extent(-sin_a, cos_a))
-    } else {
-        (rows, cols)
-    };
-
-    let spline = prefilter_spline_coefficients(input, order, mode)?;
-    let mut output = NdArray::zeros(vec![out_rows, out_cols]);
-    let cy_in = (rows as f64 - 1.0) / 2.0;
-    let cx_in = (cols as f64 - 1.0) / 2.0;
-    let cy_out = (out_rows as f64 - 1.0) / 2.0;
-    let cx_out = (out_cols as f64 - 1.0) / 2.0;
-
-    // Each output pixel is an independent interpolation; fill the row-major flat index
-    // Rotated deltas sum FIRST, center LAST — scipy's C applies the matrix to
-    // (out - center) and adds center as the final operation, so the residual
-    // fp noise at exact corners stays positive (in-range) instead of flipping
-    // the sample to cval/wrap-fold. Matches scipy 1.17.1 bit-for-bit at the
-    // 5x5 rot90/rot180 corners (frankenscipy-0y8z8).
-    let _ = out_rows;
-    let kernel_work = (order + 1) * (order + 1);
-    // Resolve the spline knobs ONCE, outside the per-pixel work below
-    // (`frankenscipy-22van`).
+    let plane_shape = [input.shape[row_axis], input.shape[col_axis]];
+    let geometry = RotationPlane::new(plane_shape, angle, reshape)?;
+    // One coherent snapshot of the spline toggles for the whole transform,
+    // including every independent plane.
     let flags = SplineFlags::resolve();
-    fill_pixels_parallel(&mut output, kernel_work, |flat, _scratch| {
-        let dy = (flat / out_cols) as f64 - cy_out;
-        let dx = (flat % out_cols) as f64 - cx_out;
-        let src_y = cos_a * dy + sin_a * dx + cy_in;
-        let src_x = -sin_a * dy + cos_a * dx + cx_in;
-        sample_interpolated(
-            input,
-            &spline.coeffs,
-            &[src_y, src_x],
-            &spline.coord_offsets,
-            order,
-            mode,
-            cval,
-            flags,
-        )
-    });
+    if input.ndim() == 2 {
+        return geometry.apply(input, order, mode, cval, flags);
+    }
 
+    let mut output_shape = input.shape.clone();
+    output_shape[row_axis] = geometry.output_shape[0];
+    output_shape[col_axis] = geometry.output_shape[1];
+    let mut output = rotation_array(output_shape)?;
+    if output.data.is_empty() {
+        return Ok(output);
+    }
+
+    let mut plane = rotation_array(plane_shape.to_vec())?;
+    let outer_axes: Vec<usize> = (0..input.ndim())
+        .filter(|&axis| axis != row_axis && axis != col_axis)
+        .collect();
+    let plane_count = input.data.len() / plane.data.len();
+    for plane_index in 0..plane_count {
+        let mut remainder = plane_index;
+        let mut input_base = 0;
+        let mut output_base = 0;
+        for &axis in outer_axes.iter().rev() {
+            let coordinate = remainder % input.shape[axis];
+            remainder /= input.shape[axis];
+            input_base += coordinate * input.strides[axis];
+            output_base += coordinate * output.strides[axis];
+        }
+        for row in 0..plane_shape[0] {
+            for col in 0..plane_shape[1] {
+                plane.data[row * plane_shape[1] + col] = input.data
+                    [input_base + row * input.strides[row_axis] + col * input.strides[col_axis]];
+            }
+        }
+
+        // SciPy calls affine_transform separately for each 2D slice. In
+        // particular, prefiltering the entire N-D volume here would filter
+        // axes outside the rotation plane and change independent slices.
+        let rotated = geometry.apply(&plane, order, mode, cval, flags)?;
+        for row in 0..geometry.output_shape[0] {
+            for col in 0..geometry.output_shape[1] {
+                output.data[output_base
+                    + row * output.strides[row_axis]
+                    + col * output.strides[col_axis]] =
+                    rotated.data[row * geometry.output_shape[1] + col];
+            }
+        }
+    }
     Ok(output)
+}
+
+/// Fallible allocation matters for reshaped, very thin images: a small input
+/// can rotate into an output whose shape product or byte count overflows.
+fn rotation_array(shape: Vec<usize>) -> Result<NdArray, NdimageError> {
+    let count = checked_shape_product(&shape)?;
+    let strides = checked_strides(&shape)?;
+    let mut data = Vec::new();
+    data.try_reserve_exact(count).map_err(|error| {
+        NdimageError::InvalidArgument(format!("cannot allocate rotation output: {error}"))
+    })?;
+    data.resize(count, 0.0);
+    Ok(NdArray {
+        data,
+        shape,
+        strides,
+    })
+}
+
+struct RotationPlane {
+    output_shape: [usize; 2],
+    cos: f64,
+    sin: f64,
+    offset: [f64; 2],
+}
+
+impl RotationPlane {
+    fn new(input_shape: [usize; 2], angle: f64, reshape: bool) -> Result<Self, NdimageError> {
+        let [rows, cols] = input_shape;
+        if rows == 0 || cols == 0 {
+            return Err(NdimageError::EmptyInput);
+        }
+        // SciPy uses its degree-trigonometry kernels, including exact
+        // quadrants and the documented loss-of-precision behavior at very
+        // large angles. Reuse the same kernels instead of reducing in radians.
+        let cos = fsci_special::cosdg(angle);
+        let sin = fsci_special::sindg(angle);
+
+        let output_shape = if reshape {
+            // scipy.ndimage.rotate: int(ptp(M @ corners) + 0.5), where
+            // M = [[cos, sin], [-sin, cos]]. A ceiling adds spurious pixels.
+            let (iy, ix) = (rows as f64, cols as f64);
+            let extent = |a: f64, b: f64| -> Result<usize, NdimageError> {
+                let bounds = [0.0, b * ix, a * iy, a * iy + b * ix];
+                let hi = bounds.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let lo = bounds.iter().copied().fold(f64::INFINITY, f64::min);
+                let length = hi - lo + 0.5;
+                if !length.is_finite() || length >= usize::MAX as f64 {
+                    return Err(NdimageError::InvalidArgument(
+                        "rotated axis length is not representable".to_string(),
+                    ));
+                }
+                Ok(length as usize)
+            };
+            [extent(cos, sin)?, extent(-sin, cos)?]
+        } else {
+            input_shape
+        };
+        let cy_out = (output_shape[0] as f64 - 1.0) / 2.0;
+        let cx_out = (output_shape[1] as f64 - 1.0) / 2.0;
+        let offset = [
+            (rows as f64 - 1.0) / 2.0 - (cos * cy_out + sin * cx_out),
+            (cols as f64 - 1.0) / 2.0 - (-sin * cy_out + cos * cx_out),
+        ];
+        Ok(Self {
+            output_shape,
+            cos,
+            sin,
+            offset,
+        })
+    }
+
+    fn apply(
+        &self,
+        input: &NdArray,
+        order: usize,
+        mode: BoundaryMode,
+        cval: f64,
+        flags: SplineFlags,
+    ) -> Result<NdArray, NdimageError> {
+        let spline = if order > 1
+            && mode == BoundaryMode::Reflect
+            && input.shape.iter().any(|&length| length <= order)
+        {
+            // SciPy retains the full spline order even on a singleton or short
+            // plane. Its reflect recurrence is defined for every line length;
+            // padding and solving a different interpolation problem changes it.
+            let mut coeffs = input.clone();
+            let [rows, cols] = [input.shape[0], input.shape[1]];
+            bspline_reflect_axis_inplace(&mut coeffs.data, 1, rows, cols, order);
+            bspline_reflect_axis_inplace(&mut coeffs.data, rows, cols, 1, order);
+            SplinePrefilter {
+                coeffs,
+                coord_offsets: vec![0.0; 2],
+            }
+        } else {
+            prefilter_spline_coefficients(input, order, mode)?
+        };
+        let mut output = rotation_array(self.output_shape.to_vec())?;
+        let out_cols = self.output_shape[1];
+        let kernel_work = (order + 1) * (order + 1);
+        fill_pixels_parallel(&mut output, kernel_work, |flat, _scratch| {
+            let row = (flat / out_cols) as f64;
+            let col = (flat % out_cols) as f64;
+            // Match NI_GeometricTransform's affine accumulation order: start
+            // with the offset, then add each matrix-column contribution.
+            let src_y = (self.offset[0] + row * self.cos) + col * self.sin;
+            let src_x = (self.offset[1] - row * self.sin) + col * self.cos;
+            sample_rotation_plane(input, &spline, [src_y, src_x], order, mode, cval, flags)
+        });
+        Ok(output)
+    }
+}
+
+fn sample_rotation_plane(
+    input: &NdArray,
+    spline: &SplinePrefilter,
+    coords: [f64; 2],
+    order: usize,
+    mode: BoundaryMode,
+    cval: f64,
+    flags: SplineFlags,
+) -> f64 {
+    let mut mapped = [0.0; 2];
+    for axis in 0..2 {
+        let len = input.shape[axis];
+        // NI_GeometricTransform maps the floating coordinate before rounding
+        // or finding the support. For wrap, a negative whole period maps to
+        // the last sample, whereas a positive whole period maps to the first.
+        // Do not snap near-integer coordinates: a near-quadrant rotation can
+        // legitimately place a pixel just outside a constant boundary.
+        mapped[axis] = if mode == BoundaryMode::Mirror && len > 1 {
+            // Preserve NI_GeometricTransform's half-grid tie behavior: on the
+            // positive side the reduced coordinate is folded only at `len`,
+            // not at `len - 1`. Rounding 1.5 on a length-two axis then folds
+            // integer tap 2 to 0; folding to 0.5 first would select tap 1.
+            let period = 2.0 * (len - 1) as f64;
+            if coords[axis] < 0.0 {
+                let reduced = period * (-coords[axis] / period).floor() + coords[axis];
+                if reduced <= 1.0 - len as f64 {
+                    reduced + period
+                } else {
+                    -reduced
+                }
+            } else if coords[axis] > (len - 1) as f64 {
+                let reduced = coords[axis] - period * (coords[axis] / period).floor();
+                if reduced >= len as f64 {
+                    period - reduced
+                } else {
+                    reduced
+                }
+            } else {
+                coords[axis]
+            }
+        } else if mode == BoundaryMode::Wrap && len > 1 {
+            let last = (len - 1) as f64;
+            if coords[axis] < 0.0 {
+                coords[axis] + last * ((-coords[axis] / last).floor() + 1.0)
+            } else if coords[axis] > last {
+                coords[axis] - last * (coords[axis] / last).floor()
+            } else {
+                coords[axis]
+            }
+        } else if let Some(value) = map_interpolation_coordinate(coords[axis], len, mode) {
+            value
+        } else {
+            return cval;
+        };
+    }
+    if order == 0 {
+        let indices = mapped.map(|coordinate| (coordinate + 0.5).floor() as i64);
+        return input.get_boundary(&indices, mode, cval);
+    }
+
+    // Constant/wrap decide which source coordinate to use above, but their
+    // spline coefficients and out-of-range support taps use mirror symmetry.
+    // The cardinal kernels must therefore see Mirror, including orders 2/4/5.
+    let lookup_mode = match mode {
+        BoundaryMode::Constant | BoundaryMode::Wrap => BoundaryMode::Mirror,
+        _ => mode,
+    };
+    thread_local! {
+        static ROTATION_SUPPORT: std::cell::RefCell<[Vec<(usize, f64)>; 2]> =
+            const { std::cell::RefCell::new([Vec::new(), Vec::new()]) };
+    }
+    ROTATION_SUPPORT.with_borrow_mut(|support| {
+        let flags = SplineFlags::resolve_or_reread(flags);
+        for axis in 0..2 {
+            support[axis].clear();
+            if spline.coeffs.shape[axis] == 1 {
+                // Every folded tap reads the same coefficient; its weights
+                // sum to one. No reduced-order knot system is needed.
+                support[axis].push((0, 1.0));
+            } else {
+                let coordinate = if mode == BoundaryMode::Nearest {
+                    // Nearest's padded spline can ring just beyond the input
+                    // edge, so retain that coordinate until after padding.
+                    coords[axis]
+                } else {
+                    mapped[axis]
+                };
+                if !compute_axis_support(
+                    coordinate,
+                    spline.coeffs.shape[axis],
+                    input.shape[axis],
+                    spline.coord_offsets[axis],
+                    order,
+                    lookup_mode,
+                    flags.compact_disabled,
+                    &mut support[axis],
+                ) {
+                    return cval;
+                }
+            }
+            if flags.offsets {
+                for tap in &mut support[axis] {
+                    tap.0 *= spline.coeffs.strides[axis];
+                }
+            }
+        }
+        if flags.offsets {
+            let slices = [support[0].as_slice(), support[1].as_slice()];
+            sample_spline_offsets(&spline.coeffs.data, &slices, 0)
+        } else {
+            sample_spline_recursive(&spline.coeffs, support, 0, &mut [0; 2])
+        }
+    })
 }
 
 // ══════════════════════════════════════════════════════════════════════

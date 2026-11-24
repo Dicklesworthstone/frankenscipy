@@ -11,6 +11,8 @@ on:
       - "crates/fsci-linalg/**"
       - "crates/fsci-sparse/**"
       - "crates/fsci-stats/**"
+      - "crates/fsci-ndimage/**"
+      - "crates/fsci-special/**"
       - "crates/fsci-signal/**"
       - "crates/fsci-conformance/tests/diff_signal_sosfilt.rs"
       - "crates/fsci-conformance/tests/diff_signal_stft_istft.rs"
@@ -44,7 +46,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [least-squares, global-optimization, sparse-lsmr, distribution-fit, resampling, fft-capture, casp, quadrature, interpolation, signal-state]
+        lane: [least-squares, global-optimization, sparse-lsmr, distribution-fit, image-rotation, resampling, fft-capture, casp, quadrature, interpolation, signal-state]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -125,6 +127,11 @@ jobs:
               cargo test --locked -p fsci-stats --lib discrete_likelihood_fits -- --nocapture
               cargo test --locked -p fsci-stats --lib randint_fitted_extreme_signed_intervals -- --nocapture
               cargo test --locked -p fsci-stats --test mle_scipy -- --nocapture
+              ;;
+            image-rotation)
+              cargo test --locked -p fsci-special --lib degree_trig_preserves_scipy_cosine_rounding -- --nocapture
+              cargo test --locked -p fsci-ndimage --lib rotate_ -- --nocapture
+              cargo test --locked -p fsci-ndimage --test rotate_axes_scipy -- --nocapture
               ;;
             resampling)
               cargo test --locked -p fsci-stats --test permutation_scipy -- --nocapture

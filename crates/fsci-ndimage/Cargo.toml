@@ -27,6 +27,7 @@ bench-harness = ["fsci-runtime/bench-harness"]
 fsci-fft = { workspace = true }
 fsci-interpolate = { workspace = true }
 fsci-runtime = { workspace = true }
+fsci-special = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

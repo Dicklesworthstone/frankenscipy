@@ -8174,7 +8174,10 @@ pub fn cosdg(x: f64) -> f64 {
     y = if j == 1 || j == 2 {
         z + z * (zz * degtrig_polevl(zz, &DEGTRIG_SINCOF))
     } else {
-        1.0 - 0.5 * zz + zz * zz * degtrig_polevl(zz, &DEGTRIG_COSCOF)
+        // Preserve Cephes' subtraction grouping. Reassociating as (1 - a) + b
+        // changes the last bit, which can move an image coordinate outside a
+        // constant boundary even at the exact center of a rotation.
+        1.0 - (0.5 * zz - zz * zz * degtrig_polevl(zz, &DEGTRIG_COSCOF))
     };
     if sign < 0.0 { -y } else { y }
 }
@@ -8213,7 +8216,7 @@ pub fn sindg(x: f64) -> f64 {
     z *= DEGTRIG_PI180;
     let zz = z * z;
     y = if j == 1 || j == 2 {
-        1.0 - 0.5 * zz + zz * zz * degtrig_polevl(zz, &DEGTRIG_COSCOF)
+        1.0 - (0.5 * zz - zz * zz * degtrig_polevl(zz, &DEGTRIG_COSCOF))
     } else {
         z + z * (zz * degtrig_polevl(zz, &DEGTRIG_SINCOF))
     };
@@ -12795,6 +12798,52 @@ mod tests {
         assert!(cotdg(0.0).is_infinite());
         assert!((cotdg(45.0) - 1.0).abs() < 1e-15);
         assert!((cotdg(90.0) - 0.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn degree_trig_preserves_scipy_cosine_rounding() {
+        // Binary64 values from SciPy 1.17.1 / NumPy 2.4.3. The former
+        // reassociated cosine polynomial was one ULP high at 37 degrees,
+        // making a singleton-plane rotation's center miss its own input.
+        let c = f64::from_bits(0x3fe9_8e6c_0ea2_7a14);
+        let s = f64::from_bits(0x3fe3_4211_9455_beb6);
+        for (angle, expected_cos, expected_sin) in [
+            (0.0, 1.0, 0.0),
+            (37.0, c, s),
+            (-37.0, c, -s),
+            (53.0, s, c),
+            (-53.0, s, -c),
+            (90.0, -0.0, 1.0),
+            (-90.0, -0.0, -1.0),
+            (127.0, -s, c),
+            (-127.0, -s, -c),
+            (143.0, -c, s),
+            (-143.0, -c, -s),
+            (180.0, -1.0, -0.0),
+            (-180.0, -1.0, 0.0),
+            (217.0, -c, -s),
+            (-217.0, -c, s),
+            (233.0, -s, -c),
+            (-233.0, -s, c),
+            (270.0, 0.0, -1.0),
+            (-270.0, 0.0, 1.0),
+            (307.0, s, -c),
+            (-307.0, s, c),
+            (323.0, c, -s),
+            (-323.0, c, s),
+            (360.0, 1.0, 0.0),
+        ] {
+            assert_eq!(
+                cosdg(angle).to_bits(),
+                expected_cos.to_bits(),
+                "cosdg({angle})"
+            );
+            assert_eq!(
+                sindg(angle).to_bits(),
+                expected_sin.to_bits(),
+                "sindg({angle})"
+            );
+        }
     }
 
     #[test]
