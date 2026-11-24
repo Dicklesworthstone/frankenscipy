@@ -2161,11 +2161,7 @@ where
     {
         pattern.validate_dimension(resolved_opts.y0.len())?;
     }
-    let probe = probe_ode_stiffness_checked(
-        fun,
-        &resolved_opts,
-        &mut ProbeEvaluations::default(),
-    )?;
+    let probe = probe_ode_stiffness_checked(fun, &resolved_opts, &mut ProbeEvaluations::default())?;
     let mut effective_stiffness =
         if stiffness_ratio_estimate.is_finite() && stiffness_ratio_estimate > 0.0 {
             if stiffness_ratio_estimate < 1.0 && probe.stiffness_ratio_estimate <= 10.0 {
@@ -2189,8 +2185,8 @@ where
     } else {
         Vec::new()
     };
-    let (mut action, mut posterior, mut expected_losses, mut chosen_loss) =
-        portfolio.select_action_excluding(
+    let (mut action, mut posterior, mut expected_losses, mut chosen_loss) = portfolio
+        .select_action_excluding(
             effective_stiffness,
             is_algebraic_dae,
             options.rtol,
@@ -5558,7 +5554,11 @@ mod tests {
     #[test]
     fn casp_sparse_analytic_probe_matches_dense_after_canonicalizing_duplicates() {
         fn dense(_t: f64, _y: &[f64]) -> Vec<Vec<f64>> {
-            vec![vec![-3.0, 1.0, 0.0], vec![1.0, -4.0, 1.0], vec![0.0, 1.0, -5.0]]
+            vec![
+                vec![-3.0, 1.0, 0.0],
+                vec![1.0, -4.0, 1.0],
+                vec![0.0, 1.0, -5.0],
+            ]
         }
         fn sparse(_t: f64, _y: &[f64]) -> fsci_sparse::CscMatrix {
             fsci_sparse::CscMatrix::from_components(
@@ -5581,11 +5581,17 @@ mod tests {
             };
             let dense_probe = probe_ode_stiffness(
                 &mut |_t, _y| panic!("dense analytic probe must not call RHS"),
-                &SolveIvpOptions { jac: Some(dense), ..options.clone() },
+                &SolveIvpOptions {
+                    jac: Some(dense),
+                    ..options.clone()
+                },
             );
             let sparse_probe = probe_ode_stiffness(
                 &mut |_t, _y| panic!("sparse analytic probe must not call RHS"),
-                &SolveIvpOptions { jac_sparse: Some(sparse), ..options },
+                &SolveIvpOptions {
+                    jac_sparse: Some(sparse),
+                    ..options
+                },
             );
             assert_eq!(sparse_probe, dense_probe);
             assert!(sparse_probe.spectral_radius > 5.0);
@@ -5636,7 +5642,8 @@ mod tests {
                 assert!(result.result.success, "{mode:?}: {}", result.result.message);
                 assert_eq!(result.attempts.len(), if force_retry { 2 } else { 1 });
                 assert!(result.attempts.iter().all(|(action, _)| matches!(
-                    action, OdeSolverAction::BDF | OdeSolverAction::Radau
+                    action,
+                    OdeSolverAction::BDF | OdeSolverAction::Radau
                 )));
                 if force_retry {
                     assert!(result.fallback_active);
@@ -5644,7 +5651,10 @@ mod tests {
                     assert!(!result.attempts[0].1);
                 }
                 assert_eq!(result.result.nfev, rhs_calls);
-                assert_eq!(result.result.njev, IMPLICIT_JAC_CALLS.with(|calls| calls.get()));
+                assert_eq!(
+                    result.result.njev,
+                    IMPLICIT_JAC_CALLS.with(|calls| calls.get())
+                );
                 assert_eq!(result.stiffness_probe.probe_nfev, 0);
                 assert_eq!(result.stiffness_probe.probe_njev, 1);
                 assert!(result.result.njev >= 2);
@@ -5667,46 +5677,92 @@ mod tests {
         }
         fn wrong_sparse(_t: f64, _y: &[f64]) -> fsci_sparse::CscMatrix {
             fsci_sparse::CscMatrix::from_components(
-                fsci_sparse::Shape2D::new(0, 0), vec![], vec![], vec![0], true,
-            ).unwrap()
+                fsci_sparse::Shape2D::new(0, 0),
+                vec![],
+                vec![],
+                vec![0],
+                true,
+            )
+            .unwrap()
         }
         fn nonfinite_sparse(_t: f64, _y: &[f64]) -> fsci_sparse::CscMatrix {
             fsci_sparse::CscMatrix::from_components(
                 fsci_sparse::Shape2D::new(1, 1),
-                vec![f64::INFINITY], vec![0], vec![0, 1], true,
-            ).unwrap()
+                vec![f64::INFINITY],
+                vec![0],
+                vec![0, 1],
+                true,
+            )
+            .unwrap()
         }
         fn overflowing_duplicates(_t: f64, _y: &[f64]) -> fsci_sparse::CscMatrix {
             fsci_sparse::CscMatrix::from_components(
                 fsci_sparse::Shape2D::new(1, 1),
-                vec![f64::MAX, f64::MAX], vec![0, 0], vec![0, 2], false,
-            ).unwrap()
+                vec![f64::MAX, f64::MAX],
+                vec![0, 0],
+                vec![0, 2],
+                false,
+            )
+            .unwrap()
         }
         for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
             for (jac, jac_sparse, error) in [
-                (Some(wrong_dense as JacFn), None, IntegrateValidationError::JacobianWrongShape { expected: 1 }),
-                (Some(nonfinite_dense as JacFn), None, IntegrateValidationError::NonFiniteJacobian),
-                (None, Some(wrong_sparse as crate::SparseJacFn), IntegrateValidationError::JacobianWrongShape { expected: 1 }),
-                (None, Some(nonfinite_sparse as crate::SparseJacFn), IntegrateValidationError::NonFiniteJacobian),
-                (None, Some(overflowing_duplicates as crate::SparseJacFn), IntegrateValidationError::NonFiniteJacobian),
+                (
+                    Some(wrong_dense as JacFn),
+                    None,
+                    IntegrateValidationError::JacobianWrongShape { expected: 1 },
+                ),
+                (
+                    Some(nonfinite_dense as JacFn),
+                    None,
+                    IntegrateValidationError::NonFiniteJacobian,
+                ),
+                (
+                    None,
+                    Some(wrong_sparse as crate::SparseJacFn),
+                    IntegrateValidationError::JacobianWrongShape { expected: 1 },
+                ),
+                (
+                    None,
+                    Some(nonfinite_sparse as crate::SparseJacFn),
+                    IntegrateValidationError::NonFiniteJacobian,
+                ),
+                (
+                    None,
+                    Some(overflowing_duplicates as crate::SparseJacFn),
+                    IntegrateValidationError::NonFiniteJacobian,
+                ),
             ] {
                 let options = SolveIvpOptions {
-                    t_span: (0.0, 1.0), y0: &[1.0], jac, jac_sparse, mode,
+                    t_span: (0.0, 1.0),
+                    y0: &[1.0],
+                    jac,
+                    jac_sparse,
+                    mode,
                     ..SolveIvpOptions::default()
                 };
                 let skipped = probe_ode_stiffness(
                     &mut |_t, _y| panic!("invalid analytic callback must not evaluate RHS"),
                     &options,
                 );
-                assert_eq!(skipped, OdeStiffnessProbe {
-                    probe_njev: 1, ..OdeStiffnessProbe::default()
-                });
+                assert_eq!(
+                    skipped,
+                    OdeStiffnessProbe {
+                        probe_njev: 1,
+                        ..OdeStiffnessProbe::default()
+                    }
+                );
                 let ledger = crate::validation::sync_audit_ledger();
                 let mut portfolio = OdeSolverPortfolio::new(mode, 4);
                 let returned = solve_ivp_with_casp_portfolio_and_audit(
                     &mut |_t, _y| panic!("invalid analytic callback must fail before solving"),
-                    &options, &mut portfolio, 0.0, false, &ledger,
-                ).unwrap_err();
+                    &options,
+                    &mut portfolio,
+                    0.0,
+                    false,
+                    &ledger,
+                )
+                .unwrap_err();
                 assert_eq!(returned, error);
                 assert_eq!(portfolio.evidence_len(), 0);
                 let guard = ledger.lock().unwrap();
@@ -5740,16 +5796,23 @@ mod tests {
         for scale in [1e-310, 1e-200, 1e200] {
             let y0 = [scale, 1.0];
             let options = SolveIvpOptions {
-                t_span: (0.0, 1.0), y0: &y0,
+                t_span: (0.0, 1.0),
+                y0: &y0,
                 ..SolveIvpOptions::default()
             };
             let dense_probe = probe_ode_stiffness(
                 &mut |_t, _y| panic!("analytic probe must not call RHS"),
-                &SolveIvpOptions { jac: Some(dense), ..options.clone() },
+                &SolveIvpOptions {
+                    jac: Some(dense),
+                    ..options.clone()
+                },
             );
             let sparse_probe = probe_ode_stiffness(
                 &mut |_t, _y| panic!("analytic probe must not call RHS"),
-                &SolveIvpOptions { jac_sparse: Some(sparse), ..options },
+                &SolveIvpOptions {
+                    jac_sparse: Some(sparse),
+                    ..options
+                },
             );
             assert_eq!(sparse_probe, dense_probe);
             assert!((dense_probe.spectral_radius / scale - 3.0).abs() < 1e-6);
@@ -5766,23 +5829,38 @@ mod tests {
         }
         for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
             for (jac_sparse, method, lband, error) in [
-                (Some(sparse as crate::SparseJacFn), SolverKind::Bdf, None,
-                    IntegrateValidationError::ConflictingJacobians),
-                (None, SolverKind::Lsoda, Some(0),
+                (
+                    Some(sparse as crate::SparseJacFn),
+                    SolverKind::Bdf,
+                    None,
+                    IntegrateValidationError::ConflictingJacobians,
+                ),
+                (
+                    None,
+                    SolverKind::Lsoda,
+                    Some(0),
                     IntegrateValidationError::NotYetImplemented {
                         function: "CASP with a packed LSODA Jacobian",
-                    }),
+                    },
+                ),
             ] {
                 let options = SolveIvpOptions {
-                    t_span: (0.0, 1.0), y0: &[1.0], jac: Some(dense),
-                    jac_sparse, method, lband, mode,
+                    t_span: (0.0, 1.0),
+                    y0: &[1.0],
+                    jac: Some(dense),
+                    jac_sparse,
+                    method,
+                    lband,
+                    mode,
                     ..SolveIvpOptions::default()
                 };
                 let mut portfolio = OdeSolverPortfolio::new(mode, 4);
                 let returned = solve_ivp_with_casp(
                     &mut |_t, _y| panic!("unsupported options must fail before RHS"),
-                    &options, &mut portfolio,
-                ).unwrap_err();
+                    &options,
+                    &mut portfolio,
+                )
+                .unwrap_err();
                 assert_eq!(returned, error);
             }
         }

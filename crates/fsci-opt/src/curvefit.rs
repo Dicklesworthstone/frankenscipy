@@ -1305,10 +1305,7 @@ fn fd_points_scipy(
         first = first.clamp(lower_bound, upper_bound);
         second = second.clamp(lower_bound, upper_bound);
         let admissible = |point: f64| {
-            point.is_finite()
-                && point >= lower_bound
-                && point <= upper_bound
-                && point != x[i]
+            point.is_finite() && point >= lower_bound && point <= upper_bound && point != x[i]
         };
         if !admissible(first) {
             if method == FiniteDiffMethod::ThreePoint && admissible(second) {
@@ -5382,9 +5379,8 @@ mod tests {
                         LeastSquaresOptions {
                             method: Some(method),
                             diff_method,
-                            jac_sparsity: sparse.then(|| {
-                                JacobianSparsity::from_rows(vec![vec![0]], 1).unwrap()
-                            }),
+                            jac_sparsity: sparse
+                                .then(|| JacobianSparsity::from_rows(vec![vec![0]], 1).unwrap()),
                             ..LeastSquaresOptions::default()
                         },
                     )
@@ -5419,9 +5415,8 @@ mod tests {
                 let options = LeastSquaresOptions {
                     method: Some(method),
                     diff_method: FiniteDiffMethod::ThreePoint,
-                    jac_sparsity: sparse.then(|| {
-                        JacobianSparsity::from_rows(vec![vec![0]], 1).unwrap()
-                    }),
+                    jac_sparsity: sparse
+                        .then(|| JacobianSparsity::from_rows(vec![vec![0]], 1).unwrap()),
                     max_nfev: Some(1),
                     ..LeastSquaresOptions::default()
                 };
@@ -5478,10 +5473,7 @@ mod tests {
                 |x| {
                     assert!(lower <= x[0] && x[0] <= upper);
                     assert!(0.0 <= x[1] && x[1] <= 2.0);
-                    vec![
-                        (x[0] - lower) / width - 1.0,
-                        x[1] * x[1] + 2.0 * x[1] + 3.0,
-                    ]
+                    vec![(x[0] - lower) / width - 1.0, x[1] * x[1] + 2.0 * x[1] + 3.0]
                 },
                 &[lower, 1.0],
                 &[lower, 0.0],

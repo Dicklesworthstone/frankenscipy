@@ -13,8 +13,8 @@ use fsci_stats::{
     CrystalBall, DiscreteDistribution, ExponWeibull, FDistribution, FitError, FoldedCauchy,
     GammaDist, JohnsonSU, Kappa3, Landau, LocationScale, LogSeries, Lognormal, Mielke, MleOptions,
     MleParameter, MleResult, Nakagami, NormInvGauss, Normal, RDist, RandInt, Rice, SkewCauchy,
-    StatsError, StudentT, Trapezoid, TruncNormal, TruncPareto, TruncWeibullMin, Weibull, Zipfian, fit_mle,
-    fit_mle_censored, fit_mle_location_scale, fit_mle_location_scale_censored,
+    StatsError, StudentT, Trapezoid, TruncNormal, TruncPareto, TruncWeibullMin, Weibull, Zipfian,
+    fit_mle, fit_mle_censored, fit_mle_location_scale, fit_mle_location_scale_censored,
     with_hardened_stats_caps, with_stats_runtime_mode,
 };
 use fsci_stats::{Cauchy, DoubleGamma, ExponNorm, FoldedNormal, LaplaceAsymmetric};
@@ -296,7 +296,10 @@ fn student_t_mle_solves_the_standardized_likelihood() {
     for (data, expected_df) in [
         (vec![7.0, 7.0, 7.0], 0.426_146_305_754_734_5),
         (vec![-20.0, -2.0, 0.0, 1.0, 100.0], 0.396_291_473_268_043_1),
-        (vec![-2.0, -0.3, 0.0, 0.5, 3.0, 10.0], 0.898_808_574_240_352_6),
+        (
+            vec![-2.0, -0.3, 0.0, 0.5, 3.0, 10.0],
+            0.898_808_574_240_352_6,
+        ),
     ] {
         let fitted = StudentT::try_fit(&data).unwrap();
         assert!(
@@ -405,8 +408,14 @@ fn student_t_density_keeps_finite_power_law_tails_and_the_gaussian_limit() {
         let densities = distribution.pdf_many(&points);
         let log_densities = distribution.logpdf_many(&points);
         for (index, &point) in points.iter().enumerate() {
-            assert_eq!(densities[index].to_bits(), distribution.pdf(point).to_bits());
-            assert_eq!(log_densities[index].to_bits(), distribution.logpdf(point).to_bits());
+            assert_eq!(
+                densities[index].to_bits(),
+                distribution.pdf(point).to_bits()
+            );
+            assert_eq!(
+                log_densities[index].to_bits(),
+                distribution.logpdf(point).to_bits()
+            );
         }
         assert_eq!(distribution.logpdf(f64::INFINITY), f64::NEG_INFINITY);
         assert_eq!(distribution.logpdf(f64::NEG_INFINITY), f64::NEG_INFINITY);
@@ -428,7 +437,10 @@ fn student_t_mle_matches_live_scipy_with_fixed_location_and_scale() {
         .output()
         .is_ok_and(|output| output.status.success());
     if !available {
-        assert!(!required, "required SciPy oracle is unavailable via {python}");
+        assert!(
+            !required,
+            "required SciPy oracle is unavailable via {python}"
+        );
         eprintln!("SKIP StudentT MLE: SciPy oracle unavailable; compared cases = 0");
         return;
     }
@@ -485,7 +497,10 @@ for case, data in enumerate(datasets):
             .split_whitespace()
             .map(|value| value.parse().unwrap())
             .collect();
-        assert_eq!(data.len(), if case < 6 { 2000 } else { [3, 5, 6][case - 6] });
+        assert_eq!(
+            data.len(),
+            if case < 6 { 2000 } else { [3, 5, 6][case - 6] }
+        );
         let fitted = StudentT::try_fit(&data).unwrap();
         let nll = likelihood(&fitted, &data);
         assert!(
@@ -503,7 +518,10 @@ for case, data in enumerate(datasets):
         );
         compared += 1;
     }
-    assert_eq!(compared, 9, "all standardized StudentT fits must be compared");
+    assert_eq!(
+        compared, 9,
+        "all standardized StudentT fits must be compared"
+    );
     eprintln!("StudentT MLE compared cases = {compared}");
 }
 

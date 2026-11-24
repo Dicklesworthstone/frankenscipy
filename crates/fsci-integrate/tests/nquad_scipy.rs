@@ -202,7 +202,11 @@ print(json.dumps({'scipy':scipy.__version__, 'numpy':np.__version__, 'rows':rows
     );
     let oracle: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let rows = oracle["rows"].as_array().unwrap();
-    assert_eq!(rows.len(), 8, "the oracle must compare every requested case");
+    assert_eq!(
+        rows.len(),
+        8,
+        "the oracle must compare every requested case"
+    );
     let mut compared = 0;
     for (id, row) in rows.iter().enumerate() {
         let options = DblquadOptions {

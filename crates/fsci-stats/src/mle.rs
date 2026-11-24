@@ -604,8 +604,7 @@ fn student_t_shape_score(sample: &[StudentTObservation], df: f64) -> f64 {
                     fraction - df * (logarithm - fraction)
                 } else if q <= 0.125 {
                     let (remainder, _) = student_t_log_remainders(q);
-                    observation.square
-                        * (1.0 / (1.0 + q) - observation.square * remainder)
+                    observation.square * (1.0 / (1.0 + q) - observation.square * remainder)
                 } else {
                     df * (fraction - df * (logarithm - fraction))
                 }
@@ -630,8 +629,7 @@ fn student_t_score_tail_resolved(sample: &[StudentTObservation], df: f64) -> boo
         let u = df * fraction;
         u - 0.5 * observation.square * observation.square
     });
-    let lower = 0.5 - 0.25 * (1.0 / df).powi(2)
-        + compensated_mean(lower_terms, sample.len());
+    let lower = 0.5 - 0.25 * (1.0 / df).powi(2) + compensated_mean(lower_terms, sample.len());
     let upper_terms = sample.iter().map(|&observation| {
         let (_, _, fraction) = observation.ratio(df);
         let u = df * fraction;
@@ -671,11 +669,9 @@ pub(crate) fn student_t_shape_mle(data: &[f64]) -> Result<f64, FitError> {
                     let (q, logarithm, _) = observation.ratio(df);
                     if q <= 0.125 {
                         let (_, remainder) = student_t_log_remainders(q);
-                        adjustment
-                            + 0.5 * (observation.square * q * remainder - logarithm)
+                        adjustment + 0.5 * (observation.square * q * remainder - logarithm)
                     } else {
-                        adjustment + 0.5 * observation.square
-                            - crate::student_t_log_kernel(df, x)
+                        adjustment + 0.5 * observation.square - crate::student_t_log_kernel(df, x)
                     }
                 }),
                 sample.len(),

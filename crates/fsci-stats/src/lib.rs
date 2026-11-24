@@ -2228,9 +2228,7 @@ impl StudentT {
     pub fn logpdf_many(&self, xs: &[f64]) -> Vec<f64> {
         let v = self.df;
         let log_coeff = log_gamma_ratio_t(v);
-        par_continuous_map_min(xs, 65536, |x| {
-            log_coeff - student_t_log_kernel(v, x)
-        })
+        par_continuous_map_min(xs, 65536, |x| log_coeff - student_t_log_kernel(v, x))
     }
 
     /// Cumulative distribution at many points — work-gated parallel map of the per-point
@@ -17454,8 +17452,7 @@ fn student_t_log_normalization_adjustment(v: f64) -> f64 {
                 + squared
                     * (1.0 / 24.0
                         + squared
-                            * (-1.0 / 20.0
-                                + squared * (17.0 / 112.0 - squared * (31.0 / 36.0)))))
+                            * (-1.0 / 20.0 + squared * (17.0 / 112.0 - squared * (31.0 / 36.0)))))
     } else {
         log_gamma_ratio_t(v) + 0.5 * (2.0 * PI).ln()
     }

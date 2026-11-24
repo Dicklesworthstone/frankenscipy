@@ -9520,15 +9520,8 @@ mod tests {
         assert!(one.converged && one.error > 1e-12);
         let exact = (1.0 - 100.0_f64.cos()) / 100.0;
         for (a, b, sign) in [(0.0, 1.0, 1.0), (1.0, 0.0, -1.0)] {
-            let double = dblquad(
-                |y, _| (100.0 * y).sin(),
-                a,
-                b,
-                |_| 0.0,
-                |_| 1.0,
-                options,
-            )
-            .unwrap();
+            let double =
+                dblquad(|y, _| (100.0 * y).sin(), a, b, |_| 0.0, |_| 1.0, options).unwrap();
             assert!(double.converged);
             assert!((double.integral - sign * exact).abs() < 1e-12);
             assert_eq!(double.error.to_bits(), one.error.to_bits());
