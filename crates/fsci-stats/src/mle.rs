@@ -1154,6 +1154,181 @@ fn compensated_mean(values: impl Iterator<Item = f64>, count: usize) -> f64 {
     mean
 }
 
+/// Shape MLE for a standardized skew normal. The score
+/// sum(x * phi(a*x) / Phi(a*x)) decreases strictly when both signs occur.
+/// Solve in a*max|x| coordinates and compare signed score sums in log space,
+/// preserving observations whose magnitudes differ by hundreds of decades.
+pub(crate) fn skew_normal_shape_mle(data: &[f64]) -> Result<f64, FitError> {
+    validate_shape_sample(data, 2, "SkewNorm")?;
+    let positive = data.iter().any(|&x| x > 0.0);
+    let negative = data.iter().any(|&x| x < 0.0);
+    if !positive && !negative {
+        return Err(FitError::NonConvergent(
+            "SkewNorm shape is unidentifiable from zero observations".into(),
+        ));
+    }
+    if !positive || !negative {
+        return Err(FitError::NonConvergent(
+            "SkewNorm likelihood has only an infinite-shape maximum for one-sided observations"
+                .into(),
+        ));
+    }
+    let scale = data.iter().fold(0.0_f64, |maximum, x| maximum.max(x.abs()));
+    let observations: Vec<_> = data
+        .iter()
+        .filter(|&&x| x != 0.0)
+        .map(|&x| (x / scale, x.abs().ln(), x > 0.0))
+        .collect();
+    let log_mills_zero = 0.5 * (2.0 / std::f64::consts::PI).ln();
+    let log_sqrt_two_pi = 0.5 * (2.0 * std::f64::consts::PI).ln();
+    let log_add = |left: f64, right: f64| {
+        if left == f64::NEG_INFINITY {
+            return right;
+        }
+        let larger = left.max(right);
+        if larger == f64::INFINITY {
+            return larger;
+        }
+        larger + (left.min(right) - larger).exp().ln_1p()
+    };
+    let score = |shape: f64| {
+        let mut positive = f64::NEG_INFINITY;
+        let mut negative = f64::NEG_INFINITY;
+        for &(x, log_abs, is_positive) in &observations {
+            let z = shape * x;
+            let log_mills = if z < 0.0 {
+                // phi(z)/Phi(z) = sqrt(2/pi)/erfcx(-z/sqrt(2)).
+                // Subtracting log Phi(z) from -z²/2 loses this ratio
+                // in the far negative tail.
+                log_mills_zero
+                    - fsci_special::erfcx_scalar(-z * std::f64::consts::FRAC_1_SQRT_2).ln()
+            } else {
+                -0.5 * z * z - log_sqrt_two_pi - fsci_special::log_ndtr_scalar(z)
+            };
+            let term = log_abs + log_mills;
+            if is_positive {
+                positive = log_add(positive, term);
+            } else {
+                negative = log_add(negative, term);
+            }
+        }
+        positive - negative
+    };
+    let mut lower = -1.0_f64;
+    let mut upper = 1.0_f64;
+    for _ in 0..128 {
+        if score(lower) >= 0.0 {
+            break;
+        }
+        lower *= 2.0;
+    }
+    for _ in 0..128 {
+        if score(upper) <= 0.0 {
+            break;
+        }
+        upper *= 2.0;
+    }
+    if !(score(lower) >= 0.0 && score(upper) <= 0.0) {
+        return Err(FitError::NonConvergent(
+            "SkewNorm likelihood score could not be bracketed".into(),
+        ));
+    }
+    for _ in 0..128 {
+        let middle = lower + 0.5 * (upper - lower);
+        let value = score(middle);
+        if value.is_nan() {
+            return Err(FitError::NonConvergent(
+                "SkewNorm likelihood score could not be evaluated".into(),
+            ));
+        }
+        if value == 0.0 || middle == lower || middle == upper {
+            let shape = middle / scale;
+            let distribution = crate::SkewNorm { a: shape };
+            if shape.is_finite() && data.iter().all(|&x| distribution.logpdf(x).is_finite()) {
+                return Ok(shape);
+            }
+            return Err(FitError::NonConvergent(
+                "SkewNorm MLE has no finite representable shape and likelihood".into(),
+            ));
+        }
+        if value > 0.0 {
+            lower = middle;
+        } else {
+            upper = middle;
+        }
+    }
+    Err(FitError::NonConvergent(
+        "SkewNorm likelihood score did not converge".into(),
+    ))
+}
+
+/// Erlang's rate is k/mean(x) at every fixed integer k. Its profiled
+/// log likelihood is strictly concave in the continuous shape, so the
+/// integer maximum is at one of the two neighbors of the Gamma MLE.
+pub(crate) fn erlang_mle(data: &[f64]) -> Result<crate::Erlang, FitError> {
+    validate_shape_sample(data, 2, "Erlang")?;
+    if data.iter().any(|&x| x < 0.0) {
+        return Err(FitError::UnsupportedData(
+            "Erlang support is [0, infinity)".into(),
+        ));
+    }
+    let maximum = data.iter().copied().fold(0.0_f64, f64::max);
+    if maximum == 0.0 {
+        return Err(FitError::NonConvergent(
+            "Erlang likelihood is unbounded for an all-zero sample".into(),
+        ));
+    }
+    let mean = maximum * compensated_mean(data.iter().map(|&x| x / maximum), data.len());
+    // A zero has zero density for every integer k>1. At k=1 the
+    // exponential likelihood has the ordinary finite rate estimate.
+    let k = if data.contains(&0.0) {
+        1
+    } else {
+        let log_mean = mean.ln();
+        let gap = compensated_mean(
+            data.iter().map(|&x| {
+                let relative = (x - mean) / mean;
+                if relative.abs() <= 0.5 {
+                    -fsci_special::log1pmx_scalar(relative)
+                } else {
+                    let ratio = x / mean;
+                    let log_ratio = if ratio > 0.0 {
+                        ratio.ln()
+                    } else {
+                        x.ln() - log_mean
+                    };
+                    ratio - 1.0 - log_ratio
+                }
+            }),
+            data.len(),
+        );
+        let continuous = gamma_shape_from_log_gap(gap, "Erlang")?;
+        if continuous <= 1.0 {
+            1
+        } else {
+            let lower = continuous.floor();
+            if lower >= usize::MAX as f64 || lower + 1.0 == lower {
+                return Err(FitError::NonConvergent(
+                    "Erlang MLE shape has no distinct representable integer neighbors".into(),
+                ));
+            }
+            // l(k+1)-l(k), per observation, is
+            // (k+1)*log1p(1/k)-1-gap. log1pmx avoids cancellation
+            // when a concentrated sample gives a large shape.
+            let inverse = 1.0 / lower;
+            let gain = lower * fsci_special::log1pmx_scalar(inverse) + inverse.ln_1p() - gap;
+            lower as usize + usize::from(gain > 0.0)
+        }
+    };
+    let rate = k as f64 / mean;
+    if !rate.is_finite() || rate <= 0.0 {
+        return Err(FitError::NonConvergent(
+            "Erlang MLE rate exceeds the finite positive parameter range".into(),
+        ));
+    }
+    Ok(crate::Erlang { k, rate })
+}
+
 /// With location zero and scale one, the asymmetric Laplace likelihood is
 /// strictly concave in log(kappa). Its score is
 /// -tanh(log(kappa)) - kappa*mean(x+) + mean((-x)+)/kappa.

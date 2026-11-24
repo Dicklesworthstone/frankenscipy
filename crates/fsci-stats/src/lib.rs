@@ -23734,7 +23734,7 @@ impl SkewNorm {
     }
 
     fn delta(&self) -> f64 {
-        self.a / (1.0 + self.a * self.a).sqrt()
+        self.a / self.a.hypot(1.0)
     }
 
     /// Left-tail cdf for a > 0 by direct quadrature of the pdf, avoiding the
@@ -23862,38 +23862,9 @@ impl ContinuousDistribution for SkewNorm {
         )
     }
 
+    /// Maximum-likelihood shape with location zero and scale one.
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        validate_finite_fit_data(data, 3, "SkewNorm")?;
-        let sample_skew = sample_standardized_skewness(data);
-        if !sample_skew.is_finite() {
-            return Err(FitError::NonConvergent(
-                "SkewNorm fit needs positive sample variance".to_owned(),
-            ));
-        }
-        if sample_skew.abs() < 1e-14 {
-            return Ok(Self { a: 0.0 });
-        }
-
-        let max_skew = Self { a: 50.0 }.skewness();
-        if sample_skew.abs() >= max_skew {
-            return Err(FitError::NonConvergent(format!(
-                "SkewNorm sample skew {sample_skew} exceeds standardized family range"
-            )));
-        }
-
-        let target = sample_skew.abs();
-        let mut lo = 0.0_f64;
-        let mut hi = 50.0_f64;
-        for _ in 0..80 {
-            let mid = 0.5 * (lo + hi);
-            if (Self { a: mid }).skewness() < target {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        let a = 0.5 * (lo + hi) * sample_skew.signum();
-        Ok(Self { a })
+        mle::skew_normal_shape_mle(data).map(|a| Self { a })
     }
 }
 
@@ -24741,9 +24712,8 @@ impl Erlang {
         Self { k, rate }
     }
 
-    /// Log-density at many points, hoisting `k·ln(λ)` and `lnΓ(k)` out of the
-    /// per-point loop. Byte-identical to mapping `logpdf` (lead leading, lnΓ last
-    /// subtraction); x≤0 delegates to `pdf`.
+    /// Log-density at many points, hoisting `k·ln(λ)` and `lnΓ(k)`.
+    /// Byte-identical to mapping `logpdf`, including support endpoints.
     #[must_use]
     pub fn logpdf_many(&self, xs: &[f64]) -> Vec<f64> {
         let k = self.k as f64;
@@ -24751,26 +24721,27 @@ impl Erlang {
         let k_lnlambda = k * lambda.ln();
         let lg = ln_gamma(k);
         par_continuous_map_min(xs, 65536, |x| {
-            if x <= 0.0 {
-                return self.pdf(x).ln();
+            if x <= 0.0 || !x.is_finite() {
+                return self.logpdf(x);
             }
             k_lnlambda + (k - 1.0) * x.ln() - lambda * x - lg
         })
     }
 
-    /// Density at many points; hoists `λ^k` (the lead factor) and `Γ(k)` (the
-    /// divisor) like [`logpdf_many`](Self::logpdf_many). Byte-identical to `pdf`.
+    /// Density at many points, evaluated from the log density so large
+    /// integer shapes do not produce overflowing powers or factorials.
+    /// Byte-identical to mapping `pdf`.
     #[must_use]
     pub fn pdf_many(&self, xs: &[f64]) -> Vec<f64> {
         let k = self.k as f64;
         let lambda = self.rate;
-        let coeff = lambda.powf(k);
-        let gamma_k = ln_gamma(k).exp();
+        let k_lnlambda = k * lambda.ln();
+        let lg = ln_gamma(k);
         par_continuous_map_min(xs, 65536, |x| {
-            if x < 0.0 {
-                return 0.0;
+            if x <= 0.0 || !x.is_finite() {
+                return self.pdf(x);
             }
-            coeff * x.powf(k - 1.0) * (-lambda * x).exp() / gamma_k
+            (k_lnlambda + (k - 1.0) * x.ln() - lambda * x - lg).exp()
         })
     }
 }
@@ -24780,15 +24751,22 @@ impl ContinuousDistribution for Erlang {
         if x < 0.0 {
             return 0.0;
         }
-        let k = self.k as f64;
-        let lambda = self.rate;
-        lambda.powf(k) * x.powf(k - 1.0) * (-lambda * x).exp() / ln_gamma(k).exp()
+        if x == 0.0 {
+            return if self.k == 1 { self.rate } else { 0.0 };
+        }
+        self.logpdf(x).exp()
     }
 
     fn logpdf(&self, x: f64) -> f64 {
-        // k·ln(λ) + (k−1)·ln(x) − λx − lnΓ(k); finite in the tail; x≤0 delegates. frankenscipy-p82v7
-        if x <= 0.0 {
-            return self.pdf(x).ln();
+        if x < 0.0 || x == f64::INFINITY {
+            return f64::NEG_INFINITY;
+        }
+        if x == 0.0 {
+            return if self.k == 1 {
+                self.rate.ln()
+            } else {
+                f64::NEG_INFINITY
+            };
         }
         let k = self.k as f64;
         let lambda = self.rate;
@@ -24881,53 +24859,9 @@ impl ContinuousDistribution for Erlang {
         k + ln_gamma(k) + (1.0 - k) * fsci_special::digamma_scalar(k) - self.rate.ln()
     }
 
+    /// Joint likelihood fit over positive integer shape and positive rate.
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        if data.len() < 2 {
-            return Err(FitError::InsufficientData {
-                required: 2,
-                actual: data.len(),
-            });
-        }
-        // Method-of-moments: m = k/rate, v = k/rate², so rate = m/v and
-        // k = m²/v rounded to the nearest positive integer.
-        let mut sum = 0.0_f64;
-        let mut count = 0usize;
-        for &x in data {
-            if !x.is_finite() {
-                return Err(FitError::UnsupportedData(format!(
-                    "Erlang data contains non-finite value: {x}"
-                )));
-            }
-            if x < 0.0 {
-                return Err(FitError::UnsupportedData(format!(
-                    "Erlang support is [0, ∞); got {x}"
-                )));
-            }
-            sum += x;
-            count += 1;
-        }
-        let n = count as f64;
-        let mean = sum / n;
-        let mut variance = 0.0_f64;
-        for &x in data {
-            let d = x - mean;
-            variance += d * d;
-        }
-        variance /= n;
-        if variance <= 0.0 || !variance.is_finite() {
-            return Err(FitError::NonConvergent(format!(
-                "Erlang MoM: sample variance {variance} is non-positive"
-            )));
-        }
-        let rate = mean / variance;
-        if !rate.is_finite() || rate <= 0.0 {
-            return Err(FitError::NonConvergent(format!(
-                "Erlang MoM produced non-positive rate: {rate}"
-            )));
-        }
-        let k_real = mean * mean / variance;
-        let k = (k_real.round() as i64).max(1) as usize;
-        Ok(Self { k, rate })
+        mle::erlang_mle(data)
     }
 
     fn mode(&self) -> f64 {
@@ -104446,7 +104380,7 @@ mod tests {
     #[test]
     fn erlang_fit_recovers_synthetic_shape() {
         // Synthesize n=2000 samples from Erlang(k=4, rate=2.0) via inverse
-        // CDF; MoM recovers k exactly and rate within 5%.
+        // CDF; the integer-profile MLE recovers k and its profiled rate.
         let true_k = 4usize;
         let true_rate = 2.0_f64;
         let dist = Erlang::new(true_k, true_rate);
@@ -104457,7 +104391,7 @@ mod tests {
             .collect();
         assert!(samples.len() > 1500);
         let fitted = Erlang::try_fit(&samples).expect("fit");
-        assert_eq!(fitted.k, true_k, "MoM should round to integer k");
+        assert_eq!(fitted.k, true_k, "MLE should recover integer k");
         let rel = (fitted.rate - true_rate).abs() / true_rate;
         assert!(
             rel < 0.05,
@@ -104467,19 +104401,17 @@ mod tests {
     }
 
     #[test]
-    fn erlang_fit_metamorphic_mean_var_consistency() {
-        // After fitting, the fitted distribution's mean and var must match
-        // the sample mean and variance to MoM precision (the MoM equations
-        // are exactly mean = k/rate and var = k/rate²).
+    fn erlang_fit_profiles_rate_and_maximizes_integer_shape_likelihood() {
         let data = [0.5_f64, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0];
-        let n = data.len() as f64;
-        let m = data.iter().sum::<f64>() / n;
-        let v = data.iter().map(|x| (x - m).powi(2)).sum::<f64>() / n;
+        let mean = data.iter().sum::<f64>() / data.len() as f64;
         let fitted = Erlang::try_fit(&data).expect("fit");
-        // MoM only enforces the relation rate = m/v exactly, but the
-        // integer rounding of k may shift the fitted mean slightly. Verify
-        // exact rate identity:
-        assert!((fitted.rate - m / v).abs() < 1e-12);
+        assert!((fitted.rate - fitted.k as f64 / mean).abs() < 1e-13);
+        let fitted_ll: f64 = data.iter().map(|&x| fitted.logpdf(x)).sum();
+        for k in 1..=12 {
+            let candidate = Erlang::new(k, k as f64 / mean);
+            let candidate_ll: f64 = data.iter().map(|&x| candidate.logpdf(x)).sum();
+            assert!(fitted_ll >= candidate_ll - 1e-12, "integer shape {k}");
+        }
     }
 
     #[test]
@@ -104878,15 +104810,23 @@ mod tests {
         );
 
         let skewed = [-0.3_f64, 0.0, 0.5, 1.2, 2.0];
-        let sample_skew = sample_standardized_skewness(&skewed);
         let fitted = SkewNorm::try_fit(&skewed).expect("SkewNorm fit");
-        assert!(fitted.a > 0.0, "positive sample skew should fit positive a");
-        assert_close(
-            fitted.skewness(),
-            sample_skew,
-            1e-10,
-            "SkewNorm skew inversion",
-        );
+        assert!(fitted.a > 0.0);
+        let score: f64 = skewed
+            .iter()
+            .map(|&x| {
+                let z = fitted.a * x;
+                x * (-0.5 * z * z - 0.5 * (2.0 * PI).ln() - fsci_special::log_ndtr_scalar(z)).exp()
+            })
+            .sum();
+        assert!(score.abs() < 1e-11, "SkewNorm MLE score={score}");
+        let log_likelihood = |a| {
+            let candidate = SkewNorm::new(a);
+            skewed.iter().map(|&x| candidate.logpdf(x)).sum::<f64>()
+        };
+        for offset in [-0.05, 0.05] {
+            assert!(log_likelihood(fitted.a) > log_likelihood(fitted.a + offset));
+        }
 
         assert_eq!(KsTwoBign::try_fit(&[0.1, 0.5, 1.0]).unwrap(), KsTwoBign);
         assert!(matches!(

@@ -17,7 +17,9 @@ use fsci_stats::{
     fit_mle, fit_mle_censored, fit_mle_location_scale, fit_mle_location_scale_censored,
     with_hardened_stats_caps, with_stats_runtime_mode,
 };
-use fsci_stats::{Cauchy, DoubleGamma, ExponNorm, FoldedNormal, LaplaceAsymmetric};
+use fsci_stats::{
+    Cauchy, DoubleGamma, Erlang, ExponNorm, FoldedNormal, LaplaceAsymmetric, SkewNorm,
+};
 use rand::{SeedableRng, rngs::StdRng};
 
 const ORACLE: &str = r#"
@@ -57,19 +59,34 @@ cases = [
     ('laplace_asymmetric', stats.laplace_asymmetric, [(0.2,), (1.0,), (5.0,)]),
     ('dgamma', stats.dgamma, [(0.4,), (2.0,), (10.0,)]),
     ('foldnorm', stats.foldnorm, [(0.0,), (0.8,), (8.0,)]),
+    ('skewnorm', stats.skewnorm, [(-5.0,), (0.0,), (4.0,)]),
+    ('erlang', stats.erlang, [(1,), (4,), (30,)]),
 ]
 for family_index, (name, dist, shapes) in enumerate(cases):
     for case_index, shape in enumerate(shapes):
-        scale = 2.0 if name in ('gamma', 'weibull_min', 'lognorm') else 1.0
+        scale = 2.0 if name in ('gamma', 'weibull_min', 'lognorm', 'erlang') else 1.0
         data = dist.rvs(*shape, scale=scale, size=2000,
                         random_state=np.random.default_rng(12700 + 17*family_index + case_index))
         kwargs = {'floc': 0}
         if name not in ('gamma', 'weibull_min', 'lognorm'):
             kwargs['fscale'] = 1
-        fitted = dist.fit(data, **kwargs)
+        if name == 'erlang':
+            # SciPy's unconstrained erlang.fit allows fractional shape.
+            # The Rust family has an integer shape, so profile SciPy's
+            # likelihood over the neighboring integers and fit each scale.
+            continuous = stats.gamma.fit(data, floc=0)[0]
+            candidates = sorted({1, max(1, int(np.floor(continuous))),
+                                 max(1, int(np.ceil(continuous)))})
+            fits = [dist.fit(data, f0=k, floc=0) for k in candidates]
+            fitted = min(fits, key=lambda p: -np.sum(dist.logpdf(
+                data, p[0], loc=p[-2], scale=p[-1])))
+        else:
+            fitted = dist.fit(data, **kwargs)
         nll = -np.sum(dist.logpdf(data, *fitted[:-2], loc=fitted[-2], scale=fitted[-1]))
         parameters = fitted[:-2]
-        if name in ('gamma', 'weibull_min', 'lognorm'):
+        if name == 'erlang':
+            parameters = (*parameters, 1/fitted[-1])
+        elif name in ('gamma', 'weibull_min', 'lognorm'):
             parameters = (*parameters, fitted[-1])
         print(name, case_index, len(parameters), *(format(x, '.17g') for x in parameters),
               format(nll, '.17g'))
@@ -82,6 +99,169 @@ fn likelihood<D: ContinuousDistribution>(distribution: &D, data: &[f64]) -> f64 
 
 fn discrete_likelihood<D: DiscreteDistribution>(distribution: &D, data: &[i64]) -> f64 {
     -data.iter().map(|&x| distribution.logpmf(x)).sum::<f64>()
+}
+
+#[test]
+fn skew_normal_mle_uses_signed_score_and_handles_large_shapes() {
+    for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+        with_stats_runtime_mode(mode, || {
+            // The sample skewness is exactly zero, so the former moment fit
+            // returned a=0 even though the fixed-location likelihood increases.
+            let data = [-1.0_f64, 0.0, 1.0, 2.0, 3.0];
+            let fitted = SkewNorm::try_fit(&data).unwrap();
+            assert!(fitted.a > 0.5 && fitted.a < 0.7);
+            assert!(likelihood(&SkewNorm::new(0.0), &data) - likelihood(&fitted, &data) > 0.5);
+            let score: f64 = data
+                .iter()
+                .map(|&x| {
+                    let z = fitted.a * x;
+                    x * (-0.5 * z * z
+                        - 0.5 * (2.0 * std::f64::consts::PI).ln()
+                        - fsci_special::log_ndtr_scalar(z))
+                    .exp()
+                })
+                .sum();
+            assert!(score.abs() < 1e-11, "skew-normal likelihood score={score}");
+            let reflected = data.map(|x| -x);
+            assert!((fitted.a + SkewNorm::try_fit(&reflected).unwrap().a).abs() < 1e-12);
+            for offset in [-0.1, 0.1] {
+                assert!(
+                    likelihood(&fitted, &data)
+                        < likelihood(&SkewNorm::new(fitted.a + offset), &data)
+                );
+            }
+            assert_eq!(fitted.a, SkewNorm::fit(&data).a);
+
+            // Arbitrary sample skewness need not lie in the model's population
+            // skewness range for the likelihood to have a finite maximum.
+            let dispersed = [-0.1, 0.2, 0.3, 1.0, 8.0];
+            let fitted = SkewNorm::try_fit(&dispersed).unwrap();
+            assert!(fitted.a > 0.0);
+            assert!(likelihood(&fitted, &dispersed).is_finite());
+
+            let small = [-0.0001, 0.001, 0.002, 0.003];
+            let fitted = SkewNorm::try_fit(&small).unwrap();
+            assert!(fitted.a > 50.0);
+            let scale = 1e-180;
+            let scaled = small.map(|x| x * scale);
+            let scaled_fit = SkewNorm::try_fit(&scaled).unwrap();
+            assert!((scaled_fit.a * scale / fitted.a - 1.0).abs() < 2e-11);
+            assert!(likelihood(&scaled_fit, &scaled).is_finite());
+            assert!(scaled_fit.mean() > 0.79 && scaled_fit.mean() < 0.80);
+            assert!(SkewNorm::try_fit(&[-1.0, 2.0]).unwrap().a > 0.0);
+        });
+    }
+}
+
+#[test]
+fn erlang_mle_profiles_rate_and_selects_integer_shape() {
+    for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+        with_stats_runtime_mode(mode, || {
+            let data = [0.5_f64, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0];
+            let fitted = Erlang::try_fit(&data).unwrap();
+            let mean = data.iter().sum::<f64>() / data.len() as f64;
+            let variance = data.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / data.len() as f64;
+            let old = Erlang::new((mean * mean / variance).round() as usize, mean / variance);
+            assert!(likelihood(&fitted, &data) < likelihood(&old, &data) - 0.05);
+            assert!((fitted.mean() - mean).abs() < 1e-13);
+            for k in 1..=16 {
+                let candidate = Erlang::new(k, k as f64 / mean);
+                assert!(likelihood(&fitted, &data) <= likelihood(&candidate, &data) + 1e-12);
+            }
+            assert_eq!(fitted, Erlang::fit(&data));
+            // Rounding the continuous Gamma MLE would choose one here.
+            // The integer likelihood instead favors k=2.
+            let neighbors = [1.0, 6.3];
+            let gamma = GammaDist::try_fit(&neighbors).unwrap();
+            assert!(gamma.a > 1.0 && gamma.a < 1.5);
+            let fitted = Erlang::try_fit(&neighbors).unwrap();
+            assert_eq!(fitted.k, 2);
+            assert!(
+                likelihood(&fitted, &neighbors)
+                    < likelihood(&Erlang::new(1, 1.0 / 3.65), &neighbors)
+            );
+
+            let zeros = [0.0, 0.0, 2.0];
+            let fitted = Erlang::try_fit(&zeros).unwrap();
+            assert_eq!(fitted.k, 1);
+            assert_eq!(fitted.rate, 1.5);
+            assert_eq!(fitted.pdf(0.0), 1.5);
+            assert_eq!(fitted.logpdf(0.0), 1.5_f64.ln());
+            assert!(likelihood(&fitted, &zeros).is_finite());
+
+            // A valid concentrated fit exceeds the factorial/power range of
+            // the former density implementation.
+            let concentrated = [9.8, 9.9, 10.0, 10.1, 10.2];
+            let fitted = Erlang::try_fit(&concentrated).unwrap();
+            assert!(fitted.k > 1000);
+            let points = [-1.0, 0.0, 9.8, 10.0, 10.2, f64::INFINITY];
+            let pdf = fitted.pdf_many(&points);
+            let logpdf = fitted.logpdf_many(&points);
+            for (index, &x) in points.iter().enumerate() {
+                assert_eq!(pdf[index], fitted.pdf(x));
+                assert_eq!(logpdf[index], fitted.logpdf(x));
+            }
+            assert!(fitted.pdf(10.0).is_finite() && fitted.pdf(10.0) > 0.0);
+            assert!(likelihood(&fitted, &concentrated).is_finite());
+            let scaled = data.map(|x| x * 1e150);
+            let scaled_fit = Erlang::try_fit(&scaled).unwrap();
+            let original = Erlang::try_fit(&data).unwrap();
+            assert_eq!(scaled_fit.k, original.k);
+            assert!((scaled_fit.rate * 1e150 / original.rate - 1.0).abs() < 1e-12);
+        });
+    }
+}
+
+#[test]
+fn skew_normal_and_erlang_mles_reject_unidentifiable_or_invalid_samples() {
+    for data in [&[][..], &[1.0][..]] {
+        assert!(matches!(
+            SkewNorm::try_fit(data),
+            Err(FitError::InsufficientData { .. })
+        ));
+        assert!(matches!(
+            Erlang::try_fit(data),
+            Err(FitError::InsufficientData { .. })
+        ));
+    }
+    for data in [[0.0, 1.0, 2.0], [-2.0, -1.0, 0.0], [0.0, 0.0, 0.0]] {
+        assert!(matches!(
+            SkewNorm::try_fit(&data),
+            Err(FitError::NonConvergent(_))
+        ));
+    }
+    for data in [[0.0, 0.0], [2.0, 2.0]] {
+        assert!(matches!(
+            Erlang::try_fit(&data),
+            Err(FitError::NonConvergent(_))
+        ));
+    }
+    assert!(matches!(
+        Erlang::try_fit(&[-0.1, 1.0]),
+        Err(FitError::UnsupportedData(_))
+    ));
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(matches!(
+            SkewNorm::try_fit(&[-1.0, bad, 2.0]),
+            Err(FitError::UnsupportedData(_))
+        ));
+        assert!(matches!(
+            Erlang::try_fit(&[1.0, bad, 2.0]),
+            Err(FitError::UnsupportedData(_))
+        ));
+    }
+    with_stats_runtime_mode(RuntimeMode::Hardened, || {
+        with_hardened_stats_caps(2, 2, || {
+            assert!(matches!(
+                SkewNorm::try_fit(&[-1.0, 0.0, 2.0]),
+                Err(FitError::ResourceExhausted { .. })
+            ));
+            assert!(matches!(
+                Erlang::try_fit(&[1.0, 2.0, 3.0]),
+                Err(FitError::ResourceExhausted { .. })
+            ));
+        });
+    });
 }
 
 #[test]
@@ -3166,6 +3346,17 @@ fn mle_matches_live_scipy_on_seeded_fits() {
         let two_positive = [MleParameter::Positive(1.0), MleParameter::Positive(1.0)];
         let options = MleOptions::default();
         let (actual, nll) = match family {
+            "skewnorm" => {
+                let fitted = SkewNorm::try_fit(&data).unwrap();
+                (vec![fitted.a], likelihood(&fitted, &data))
+            }
+            "erlang" => {
+                let fitted = Erlang::try_fit(&data).unwrap();
+                (
+                    vec![fitted.k as f64, fitted.rate],
+                    likelihood(&fitted, &data),
+                )
+            }
             "laplace_asymmetric" => {
                 let fitted = LaplaceAsymmetric::try_fit(&data).unwrap();
                 (vec![fitted.kappa], likelihood(&fitted, &data))
@@ -3339,10 +3530,10 @@ fn mle_matches_live_scipy_on_seeded_fits() {
         compared += 1;
     }
     assert_eq!(
-        compared, 78,
+        compared, 84,
         "every seeded case must produce a real comparison"
     );
-    eprintln!("MLE compared cases = {compared}; families = 26; samples per case = 2000");
+    eprintln!("MLE compared cases = {compared}; families = 28; samples per case = 2000");
 }
 
 #[test]
