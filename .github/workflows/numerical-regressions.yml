@@ -115,6 +115,7 @@ jobs:
               cargo test --locked -p fsci-stats --test mle_scipy -- --nocapture
               ;;
             signal-state)
+              cargo test --locked -p fsci-signal --test place_poles_scipy -- --nocapture
               cargo test --locked -p fsci-signal --lib sosfilt_ -- --nocapture
               cargo test --locked -p fsci-signal --doc SosFilter -- --nocapture
               cargo test --locked -p fsci-conformance --no-default-features --test diff_signal_sosfilt -- --nocapture

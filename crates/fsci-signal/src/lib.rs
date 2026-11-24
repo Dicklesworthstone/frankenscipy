@@ -15033,25 +15033,40 @@ fn abcd_shape(m: &[Vec<f64>], name: &str) -> Result<(usize, usize), SignalError>
     Ok((m.len(), cols))
 }
 
+use fsci_linalg::complex::C64;
+
 /// Result of [`place_poles`]: the state-feedback gain and the achieved
 /// closed-loop poles.
+#[derive(Debug, Clone)]
 pub struct PlacePolesResult {
-    /// Gain matrix `K` (shape `1×n` for single-input), so `eig(A − B·K)` are the
-    /// requested poles.
+    /// Real gain matrix `K` (shape `m×n` for `m` inputs and `n` states), so
+    /// `eig(A − B·K)` are the requested poles.
     pub gain_matrix: Vec<Vec<f64>>,
     /// Achieved closed-loop poles (real, imaginary).
     pub computed_poles: Vec<(f64, f64)>,
 }
 
-/// Pole placement by state feedback for a **single-input** system, matching
-/// `scipy.signal.place_poles(A, B, poles)` when `B` has one column.
+/// Pole placement by real state feedback for single-input and multi-input
+/// systems, corresponding to `scipy.signal.place_poles(A, B, poles)`.
 ///
-/// Computes the gain `K` (via Ackermann's formula) such that the eigenvalues of
-/// `A − B·K` equal `poles`. For a controllable single-input system this gain is
-/// unique, so it matches SciPy's result exactly. `poles` are `(re, im)` pairs and
-/// must be closed under conjugation (so `K` is real). Multi-input systems
-/// (`B` with more than one column) return an error — that case needs the
-/// Kautsky–Nichols–Van Dooren optimizer, not yet ported.
+/// Computes a real gain `K` such that the eigenvalues of `A − B·K` equal
+/// `poles`. `A` is `n×n`, `B` is `n×m`, and each pole is a `(re, im)`
+/// pair. All inputs must be finite, non-real poles must occur in conjugate
+/// pairs, and no pole may occur more than `rank(B)` times.
+///
+/// Single-input systems retain Ackermann's formula and their unique feedback
+/// gain. Multi-input systems maximize the volume of a feasible eigenvector
+/// basis using KNV rank-one updates for real poles and YT rank-two updates for
+/// conjugate pairs. Iteration stops after a relative determinant change below
+/// `1e-3` or 30 sweeps; a singular basis is retried with up to three deterministic
+/// initializations. Full-row-rank inputs are solved directly. Redundant input
+/// columns are supported using the minimum-norm gain for the resulting target
+/// matrix.
+///
+/// Multi-input gains are generally nonunique and need not equal SciPy's gain.
+/// The returned poles are computed from the actual `A − B·K`. A numerically
+/// singular transfer basis or inconsistent feedback equation returns an error;
+/// the pair `(A, B)` must permit the requested pole assignment.
 pub fn place_poles(
     a: &[Vec<f64>],
     b: &[Vec<f64>],
@@ -15074,10 +15089,9 @@ pub fn place_poles(
             detail: "place_poles: B rows must have equal length".to_string(),
         });
     }
-    if m != 1 {
-        return Err(SignalError::InvalidParameter {
-            detail: "place_poles: only single-input systems (B with 1 column) are supported"
-                .to_string(),
+    if m == 0 {
+        return Err(SignalError::InvalidInputShape {
+            detail: "place_poles: B must contain at least one input column".to_string(),
         });
     }
     if poles.len() != n {
@@ -15085,6 +15099,24 @@ pub fn place_poles(
             detail: format!("place_poles: need {n} poles, got {}", poles.len()),
         });
     }
+
+    if a.iter().chain(b).flatten().any(|value| !value.is_finite())
+        || poles.iter().any(|&(re, im)| !re.is_finite() || !im.is_finite())
+    {
+        return Err(SignalError::NonFiniteInput {
+            detail: "place_poles: A, B, and the requested poles must be finite".to_string(),
+        });
+    }
+    let ordered_poles = place_poles_order(poles)?;
+    if m != 1 {
+        return place_poles_multiple_inputs(a, b, &ordered_poles);
+    }
+    if b.iter().all(|row| row[0] == 0.0) {
+        return Err(SignalError::NumericalFailure(
+            "place_poles: B has zero rank; the system has no controllable inputs".to_string(),
+        ));
+    }
+    place_poles_check_multiplicity(&ordered_poles, 1)?;
 
     let bvec: Vec<f64> = (0..n).map(|i| b[i][0]).collect();
 
@@ -15181,6 +15213,498 @@ pub fn place_poles(
 
     Ok(PlacePolesResult {
         gain_matrix: vec![gain],
+        computed_poles,
+    })
+}
+
+
+// The feasible eigenvectors for a desired pole lambda are the columns of
+// ker(U_perp^T (A - lambda I)), where U_perp spans the orthogonal complement
+// of range(B). Keeping every update in this subspace makes pole placement an
+// eigenstructure problem, rather than an optimization of eigenvalue errors.
+struct PolePlacementSubspace {
+    first: usize,
+    pole: C64,
+    basis: Vec<Vec<C64>>,
+}
+
+fn place_poles_order(poles: &[(f64, f64)]) -> Result<Vec<(f64, f64)>, SignalError> {
+    let mut used = vec![false; poles.len()];
+    let mut real = Vec::new();
+    let mut pairs = Vec::new();
+    for (i, &(re, im)) in poles.iter().enumerate() {
+        if used[i] {
+            continue;
+        }
+        used[i] = true;
+        if im == 0.0 {
+            real.push(re);
+        } else {
+            let partner = poles.iter().enumerate().find_map(|(j, &(other_re, other_im))| {
+                (!used[j] && other_re == re && other_im == -im).then_some(j)
+            });
+            let Some(partner) = partner else {
+                return Err(SignalError::InvalidParameter {
+                    detail: "place_poles: non-real poles must occur in complex conjugate pairs"
+                        .to_string(),
+                });
+            };
+            used[partner] = true;
+            pairs.push((re, im.abs()));
+        }
+    }
+    real.sort_by(f64::total_cmp);
+    pairs.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| b.1.total_cmp(&a.1)));
+    let mut ordered: Vec<(f64, f64)> = real.into_iter().map(|re| (re, 0.0)).collect();
+    for (re, im) in pairs {
+        ordered.push((re, -im));
+        ordered.push((re, im));
+    }
+    Ok(ordered)
+}
+
+fn place_poles_check_multiplicity(
+    poles: &[(f64, f64)],
+    rank_b: usize,
+) -> Result<(), SignalError> {
+    for &pole in poles {
+        if poles.iter().filter(|&&candidate| candidate == pole).count() > rank_b {
+            return Err(SignalError::InvalidParameter {
+                detail: format!(
+                    "place_poles: a requested pole occurs more than rank(B)={rank_b} times"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn place_poles_identity(n: usize) -> Vec<Vec<f64>> {
+    let mut identity = vec![vec![0.0; n]; n];
+    for (i, row) in identity.iter_mut().enumerate() {
+        row[i] = 1.0;
+    }
+    identity
+}
+
+fn place_poles_complex_norm(vector: &[C64]) -> f64 {
+    vector
+        .iter()
+        .fold(0.0_f64, |norm, value| norm.hypot(value.re).hypot(value.im))
+}
+
+fn place_poles_initial_coefficient(state: &mut u64) -> f64 {
+    // A reproducible initial basis, independent of platform and thread count.
+    // Different starts are used only if a tentative transfer matrix is singular.
+    *state = state
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    ((*state >> 11) as f64) / 9_007_199_254_740_992.0 - 0.5
+}
+
+fn place_poles_complement(
+    transfer: &[Vec<f64>],
+    first: usize,
+    width: usize,
+) -> Result<Vec<Vec<f64>>, SignalError> {
+    let n = transfer.len();
+    if width == n {
+        return Ok(place_poles_identity(n));
+    }
+    let remaining: Vec<Vec<f64>> = transfer
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .filter_map(|(j, &value)| {
+                    (j < first || j >= first + width).then_some(value)
+                })
+                .collect()
+        })
+        .collect();
+    fsci_linalg::qr(&remaining, fsci_linalg::DecompOptions::default())
+        .map(|factor| factor.q)
+        .map_err(|error| {
+            SignalError::NumericalFailure(format!(
+                "place_poles: transfer-basis QR failed ({error})"
+            ))
+        })
+}
+
+fn place_poles_update_real(
+    space: &PolePlacementSubspace,
+    transfer: &mut [Vec<f64>],
+) -> Result<(), SignalError> {
+    let n = transfer.len();
+    let q = place_poles_complement(transfer, space.first, 1)?;
+    let rank = space.basis[0].len();
+    let mut vector = vec![0.0; n];
+    // KNV method 0: project the normal of all other columns into the
+    // admissible subspace. Its normalized projection maximizes |det(X)|
+    // with those columns held fixed.
+    for k in 0..rank {
+        let coefficient: f64 = (0..n)
+            .map(|i| space.basis[i][k].re * q[i][n - 1])
+            .sum();
+        for i in 0..n {
+            vector[i] += space.basis[i][k].re * coefficient;
+        }
+    }
+    let norm = vector.iter().copied().fold(0.0_f64, f64::hypot);
+    if norm > f64::EPSILON * n as f64 {
+        for (row, value) in transfer.iter_mut().zip(vector) {
+            row[space.first] = value / norm;
+        }
+    }
+    Ok(())
+}
+
+fn place_poles_update_complex(
+    space: &PolePlacementSubspace,
+    transfer: &mut [Vec<f64>],
+) -> Result<(), SignalError> {
+    let n = transfer.len();
+    let rank = space.basis[0].len();
+    let q = place_poles_complement(transfer, space.first, 2)?;
+    let zero = C64::new(0.0, 0.0);
+    let mut a = vec![zero; rank];
+    let mut b = vec![zero; rank];
+    for k in 0..rank {
+        for (i, row) in space.basis.iter().enumerate() {
+            a[k] += row[k].conj() * q[i][n - 2];
+            b[k] += row[k].conj() * q[i][n - 1];
+        }
+    }
+    // If v = S c is a unit feasible complex eigenvector, its real/imaginary
+    // columns contribute det([q1,q2]^T [Re(v),Im(v)]) =
+    // c^H H c, H = (a b^H - b a^H)/(2i), a=S^H q1, b=S^H q2.
+    // H is Hermitian. An eigenvector for its largest-magnitude eigenvalue
+    // therefore gives the globally best conjugate-pair update with the other
+    // columns fixed. This is the rank-two YT complex update (up to a scalar).
+    let mut hermitian = vec![vec![zero; rank]; rank];
+    for i in 0..rank {
+        for j in 0..=i {
+            let mut value =
+                (a[i] * b[j].conj() - b[i] * a[j].conj()) * C64::new(0.0, -0.5);
+            if i == j {
+                value.im = 0.0;
+            }
+            hermitian[i][j] = value;
+            hermitian[j][i] = value.conj();
+        }
+    }
+    let eig = fsci_linalg::complex::eigh(
+        &hermitian,
+        fsci_linalg::DecompOptions::default(),
+    )
+    .map_err(|error| {
+        SignalError::NumericalFailure(format!(
+            "place_poles: conjugate-pair update failed ({error})"
+        ))
+    })?;
+    let selected = (0..rank)
+        .max_by(|&i, &j| eig.eigenvalues[i].abs().total_cmp(&eig.eigenvalues[j].abs()))
+        .expect("a nonzero-rank input has a nonempty pole subspace");
+    if eig.eigenvalues[selected].abs() <= f64::EPSILON * n as f64 {
+        return Ok(());
+    }
+    let mut vector = vec![zero; n];
+    for (i, row) in space.basis.iter().enumerate() {
+        for (k, &basis_value) in row.iter().enumerate() {
+            vector[i] += basis_value * eig.eigenvectors[k][selected];
+        }
+    }
+    let norm = place_poles_complex_norm(&vector);
+    if norm > 0.0 && norm.is_finite() {
+        for (row, value) in transfer.iter_mut().zip(vector) {
+            row[space.first] = value.re / norm;
+            row[space.first + 1] = value.im / norm;
+        }
+    }
+    Ok(())
+}
+
+fn place_poles_log_volume(transfer: &[Vec<f64>]) -> Result<f64, SignalError> {
+    let r = fsci_linalg::qr_r(transfer, fsci_linalg::DecompOptions::default())
+        .map_err(|error| {
+            SignalError::NumericalFailure(format!(
+                "place_poles: transfer-volume QR failed ({error})"
+            ))
+        })?;
+    Ok((0..r.len()).map(|i| r[i][i].abs().ln()).sum())
+}
+
+fn place_poles_transfer(
+    spaces: &[PolePlacementSubspace],
+    n: usize,
+    rank_b: usize,
+) -> Result<Vec<Vec<f64>>, SignalError> {
+    let zero = C64::new(0.0, 0.0);
+    for attempt in 0..3_u64 {
+        let mut state = 0x7f4a_7c15_9e37_79b9_u64.wrapping_add(attempt);
+        let mut transfer = vec![vec![0.0; n]; n];
+        for space in spaces {
+            let mut vector = vec![zero; n];
+            for k in 0..rank_b {
+                let re = place_poles_initial_coefficient(&mut state);
+                let im = if space.pole.im == 0.0 {
+                    0.0
+                } else {
+                    place_poles_initial_coefficient(&mut state)
+                };
+                let coefficient = C64::new(re, im);
+                for (i, row) in space.basis.iter().enumerate() {
+                    vector[i] += row[k] * coefficient;
+                }
+            }
+            let norm = place_poles_complex_norm(&vector);
+            if norm == 0.0 || !norm.is_finite() {
+                return Err(SignalError::NumericalFailure(
+                    "place_poles: could not initialize an admissible eigenvector".to_string(),
+                ));
+            }
+            for (row, value) in transfer.iter_mut().zip(vector) {
+                row[space.first] = value.re / norm;
+                if space.pole.im != 0.0 {
+                    row[space.first + 1] = value.im / norm;
+                }
+            }
+        }
+        let mut best = transfer.clone();
+        let mut best_volume = place_poles_log_volume(&best)?;
+        if rank_b > 1 {
+            for _ in 0..30 {
+                let previous = place_poles_log_volume(&transfer)?;
+                for space in spaces {
+                    if space.pole.im == 0.0 {
+                        place_poles_update_real(space, &mut transfer)?;
+                    } else {
+                        place_poles_update_complex(space, &mut transfer)?;
+                    }
+                }
+                let volume = place_poles_log_volume(&transfer)?;
+                if volume > best_volume {
+                    best_volume = volume;
+                    best.clone_from(&transfer);
+                }
+                // Relative determinant change without forming a determinant
+                // that may underflow for a large transfer matrix.
+                if volume.is_finite()
+                    && previous.is_finite()
+                    && (previous - volume).exp_m1().abs() < 1e-3
+                {
+                    break;
+                }
+            }
+        }
+        if best_volume.is_finite() {
+            let singular_values =
+                fsci_linalg::svdvals(&best, fsci_linalg::DecompOptions::default()).map_err(
+                    |error| {
+                        SignalError::NumericalFailure(format!(
+                            "place_poles: transfer-rank check failed ({error})"
+                        ))
+                    },
+                )?;
+            if singular_values[n - 1]
+                > singular_values[0] * f64::EPSILON * n as f64
+            {
+                return Ok(best);
+            }
+        }
+    }
+    Err(SignalError::NumericalFailure(
+        "place_poles: requested poles cannot be placed; check controllability of (A, B)"
+            .to_string(),
+    ))
+}
+
+fn place_poles_multiple_inputs(
+    a: &[Vec<f64>],
+    b: &[Vec<f64>],
+    poles: &[(f64, f64)],
+) -> Result<PlacePolesResult, SignalError> {
+    let n = a.len();
+    let inputs = b[0].len();
+    let options = fsci_linalg::DecompOptions::default();
+    let input_svd = fsci_linalg::svd(b, options).map_err(|error| {
+        SignalError::NumericalFailure(format!(
+            "place_poles: input-rank decomposition failed ({error})"
+        ))
+    })?;
+    let threshold = input_svd.s[0] * f64::EPSILON * n.max(inputs) as f64;
+    let rank_b = input_svd.s.iter().filter(|&&value| value > threshold).count();
+    if rank_b == 0 {
+        return Err(SignalError::NumericalFailure(
+            "place_poles: B has zero rank; the system has no controllable inputs".to_string(),
+        ));
+    }
+    place_poles_check_multiplicity(poles, rank_b)?;
+
+    let mut target = vec![vec![0.0; n]; n];
+    let mut first = 0;
+    while first < n {
+        let (re, im) = poles[first];
+        target[first][first] = re;
+        if im == 0.0 {
+            first += 1;
+        } else {
+            target[first][first + 1] = im.abs();
+            target[first + 1][first] = -im.abs();
+            target[first + 1][first + 1] = re;
+            first += 2;
+        }
+    }
+
+    if rank_b < n {
+        // SVD determines the actual input range even for redundant columns of
+        // B. Complete its orthonormal basis before forming the pole subspaces.
+        let input_range: Vec<Vec<f64>> = input_svd
+            .u
+            .iter()
+            .map(|row| row[..rank_b].to_vec())
+            .collect();
+        let u = fsci_linalg::qr(&input_range, options)
+            .map_err(|error| {
+                SignalError::NumericalFailure(format!(
+                    "place_poles: input-range QR failed ({error})"
+                ))
+            })?
+            .q;
+        let mut spaces = Vec::new();
+        let mut first = 0;
+        while first < n {
+            let pole = C64::new(poles[first].0, poles[first].1.abs());
+            // QR of [U_perp^T (A-lambda I)]^H: the trailing columns of
+            // its complete Q form the required complex null space.
+            let mut constraint_adjoint = vec![vec![C64::new(0.0, 0.0); n - rank_b]; n];
+            for i in 0..n {
+                for j in 0..n - rank_b {
+                    let projected: f64 = (0..n).map(|k| a[k][i] * u[k][rank_b + j]).sum();
+                    constraint_adjoint[i][j] =
+                        C64::new(projected, 0.0) - pole.conj() * u[i][rank_b + j];
+                }
+            }
+            let q = fsci_linalg::complex::qr(&constraint_adjoint, false, options)
+                .map_err(|error| {
+                    SignalError::NumericalFailure(format!(
+                        "place_poles: admissible-eigenvector QR failed ({error})"
+                    ))
+                })?
+                .q;
+            spaces.push(PolePlacementSubspace {
+                first,
+                pole,
+                basis: q.into_iter().map(|row| row[n - rank_b..].to_vec()).collect(),
+            });
+            first += if pole.im == 0.0 { 1 } else { 2 };
+        }
+
+        let transfer = place_poles_transfer(&spaces, n, rank_b)?;
+        let transpose: Vec<Vec<f64>> = (0..n)
+            .map(|j| transfer.iter().map(|row| row[j]).collect())
+            .collect();
+        let factor = fsci_linalg::lu_factor(&transpose, options).map_err(|error| {
+            SignalError::NumericalFailure(format!(
+                "place_poles: transfer factorization failed ({error})"
+            ))
+        })?;
+        let mut transformed = vec![vec![0.0; n]; n];
+        for i in 0..n {
+            // Solve X^T m_i = (X Lambda)_i^T, so M = X Lambda X^-1,
+            // without explicitly inverting the transfer matrix.
+            let rhs: Vec<f64> = (0..n)
+                .map(|j| (0..n).map(|k| transfer[i][k] * target[k][j]).sum())
+                .collect();
+            transformed[i] = fsci_linalg::lu_solve(&factor, &rhs)
+                .map_err(|error| {
+                    SignalError::NumericalFailure(format!(
+                        "place_poles: singular transfer matrix; check controllability ({error})"
+                    ))
+                })?
+                .x;
+        }
+        target = transformed;
+    }
+
+    // B K = A-M. The retained SVD gives the minimum-norm gain for
+    // over-actuated or redundant inputs as well as full-column-rank B.
+    let mut gain = vec![vec![0.0; n]; inputs];
+    for column in 0..n {
+        for k in 0..rank_b {
+            let projected: f64 = (0..n)
+                .map(|i| input_svd.u[i][k] * (a[i][column] - target[i][column]))
+                .sum();
+            let coefficient = projected / input_svd.s[k];
+            for (input, row) in gain.iter_mut().enumerate() {
+                row[column] += input_svd.vt[k][input] * coefficient;
+            }
+        }
+    }
+    if gain.iter().flatten().any(|value| !value.is_finite()) {
+        return Err(SignalError::NumericalFailure(
+            "place_poles: feedback gain is not representable by finite values".to_string(),
+        ));
+    }
+    let mut closed_loop = a.to_vec();
+    let mut residual_norm = 0.0_f64;
+    let mut equation_norm = 0.0_f64;
+    for i in 0..n {
+        let mut row_residual = 0.0;
+        let mut row_magnitude = 0.0;
+        for j in 0..n {
+            let mut correction = 0.0;
+            let mut magnitude = a[i][j].abs() + target[i][j].abs();
+            for (input, row) in gain.iter().enumerate() {
+                let term = b[i][input] * row[j];
+                correction += term;
+                magnitude += term.abs();
+            }
+            closed_loop[i][j] -= correction;
+            if !closed_loop[i][j].is_finite() || !magnitude.is_finite() {
+                return Err(SignalError::NumericalFailure(
+                    "place_poles: feedback equation contains non-finite values".to_string(),
+                ));
+            }
+            row_residual += (closed_loop[i][j] - target[i][j]).abs();
+            row_magnitude += magnitude;
+        }
+        if !row_residual.is_finite() || !row_magnitude.is_finite() {
+            return Err(SignalError::NumericalFailure(
+                "place_poles: feedback equation norms are not finite".to_string(),
+            ));
+        }
+        residual_norm = residual_norm.max(row_residual);
+        equation_norm = equation_norm.max(row_magnitude);
+    }
+    // Check the induced infinity-norm backward error of B K = A-M. Large
+    // feedback gains can produce small entries through cancellation, so the
+    // scale is the complete equation norm || |A| + |M| + |B| |K| ||_inf.
+    let tolerance = 256.0 * f64::EPSILON * n as f64 * equation_norm.max(1.0);
+    if residual_norm > tolerance {
+        return Err(SignalError::NumericalFailure(
+            "place_poles: feedback residual is too large; check controllability of (A, B)"
+                .to_string(),
+        ));
+    }
+    let eig = fsci_linalg::eig(&closed_loop, options).map_err(|error| {
+        SignalError::NumericalFailure(format!(
+            "place_poles: closed-loop eigenvalue calculation failed ({error})"
+        ))
+    })?;
+    let mut computed_poles: Vec<(f64, f64)> = eig
+        .eigenvalues_re
+        .into_iter()
+        .zip(eig.eigenvalues_im)
+        .collect();
+    computed_poles.sort_by(|a, b| {
+        (a.1 != 0.0)
+            .cmp(&(b.1 != 0.0))
+            .then_with(|| a.0.total_cmp(&b.0))
+            .then_with(|| a.1.total_cmp(&b.1))
+    });
+    Ok(PlacePolesResult {
+        gain_matrix: gain,
         computed_poles,
     })
 }
