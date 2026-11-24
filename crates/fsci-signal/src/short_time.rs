@@ -144,7 +144,9 @@ fn scaling_factors(
 ) -> Result<(f64, f64), SignalError> {
     let power = window.iter().map(|value| value * value).sum::<f64>();
     if !power.is_finite() || power <= 0.0 {
-        return Err(invalid_parameter("STFT window power must be finite and positive"));
+        return Err(invalid_parameter(
+            "STFT window power must be finite and positive",
+        ));
     }
     let inverse = match scaling {
         StftScaling::Magnitude => window.iter().sum::<f64>(),
@@ -152,7 +154,9 @@ fn scaling_factors(
     };
     let forward = inverse.abs().recip();
     if !inverse.is_finite() || !forward.is_finite() || inverse == 0.0 {
-        return Err(invalid_parameter("STFT window scaling must be finite and nonzero"));
+        return Err(invalid_parameter(
+            "STFT window scaling must be finite and nonzero",
+        ));
     }
     Ok((forward, inverse))
 }
@@ -176,7 +180,9 @@ fn validate_geometry(
         .checked_mul(std::mem::size_of::<fsci_fft::Complex64>())
         .is_some_and(|bytes| bytes <= isize::MAX as usize)
     {
-        return Err(invalid_parameter("STFT transform length exceeds addressable memory"));
+        return Err(invalid_parameter(
+            "STFT transform length exceeds addressable memory",
+        ));
     }
     Ok(nperseg - noverlap)
 }
@@ -284,10 +290,7 @@ fn map_frames<T: Send>(
 /// }
 /// # Ok::<(), fsci_signal::SignalError>(())
 /// ```
-pub fn stft_with_options(
-    x: &[f64],
-    options: &StftOptions<'_>,
-) -> Result<StftResult, SignalError> {
+pub fn stft_with_options(x: &[f64], options: &StftOptions<'_>) -> Result<StftResult, SignalError> {
     if x.is_empty() {
         return Err(invalid_parameter("STFT input must not be empty"));
     }
@@ -298,7 +301,9 @@ pub fn stft_with_options(
         StftWindow::Coefficients(window) => {
             let nperseg = options.nperseg.unwrap_or(window.len());
             if nperseg > x.len() {
-                return Err(invalid_parameter("STFT window must not exceed input length"));
+                return Err(invalid_parameter(
+                    "STFT window must not exceed input length",
+                ));
             }
             nperseg
         }
@@ -339,7 +344,10 @@ pub fn stft_with_options(
             value.0 *= scale;
             value.1 *= scale;
         }
-        if !spectrum.iter().all(|&(re, im)| re.is_finite() && im.is_finite()) {
+        if !spectrum
+            .iter()
+            .all(|&(re, im)| re.is_finite() && im.is_finite())
+        {
             return Err(SignalError::NumericalFailure(
                 "STFT produced non-finite coefficients".to_string(),
             ));
@@ -358,7 +366,11 @@ pub fn stft_with_options(
     let frequencies: Vec<f64> = (0..nfft / 2 + 1)
         .map(|frequency| frequency as f64 * frequency_step)
         .collect();
-    if !frequencies.iter().chain(&times).all(|value| value.is_finite()) {
+    if !frequencies
+        .iter()
+        .chain(&times)
+        .all(|value| value.is_finite())
+    {
         return Err(SignalError::NumericalFailure(
             "STFT frequency or time axis is not finite".to_string(),
         ));
@@ -395,20 +407,33 @@ pub fn istft_with_options(
     validate_sampling_frequency(options.fs)?;
     let frame_count = transformed.zxx.len();
     if frame_count == 0 {
-        return Err(invalid_parameter("STFT result must have at least one frame"));
+        return Err(invalid_parameter(
+            "STFT result must have at least one frame",
+        ));
     }
     let frequency_count = transformed.zxx[0].len();
     if frequency_count == 0
         || transformed.frequencies.len() != frequency_count
         || transformed.times.len() != frame_count
-        || transformed.zxx.iter().any(|frame| frame.len() != frequency_count)
+        || transformed
+            .zxx
+            .iter()
+            .any(|frame| frame.len() != frequency_count)
     {
         return Err(SignalError::InvalidInputShape {
             detail: "STFT frames and frequency/time axes must have matching lengths".to_string(),
         });
     }
-    if !transformed.frequencies.iter().chain(&transformed.times).all(|v| v.is_finite())
-        || !transformed.zxx.iter().flatten().all(|&(re, im)| re.is_finite() && im.is_finite())
+    if !transformed
+        .frequencies
+        .iter()
+        .chain(&transformed.times)
+        .all(|v| v.is_finite())
+        || !transformed
+            .zxx
+            .iter()
+            .flatten()
+            .all(|&(re, im)| re.is_finite() && im.is_finite())
     {
         return Err(SignalError::NonFiniteInput {
             detail: "STFT coefficients and axes must be finite".to_string(),
@@ -460,7 +485,11 @@ pub fn istft_with_options(
     let end = output_len - trim;
     let mut result = Vec::with_capacity(end - trim);
     for (&sample, &weight) in output[trim..end].iter().zip(&normalization[trim..end]) {
-        let value = if weight > 1e-10 { sample / weight } else { sample };
+        let value = if weight > 1e-10 {
+            sample / weight
+        } else {
+            sample
+        };
         if !value.is_finite() {
             return Err(SignalError::NumericalFailure(
                 "ISTFT produced non-finite samples".to_string(),
@@ -516,14 +545,22 @@ mod tests {
                 .map(|i| 1.0 + (i as f64 * 0.3).sin() + 0.01 * i as f64)
                 .collect();
             let result = crate::stft(&x, 23.0, None, Some(nperseg), None).unwrap();
-            let reconstructed = istft_with_options(&result, &IstftOptions {
-                nperseg: Some(nperseg),
-                boundary: nperseg != 1,
-                ..IstftOptions::default()
-            }).unwrap();
+            let reconstructed = istft_with_options(
+                &result,
+                &IstftOptions {
+                    nperseg: Some(nperseg),
+                    boundary: nperseg != 1,
+                    ..IstftOptions::default()
+                },
+            )
+            .unwrap();
             assert!(reconstructed.len() >= x.len());
             assert_samples(&reconstructed[..x.len()], &x, 2e-12);
-            assert!(reconstructed[x.len()..].iter().all(|value| value.abs() < 2e-12));
+            assert!(
+                reconstructed[x.len()..]
+                    .iter()
+                    .all(|value| value.abs() < 2e-12)
+            );
         }
     }
 
@@ -537,11 +574,18 @@ mod tests {
         let single = crate::stft(&[4.5], 1.0, None, None, None).unwrap();
         assert_eq!(single.zxx, vec![vec![(4.5, 0.0)]]);
         assert!(crate::istft(&single, 1, None).unwrap().is_empty());
-        assert_eq!(istft_with_options(&single, &IstftOptions {
-            nperseg: Some(1),
-            boundary: false,
-            ..IstftOptions::default()
-        }).unwrap(), vec![4.5]);
+        assert_eq!(
+            istft_with_options(
+                &single,
+                &IstftOptions {
+                    nperseg: Some(1),
+                    boundary: false,
+                    ..IstftOptions::default()
+                }
+            )
+            .unwrap(),
+            vec![4.5]
+        );
     }
 
     #[test]
@@ -550,24 +594,32 @@ mod tests {
         let window = [0.1, 0.5, 1.0, 0.5, 0.1];
         for nfft in [5, 8, 9, 16] {
             for scaling in [StftScaling::Magnitude, StftScaling::Psd] {
-                let result = stft_with_options(&x, &StftOptions {
-                    fs: 11.0,
-                    window: StftWindow::Coefficients(&window),
-                    noverlap: Some(3),
-                    nfft: Some(nfft),
-                    scaling,
-                    ..StftOptions::default()
-                }).unwrap();
+                let result = stft_with_options(
+                    &x,
+                    &StftOptions {
+                        fs: 11.0,
+                        window: StftWindow::Coefficients(&window),
+                        noverlap: Some(3),
+                        nfft: Some(nfft),
+                        scaling,
+                        ..StftOptions::default()
+                    },
+                )
+                .unwrap();
                 assert_eq!(result.frequencies.len(), nfft / 2 + 1);
-                let reconstructed = istft_with_options(&result, &IstftOptions {
-                    fs: 11.0,
-                    window: StftWindow::Coefficients(&window),
-                    nperseg: Some(5),
-                    noverlap: Some(3),
-                    nfft: Some(nfft),
-                    scaling,
-                    ..IstftOptions::default()
-                }).unwrap();
+                let reconstructed = istft_with_options(
+                    &result,
+                    &IstftOptions {
+                        fs: 11.0,
+                        window: StftWindow::Coefficients(&window),
+                        nperseg: Some(5),
+                        noverlap: Some(3),
+                        nfft: Some(nfft),
+                        scaling,
+                        ..IstftOptions::default()
+                    },
+                )
+                .unwrap();
                 assert_samples(&reconstructed[..x.len()], &x, 2e-12);
             }
         }
@@ -577,10 +629,19 @@ mod tests {
     fn stft_boundary_extensions_match_sample_geometry() {
         let x = [1.0, 3.0, 2.0, 7.0];
         for (boundary, expected) in [
-            (StftBoundary::Zeros, [0.0, 0.0, 1.0, 3.0, 2.0, 7.0, 0.0, 0.0]),
+            (
+                StftBoundary::Zeros,
+                [0.0, 0.0, 1.0, 3.0, 2.0, 7.0, 0.0, 0.0],
+            ),
             (StftBoundary::Even, [2.0, 3.0, 1.0, 3.0, 2.0, 7.0, 2.0, 3.0]),
-            (StftBoundary::Odd, [0.0, -1.0, 1.0, 3.0, 2.0, 7.0, 12.0, 11.0]),
-            (StftBoundary::Constant, [1.0, 1.0, 1.0, 3.0, 2.0, 7.0, 7.0, 7.0]),
+            (
+                StftBoundary::Odd,
+                [0.0, -1.0, 1.0, 3.0, 2.0, 7.0, 12.0, 11.0],
+            ),
+            (
+                StftBoundary::Constant,
+                [1.0, 1.0, 1.0, 3.0, 2.0, 7.0, 7.0, 7.0],
+            ),
         ] {
             assert_eq!(extend_signal(&x, 2, boundary).unwrap(), expected);
         }
@@ -591,51 +652,83 @@ mod tests {
     fn stft_no_boundary_times_and_trailing_padding_are_explicit() {
         let x: Vec<f64> = (1..=10).map(f64::from).collect();
         for padded in [false, true] {
-            let result = stft_with_options(&x, &StftOptions {
-                fs: 2.0,
-                window: StftWindow::Named("boxcar"),
-                nperseg: Some(4),
-                noverlap: Some(0),
-                boundary: StftBoundary::None,
-                padded,
-                ..StftOptions::default()
-            }).unwrap();
+            let result = stft_with_options(
+                &x,
+                &StftOptions {
+                    fs: 2.0,
+                    window: StftWindow::Named("boxcar"),
+                    nperseg: Some(4),
+                    noverlap: Some(0),
+                    boundary: StftBoundary::None,
+                    padded,
+                    ..StftOptions::default()
+                },
+            )
+            .unwrap();
             assert_eq!(result.times[0], 1.0);
             assert_eq!(result.zxx.len(), if padded { 3 } else { 2 });
-            let reconstructed = istft_with_options(&result, &IstftOptions {
-                window: StftWindow::Named("boxcar"),
-                nperseg: Some(4),
-                noverlap: Some(0),
-                boundary: false,
-                ..IstftOptions::default()
-            }).unwrap();
+            let reconstructed = istft_with_options(
+                &result,
+                &IstftOptions {
+                    window: StftWindow::Named("boxcar"),
+                    nperseg: Some(4),
+                    noverlap: Some(0),
+                    boundary: false,
+                    ..IstftOptions::default()
+                },
+            )
+            .unwrap();
             let covered = if padded { x.len() } else { 8 };
             assert_samples(&reconstructed[..covered], &x[..covered], 2e-14);
-            assert!(reconstructed[covered..].iter().all(|&value| value.abs() < 2e-14));
+            assert!(
+                reconstructed[covered..]
+                    .iter()
+                    .all(|&value| value.abs() < 2e-14)
+            );
         }
-        let odd = stft_with_options(&x, &StftOptions {
-            fs: 2.0,
-            nperseg: Some(3),
-            boundary: StftBoundary::None,
-            ..StftOptions::default()
-        }).unwrap();
+        let odd = stft_with_options(
+            &x,
+            &StftOptions {
+                fs: 2.0,
+                nperseg: Some(3),
+                boundary: StftBoundary::None,
+                ..StftOptions::default()
+            },
+        )
+        .unwrap();
         assert_eq!(odd.times[0], 0.75);
     }
 
     #[test]
     fn stft_detrending_removes_components_before_windowing() {
         for kind in [DetrendType::Constant, DetrendType::Linear] {
-            let x: Vec<f64> = (0..16).map(|i| {
-                if kind == DetrendType::Constant { 3.0 } else { 3.0 + i as f64 }
-            }).collect();
-            let result = stft_with_options(&x, &StftOptions {
-                nperseg: Some(4),
-                detrend: Some(kind),
-                boundary: StftBoundary::None,
-                padded: false,
-                ..StftOptions::default()
-            }).unwrap();
-            assert!(result.zxx.iter().flatten().all(|&(re, im)| re.abs() + im.abs() < 1e-12));
+            let x: Vec<f64> = (0..16)
+                .map(|i| {
+                    if kind == DetrendType::Constant {
+                        3.0
+                    } else {
+                        3.0 + i as f64
+                    }
+                })
+                .collect();
+            let result = stft_with_options(
+                &x,
+                &StftOptions {
+                    nperseg: Some(4),
+                    detrend: Some(kind),
+                    boundary: StftBoundary::None,
+                    padded: false,
+                    ..StftOptions::default()
+                },
+            )
+            .unwrap();
+            assert!(
+                result
+                    .zxx
+                    .iter()
+                    .flatten()
+                    .all(|&(re, im)| re.abs() + im.abs() < 1e-12)
+            );
         }
     }
 
@@ -655,17 +748,25 @@ mod tests {
     #[test]
     fn istft_nola_gap_uses_scipy_denominator_fallback() {
         let x = [1.0, 2.0, 3.0, 4.0];
-        let result = stft_with_options(&x, &StftOptions {
-            nperseg: Some(4),
-            boundary: StftBoundary::None,
-            padded: false,
-            ..StftOptions::default()
-        }).unwrap();
-        let reconstructed = istft_with_options(&result, &IstftOptions {
-            nperseg: Some(4),
-            boundary: false,
-            ..IstftOptions::default()
-        }).unwrap();
+        let result = stft_with_options(
+            &x,
+            &StftOptions {
+                nperseg: Some(4),
+                boundary: StftBoundary::None,
+                padded: false,
+                ..StftOptions::default()
+            },
+        )
+        .unwrap();
+        let reconstructed = istft_with_options(
+            &result,
+            &IstftOptions {
+                nperseg: Some(4),
+                boundary: false,
+                ..IstftOptions::default()
+            },
+        )
+        .unwrap();
         assert_samples(&reconstructed, &[0.0, 2.0, 3.0, 4.0], 1e-12);
     }
 
@@ -673,15 +774,23 @@ mod tests {
     fn istft_negative_sum_window_retains_signed_scipy_scaling() {
         let x = [1.0, -2.0, 3.0, -4.0, 5.0];
         let window = [-1.0; 4];
-        let result = stft_with_options(&x, &StftOptions {
-            window: StftWindow::Coefficients(&window),
-            ..StftOptions::default()
-        }).unwrap();
-        let reconstructed = istft_with_options(&result, &IstftOptions {
-            window: StftWindow::Coefficients(&window),
-            nperseg: Some(4),
-            ..IstftOptions::default()
-        }).unwrap();
+        let result = stft_with_options(
+            &x,
+            &StftOptions {
+                window: StftWindow::Coefficients(&window),
+                ..StftOptions::default()
+            },
+        )
+        .unwrap();
+        let reconstructed = istft_with_options(
+            &result,
+            &IstftOptions {
+                window: StftWindow::Coefficients(&window),
+                nperseg: Some(4),
+                ..IstftOptions::default()
+            },
+        )
+        .unwrap();
         let expected: Vec<f64> = x.iter().map(|value| -value).collect();
         assert_samples(&reconstructed[..x.len()], &expected, 1e-12);
     }
@@ -698,14 +807,41 @@ mod tests {
     fn stft_invalid_geometry_and_windows_are_errors() {
         let x = [1.0; 8];
         for options in [
-            StftOptions { nperseg: Some(0), ..StftOptions::default() },
-            StftOptions { nperseg: Some(4), noverlap: Some(4), ..StftOptions::default() },
-            StftOptions { nperseg: Some(4), nfft: Some(3), ..StftOptions::default() },
-            StftOptions { nfft: Some(usize::MAX), ..StftOptions::default() },
-            StftOptions { window: StftWindow::Coefficients(&[1.0, 1.0]), nperseg: Some(3), ..StftOptions::default() },
-            StftOptions { window: StftWindow::Coefficients(&[1.0; 9]), ..StftOptions::default() },
-            StftOptions { window: StftWindow::Coefficients(&[0.0; 4]), ..StftOptions::default() },
-            StftOptions { window: StftWindow::Coefficients(&[f64::NAN; 4]), ..StftOptions::default() },
+            StftOptions {
+                nperseg: Some(0),
+                ..StftOptions::default()
+            },
+            StftOptions {
+                nperseg: Some(4),
+                noverlap: Some(4),
+                ..StftOptions::default()
+            },
+            StftOptions {
+                nperseg: Some(4),
+                nfft: Some(3),
+                ..StftOptions::default()
+            },
+            StftOptions {
+                nfft: Some(usize::MAX),
+                ..StftOptions::default()
+            },
+            StftOptions {
+                window: StftWindow::Coefficients(&[1.0, 1.0]),
+                nperseg: Some(3),
+                ..StftOptions::default()
+            },
+            StftOptions {
+                window: StftWindow::Coefficients(&[1.0; 9]),
+                ..StftOptions::default()
+            },
+            StftOptions {
+                window: StftWindow::Coefficients(&[0.0; 4]),
+                ..StftOptions::default()
+            },
+            StftOptions {
+                window: StftWindow::Coefficients(&[f64::NAN; 4]),
+                ..StftOptions::default()
+            },
         ] {
             assert!(stft_with_options(&x, &options).is_err(), "{options:?}");
         }
@@ -715,20 +851,44 @@ mod tests {
     fn istft_rejects_invalid_shapes_without_panicking() {
         let original = crate::stft(&[1.0; 8], 1.0, None, Some(4), None).unwrap();
         for options in [
-            IstftOptions { nperseg: Some(0), ..IstftOptions::default() },
-            IstftOptions { nperseg: Some(4), noverlap: Some(4), ..IstftOptions::default() },
-            IstftOptions { nperseg: Some(4), nfft: Some(3), ..IstftOptions::default() },
-            IstftOptions { nperseg: Some(4), nfft: Some(8), ..IstftOptions::default() },
+            IstftOptions {
+                nperseg: Some(0),
+                ..IstftOptions::default()
+            },
+            IstftOptions {
+                nperseg: Some(4),
+                noverlap: Some(4),
+                ..IstftOptions::default()
+            },
+            IstftOptions {
+                nperseg: Some(4),
+                nfft: Some(3),
+                ..IstftOptions::default()
+            },
+            IstftOptions {
+                nperseg: Some(4),
+                nfft: Some(8),
+                ..IstftOptions::default()
+            },
         ] {
-            assert!(istft_with_options(&original, &options).is_err(), "{options:?}");
+            assert!(
+                istft_with_options(&original, &options).is_err(),
+                "{options:?}"
+            );
         }
         for which in 0..5 {
             let mut malformed = original.clone();
             match which {
                 0 => malformed.zxx.clear(),
-                1 => { malformed.zxx[1].pop(); }
-                2 => { malformed.times.pop(); }
-                3 => { malformed.frequencies.pop(); }
+                1 => {
+                    malformed.zxx[1].pop();
+                }
+                2 => {
+                    malformed.times.pop();
+                }
+                3 => {
+                    malformed.frequencies.pop();
+                }
                 _ => malformed.zxx[0][0].0 = f64::NAN,
             }
             assert!(crate::istft(&malformed, 4, None).is_err());

@@ -6,9 +6,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use fsci_signal::{
-    StftBoundary, StftOptions, StftResult, get_window, stft_with_options,
-};
+use fsci_signal::{StftBoundary, StftOptions, StftResult, get_window, stft_with_options};
 
 fn signal(n: usize) -> Vec<f64> {
     (0..n)

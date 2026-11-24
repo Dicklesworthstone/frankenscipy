@@ -7,6 +7,7 @@ mod collocation;
 pub mod complex;
 pub mod lebedev;
 pub mod lsoda;
+pub mod qmc;
 pub mod quad;
 mod quadpack;
 pub mod radau;
@@ -31,16 +32,17 @@ pub use lsoda::{JacFn, LsodaMethod};
 pub use quad::{
     CompositeQuadResult, CubatureOptions, CubatureRegion, CubatureResult, CubatureRule,
     CubatureScalarResult, CubatureStatus, DblquadOptions, DblquadResult, NquadRange, NsumResult,
-    QmcQuadResult, QuadInfo, QuadOptions, QuadResult, QuadVecResult, QuadWeight, QuadWeightOptions,
-    cubature, cubature_scalar, cumulative_simpson, cumulative_simpson_axis_2d,
+    QmcQuadOptions, QmcQuadResult, QuadInfo, QuadOptions, QuadResult, QuadVecResult, QuadWeight,
+    QuadWeightOptions, cubature, cubature_scalar, cumulative_simpson, cumulative_simpson_axis_2d,
     cumulative_trapezoid, cumulative_trapezoid_axis_2d, cumulative_trapezoid_initial,
     cumulative_trapezoid_uniform, dblquad, dblquad_many, dblquad_rect, fixed_quad,
     gauss_kronrod_quad, gauss_legendre, line_integral, monte_carlo_integrate, newton_cotes,
-    newton_cotes_quad, nquad, nquad_many, nquad_with_ranges, nsum, qmc_quad, quad, quad_explain,
-    quad_full_inf, quad_full_output, quad_inf, quad_many, quad_neg_inf, quad_points, quad_vec,
-    quad_weighted, quad_weighted_full_output, romb, romb_func, romberg, simpson, simpson_axis_2d,
-    simpson_irregular, simpson_uniform, tanhsinh, tplquad, tplquad_many, tplquad_rect, trapezoid,
-    trapezoid_axis_2d, trapezoid_irregular, trapezoid_richardson, trapezoid_uniform,
+    newton_cotes_quad, nquad, nquad_many, nquad_with_ranges, nsum, qmc_quad, qmc_quad_with_options,
+    quad, quad_explain, quad_full_inf, quad_full_output, quad_inf, quad_many, quad_neg_inf,
+    quad_points, quad_vec, quad_weighted, quad_weighted_full_output, romb, romb_func, romberg,
+    simpson, simpson_axis_2d, simpson_irregular, simpson_uniform, tanhsinh, tplquad, tplquad_many,
+    tplquad_rect, trapezoid, trapezoid_axis_2d, trapezoid_irregular, trapezoid_richardson,
+    trapezoid_uniform,
 };
 pub use radau::{RadauSolver, RadauSolverConfig};
 pub use rk::{

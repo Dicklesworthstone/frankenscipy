@@ -2,13 +2,13 @@
 //! Cover fsci_integrate::{monte_carlo_integrate, qmc_quad}.
 //!
 //! Resolves [frankenscipy-xu0ko]. Both routines are stochastic
-//! (MC uses a seeded LCG; QMC uses Halton blocks) so direct equality
+//! (MC uses a seeded LCG; QMC uses independent scrambled Halton estimates) so direct equality
 //! with closed-form expected values is brittle. The right invariants:
 //!   * Estimate is within k·standard_error of the truth (k=4 for MC;
 //!     QMC converges faster but we still use a generous k).
 //!   * Edge cases (n_samples=0 or empty bounds) return (0.0, 0.0)
 //!     for MC.
-//!   * QMC reports n_estimates < 2 → error (variance needs ≥2 blocks).
+//!   * QMC requires at least one estimate; with one, standard error is undefined.
 //!   * QMC reports dimension > 32 → error (out of pinned-prime table).
 
 use std::collections::BTreeMap;
@@ -199,12 +199,12 @@ fn diff_integrate_monte_carlo_qmc_quad() {
         );
     }
 
-    // QMC: n_estimates == 1 is allowed (se = 0)
+    // QMC: one estimate is allowed, but cannot identify sampling uncertainty.
     {
         let r = qmc_quad(|_| 1.0, &[0.0], &[1.0], 1, 256).expect("single estimate ok");
         check(
-            "qmc_n_estimates_one_ok_zero_se",
-            (r.integral - 1.0).abs() < QMC_SINGLE_EST_TOL && r.standard_error == 0.0,
+            "qmc_n_estimates_one_ok_undefined_se",
+            (r.integral - 1.0).abs() < QMC_SINGLE_EST_TOL && r.standard_error.is_nan(),
             format!("integral={} se={}", r.integral, r.standard_error),
         );
     }

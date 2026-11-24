@@ -15107,7 +15107,9 @@ pub fn place_poles(
     }
 
     if a.iter().chain(b).flatten().any(|value| !value.is_finite())
-        || poles.iter().any(|&(re, im)| !re.is_finite() || !im.is_finite())
+        || poles
+            .iter()
+            .any(|&(re, im)| !re.is_finite() || !im.is_finite())
     {
         return Err(SignalError::NonFiniteInput {
             detail: "place_poles: A, B, and the requested poles must be finite".to_string(),
@@ -15223,7 +15225,6 @@ pub fn place_poles(
     })
 }
 
-
 // The feasible eigenvectors for a desired pole lambda are the columns of
 // ker(U_perp^T (A - lambda I)), where U_perp spans the orthogonal complement
 // of range(B). Keeping every update in this subspace makes pole placement an
@@ -15246,9 +15247,12 @@ fn place_poles_order(poles: &[(f64, f64)]) -> Result<Vec<(f64, f64)>, SignalErro
         if im == 0.0 {
             real.push(re);
         } else {
-            let partner = poles.iter().enumerate().find_map(|(j, &(other_re, other_im))| {
-                (!used[j] && other_re == re && other_im == -im).then_some(j)
-            });
+            let partner = poles
+                .iter()
+                .enumerate()
+                .find_map(|(j, &(other_re, other_im))| {
+                    (!used[j] && other_re == re && other_im == -im).then_some(j)
+                });
             let Some(partner) = partner else {
                 return Err(SignalError::InvalidParameter {
                     detail: "place_poles: non-real poles must occur in complex conjugate pairs"
@@ -15269,10 +15273,7 @@ fn place_poles_order(poles: &[(f64, f64)]) -> Result<Vec<(f64, f64)>, SignalErro
     Ok(ordered)
 }
 
-fn place_poles_check_multiplicity(
-    poles: &[(f64, f64)],
-    rank_b: usize,
-) -> Result<(), SignalError> {
+fn place_poles_check_multiplicity(poles: &[(f64, f64)], rank_b: usize) -> Result<(), SignalError> {
     for &pole in poles {
         if poles.iter().filter(|&&candidate| candidate == pole).count() > rank_b {
             return Err(SignalError::InvalidParameter {
@@ -15322,9 +15323,7 @@ fn place_poles_complement(
         .map(|row| {
             row.iter()
                 .enumerate()
-                .filter_map(|(j, &value)| {
-                    (j < first || j >= first + width).then_some(value)
-                })
+                .filter_map(|(j, &value)| (j < first || j >= first + width).then_some(value))
                 .collect()
         })
         .collect();
@@ -15349,9 +15348,7 @@ fn place_poles_update_real(
     // admissible subspace. Its normalized projection maximizes |det(X)|
     // with those columns held fixed.
     for k in 0..rank {
-        let coefficient: f64 = (0..n)
-            .map(|i| space.basis[i][k].re * q[i][n - 1])
-            .sum();
+        let coefficient: f64 = (0..n).map(|i| space.basis[i][k].re * q[i][n - 1]).sum();
         for i in 0..n {
             vector[i] += space.basis[i][k].re * coefficient;
         }
@@ -15390,8 +15387,7 @@ fn place_poles_update_complex(
     let mut hermitian = vec![vec![zero; rank]; rank];
     for i in 0..rank {
         for j in 0..=i {
-            let mut value =
-                (a[i] * b[j].conj() - b[i] * a[j].conj()) * C64::new(0.0, -0.5);
+            let mut value = (a[i] * b[j].conj() - b[i] * a[j].conj()) * C64::new(0.0, -0.5);
             if i == j {
                 value.im = 0.0;
             }
@@ -15399,17 +15395,18 @@ fn place_poles_update_complex(
             hermitian[j][i] = value.conj();
         }
     }
-    let eig = fsci_linalg::complex::eigh(
-        &hermitian,
-        fsci_linalg::DecompOptions::default(),
-    )
-    .map_err(|error| {
-        SignalError::NumericalFailure(format!(
-            "place_poles: conjugate-pair update failed ({error})"
-        ))
-    })?;
+    let eig = fsci_linalg::complex::eigh(&hermitian, fsci_linalg::DecompOptions::default())
+        .map_err(|error| {
+            SignalError::NumericalFailure(format!(
+                "place_poles: conjugate-pair update failed ({error})"
+            ))
+        })?;
     let selected = (0..rank)
-        .max_by(|&i, &j| eig.eigenvalues[i].abs().total_cmp(&eig.eigenvalues[j].abs()))
+        .max_by(|&i, &j| {
+            eig.eigenvalues[i]
+                .abs()
+                .total_cmp(&eig.eigenvalues[j].abs())
+        })
         .expect("a nonzero-rank input has a nonempty pole subspace");
     if eig.eigenvalues[selected].abs() <= f64::EPSILON * n as f64 {
         return Ok(());
@@ -15431,8 +15428,8 @@ fn place_poles_update_complex(
 }
 
 fn place_poles_log_volume(transfer: &[Vec<f64>]) -> Result<f64, SignalError> {
-    let r = fsci_linalg::qr_r(transfer, fsci_linalg::DecompOptions::default())
-        .map_err(|error| {
+    let r =
+        fsci_linalg::qr_r(transfer, fsci_linalg::DecompOptions::default()).map_err(|error| {
             SignalError::NumericalFailure(format!(
                 "place_poles: transfer-volume QR failed ({error})"
             ))
@@ -15512,9 +15509,7 @@ fn place_poles_transfer(
                         ))
                     },
                 )?;
-            if singular_values[n - 1]
-                > singular_values[0] * f64::EPSILON * n as f64
-            {
+            if singular_values[n - 1] > singular_values[0] * f64::EPSILON * n as f64 {
                 return Ok(best);
             }
         }
@@ -15539,7 +15534,11 @@ fn place_poles_multiple_inputs(
         ))
     })?;
     let threshold = input_svd.s[0] * f64::EPSILON * n.max(inputs) as f64;
-    let rank_b = input_svd.s.iter().filter(|&&value| value > threshold).count();
+    let rank_b = input_svd
+        .s
+        .iter()
+        .filter(|&&value| value > threshold)
+        .count();
     if rank_b == 0 {
         return Err(SignalError::NumericalFailure(
             "place_poles: B has zero rank; the system has no controllable inputs".to_string(),
@@ -15601,7 +15600,10 @@ fn place_poles_multiple_inputs(
             spaces.push(PolePlacementSubspace {
                 first,
                 pole,
-                basis: q.into_iter().map(|row| row[n - rank_b..].to_vec()).collect(),
+                basis: q
+                    .into_iter()
+                    .map(|row| row[n - rank_b..].to_vec())
+                    .collect(),
             });
             first += if pole.im == 0.0 { 1 } else { 2 };
         }
@@ -30725,10 +30727,8 @@ mod tests {
             }
         }
         let parallel_inverse = istft(&parallel, nperseg, Some(noverlap)).unwrap();
-        let serial_inverse = with_serial_par_index_fill(|| {
-            istft(&parallel, nperseg, Some(noverlap))
-        })
-        .unwrap();
+        let serial_inverse =
+            with_serial_par_index_fill(|| istft(&parallel, nperseg, Some(noverlap))).unwrap();
         assert_eq!(parallel_inverse.len(), serial_inverse.len());
         for (i, (&actual, &expected)) in parallel_inverse.iter().zip(&serial_inverse).enumerate() {
             assert_eq!(actual.to_bits(), expected.to_bits(), "inverse sample {i}");
