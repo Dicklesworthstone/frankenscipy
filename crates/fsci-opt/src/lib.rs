@@ -96,10 +96,11 @@ pub use nonlin::{
     broyden2_lowrank, diag_broyden, exciting_mixing, linear_mixing, nonlin_solve, root_nonlin,
 };
 pub use root::{
-    MultivariateRootMethod, MultivariateRootOptions, MultivariateRootResult, RootResult,
-    RootResults, anderson, bisect, brenth, brentq, brentq_many, broyden1, broyden2, df_sane,
-    fsolve, halley, lm_root, newton, newton_krylov, newton_many, newton_scalar, ridder, root,
-    root_many, root_scalar, secant, secant_many, toms748,
+    MultivariateRootMethod, MultivariateRootOptions, MultivariateRootResult, NewtonKrylovOptions,
+    RootResult, RootResults, anderson, bisect, brenth, brentq, brentq_many, broyden1, broyden2,
+    df_sane, fsolve, halley, lm_root, newton, newton_krylov, newton_krylov_with_options,
+    newton_many, newton_scalar, ridder, root, root_many, root_scalar, secant, secant_many,
+    toms748,
 };
 pub use types::{
     Bound, Bounds, Constraint, ConstraintFn, ConstraintJacFn, ConstraintOrigin, ConstraintType,

@@ -76,6 +76,8 @@ jobs:
             least-squares)
               cargo test --locked -p fsci-opt --lib curvefit::tests -- --nocapture
               cargo test --locked -p fsci-opt --lib trf_lsmr::tests -- --nocapture
+              cargo test --locked -p fsci-opt --lib newton_krylov -- --nocapture
+              cargo test --locked -p fsci-opt --lib nk_gmres -- --nocapture
               cargo test --locked -p fsci-opt --test least_squares_lsmr_scipy -- --nocapture
               cargo test --locked -p fsci-opt --test linear_least_squares_scipy -- --nocapture
               ;;

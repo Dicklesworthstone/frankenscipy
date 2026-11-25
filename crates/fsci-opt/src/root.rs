@@ -2526,114 +2526,211 @@ where
     })
 }
 
-/// Levenberg-Marquardt algorithm for root finding.
-///
-/// Matches `scipy.optimize.root(method='lm')`.
-///
-/// The Levenberg-Marquardt algorithm is a damped least-squares method that
-/// combines Gauss-Newton and gradient descent. It solves:
-///
-/// (J^T J + λI) dx = -J^T F(x)
-///
-/// where λ is an adaptive damping parameter. When λ is small, this approaches
-// L2 norm.
+// Scaled L2 norm: finite tiny/large residuals must not become zero/infinity
+// merely because their squares underflow/overflow.
 fn nk_norm(v: &[f64]) -> f64 {
-    v.iter().map(|x| x * x).sum::<f64>().sqrt()
+    v.iter().fold(0.0_f64, |norm, &value| norm.hypot(value))
 }
 
 fn nk_dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
-// Jacobian-free GMRES (non-restarted, up to `max_dim` Arnoldi vectors): solve
-// `A·x = b` where `matvec(v) ≈ A·v`. Returns the approximate solution; for
-// `max_dim >= n` this is the exact solve (the Krylov space spans Rⁿ).
-fn nk_gmres<MV>(matvec: &mut MV, b: &[f64], tol: f64, max_dim: usize) -> Vec<f64>
-where
-    MV: FnMut(&[f64]) -> Vec<f64>,
-{
-    let n = b.len();
-    let bnorm = nk_norm(b);
-    if bnorm == 0.0 {
-        return vec![0.0; n];
+fn nk_check_vector(values: &[f64], expected: usize, context: &str) -> Result<(), OptError> {
+    if values.len() != expected {
+        return Err(OptError::InvalidArgument {
+            detail: format!(
+                "newton_krylov: {context} length is {}, expected {expected}",
+                values.len()
+            ),
+        });
     }
-    let m = max_dim.clamp(1, n);
-    let mut q: Vec<Vec<f64>> = Vec::with_capacity(m + 1);
-    let mut h = vec![vec![0.0_f64; m]; m + 1];
-    let mut cs = vec![0.0_f64; m];
-    let mut sn = vec![0.0_f64; m];
-    let mut g = vec![0.0_f64; m + 1];
-    g[0] = bnorm;
-    q.push(b.iter().map(|v| v / bnorm).collect());
-
-    let mut k_used = 0;
-    for k in 0..m {
-        let mut w = matvec(&q[k]);
-        // Modified Gram-Schmidt against q[0..=k].
-        for i in 0..=k {
-            h[i][k] = nk_dot(&w, &q[i]);
-            for j in 0..n {
-                w[j] -= h[i][k] * q[i][j];
-            }
-        }
-        h[k + 1][k] = nk_norm(&w);
-        let breakdown = h[k + 1][k] <= 1e-14 * bnorm;
-        if !breakdown {
-            let hk = h[k + 1][k];
-            q.push(w.iter().map(|v| v / hk).collect());
-        }
-        // Apply previous Givens rotations to column k.
-        for i in 0..k {
-            let temp = cs[i] * h[i][k] + sn[i] * h[i + 1][k];
-            h[i + 1][k] = -sn[i] * h[i][k] + cs[i] * h[i + 1][k];
-            h[i][k] = temp;
-        }
-        // New Givens rotation to zero h[k+1][k].
-        let r = (h[k][k] * h[k][k] + h[k + 1][k] * h[k + 1][k]).sqrt();
-        if r == 0.0 {
-            k_used = k + 1;
-            break;
-        }
-        cs[k] = h[k][k] / r;
-        sn[k] = h[k + 1][k] / r;
-        h[k][k] = r;
-        h[k + 1][k] = 0.0;
-        g[k + 1] = -sn[k] * g[k];
-        g[k] *= cs[k];
-        k_used = k + 1;
-        if g[k + 1].abs() <= tol * bnorm || breakdown {
-            break;
-        }
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(OptError::NonFiniteInput {
+            detail: format!("newton_krylov: {context} contains a non-finite value"),
+        });
     }
-
-    // Back-substitution: solve upper-triangular H[0..k_used] y = g[0..k_used].
-    let kk = k_used;
-    let mut y = vec![0.0_f64; kk];
-    for i in (0..kk).rev() {
-        let mut s = g[i];
-        for j in (i + 1)..kk {
-            s -= h[i][j] * y[j];
-        }
-        y[i] = if h[i][i] != 0.0 { s / h[i][i] } else { 0.0 };
-    }
-    let mut x = vec![0.0_f64; n];
-    for i in 0..kk {
-        for j in 0..n {
-            x[j] += y[i] * q[i][j];
-        }
-    }
-    x
+    Ok(())
 }
 
-/// Solve `F(x) = 0` with a Jacobian-free Newton-Krylov method, matching
-/// `scipy.optimize.newton_krylov(func, x0, f_tol=...)`.
+// Restarted GMRES. At most restart+1 Arnoldi vectors and a
+// (restart+1) x restart Hessenberg matrix are live, independent of n.
+// max_iter counts Arnoldi steps across all restarts; each cycle additionally
+// evaluates A*x to check the true residual of the accumulated solution.
+fn nk_gmres<MV>(
+    matvec: &mut MV,
+    b: &[f64],
+    tol: f64,
+    restart: usize,
+    max_iter: usize,
+) -> Result<Vec<f64>, OptError>
+where
+    MV: FnMut(&[f64]) -> Result<Vec<f64>, OptError>,
+{
+    if restart == 0 || max_iter == 0 || !tol.is_finite() || tol <= 0.0 {
+        return Err(OptError::InvalidArgument {
+            detail: String::from("newton_krylov: inner limits and tolerance must be positive"),
+        });
+    }
+    let n = b.len();
+    let bnorm = nk_norm(b);
+    if !bnorm.is_finite() {
+        return Err(OptError::NonFiniteInput {
+            detail: String::from("newton_krylov: inner right-hand-side norm is not finite"),
+        });
+    }
+    let mut x = vec![0.0; n];
+    if bnorm == 0.0 {
+        return Ok(x);
+    }
+    let width = restart.min(n).min(max_iter);
+    let mut residual = b.to_vec();
+    let mut iterations = 0usize;
+
+    while iterations < max_iter {
+        let beta = nk_norm(&residual);
+        if beta / bnorm <= tol {
+            break;
+        }
+        let m = width.min(max_iter - iterations);
+        let mut q: Vec<Vec<f64>> = Vec::with_capacity(m + 1);
+        let mut h = vec![vec![0.0_f64; m]; m + 1];
+        let mut cs = vec![0.0_f64; m];
+        let mut sn = vec![0.0_f64; m];
+        let mut g = vec![0.0_f64; m + 1];
+        g[0] = beta;
+        q.push(residual.iter().map(|v| v / beta).collect());
+
+        let mut k_used = 0;
+        let mut cycle_breakdown = false;
+        for k in 0..m {
+            let mut w = matvec(&q[k])?;
+            nk_check_vector(&w, n, "Jacobian-vector product")?;
+            let column_norm = nk_norm(&w);
+            if !column_norm.is_finite() {
+                return Err(OptError::NonFiniteInput {
+                    detail: String::from("newton_krylov: Arnoldi column norm is not finite"),
+                });
+            }
+            // Two-pass modified Gram-Schmidt prevents loss of orthogonality
+            // from masquerading as convergence near a dependent Krylov vector.
+            for _ in 0..2 {
+                for i in 0..=k {
+                    let projection = nk_dot(&w, &q[i]);
+                    h[i][k] += projection;
+                    for j in 0..n {
+                        w[j] -= projection * q[i][j];
+                    }
+                }
+            }
+            h[k + 1][k] = nk_norm(&w);
+            // Arnoldi breakdown depends on the operator column, not ||b||:
+            // rescaling the residual must not change the retained subspace.
+            let breakdown = h[k + 1][k] <= f64::EPSILON * column_norm;
+            cycle_breakdown = breakdown;
+            if !breakdown {
+                let norm = h[k + 1][k];
+                q.push(w.iter().map(|v| v / norm).collect());
+            }
+            for i in 0..k {
+                let temp = cs[i] * h[i][k] + sn[i] * h[i + 1][k];
+                h[i + 1][k] = -sn[i] * h[i][k] + cs[i] * h[i + 1][k];
+                h[i][k] = temp;
+            }
+            let diagonal = h[k][k].hypot(h[k + 1][k]);
+            iterations += 1;
+            k_used = k + 1;
+            if diagonal == 0.0 {
+                break;
+            }
+            if !diagonal.is_finite() {
+                return Err(OptError::NonFiniteInput {
+                    detail: String::from("newton_krylov: projected system is not finite"),
+                });
+            }
+            cs[k] = h[k][k] / diagonal;
+            sn[k] = h[k + 1][k] / diagonal;
+            h[k][k] = diagonal;
+            h[k + 1][k] = 0.0;
+            g[k + 1] = -sn[k] * g[k];
+            g[k] *= cs[k];
+            if g[k + 1].abs() / bnorm <= tol || breakdown {
+                break;
+            }
+        }
+
+        let mut y = vec![0.0_f64; k_used];
+        for i in (0..k_used).rev() {
+            let mut value = g[i];
+            for j in (i + 1)..k_used {
+                value -= h[i][j] * y[j];
+            }
+            y[i] = if h[i][i] != 0.0 { value / h[i][i] } else { 0.0 };
+        }
+        for i in 0..k_used {
+            for j in 0..n {
+                x[j] += y[i] * q[i][j];
+            }
+        }
+        nk_check_vector(&x, n, "inner solution")?;
+        let ax = matvec(&x)?;
+        nk_check_vector(&ax, n, "restarted Jacobian-vector product")?;
+        residual = b.iter().zip(ax).map(|(b, ax)| b - ax).collect();
+        nk_check_vector(&residual, n, "inner residual")?;
+        if !nk_norm(&residual).is_finite() {
+            return Err(OptError::NonFiniteInput {
+                detail: String::from("newton_krylov: inner residual norm is not finite"),
+            });
+        }
+        // The Krylov space cannot grow after breakdown. Return the available
+        // step even if finite-difference noise prevents the inner tolerance;
+        // only the outer nonlinear residual can certify convergence.
+        if cycle_breakdown {
+            break;
+        }
+    }
+    Ok(x)
+}
+
+/// Controls for a Jacobian-free nonlinear solve with restarted GMRES.
 ///
-/// Each Newton step solves `J·dx = −F(x)` with an inner GMRES that approximates
-/// `J·v` by the forward finite difference `(F(x + εv) − F(x))/ε`
-/// (`ε = √ε_mach·(1+‖x‖)/‖v‖`, as in scipy's `KrylovJacobian`), globalized by an
-/// Armijo backtracking line search on `‖F‖`. Terminates when `‖F(x)‖ < f_tol`.
-/// Returns the same [`MultivariateRootResult`] as the other root methods, and fails with
-/// [`OptError::NoConvergence`] where SciPy raises `NoConvergence`; see [`broyden1`].
+/// The outer stopping condition is the L2 residual norm, as in this crate's
+/// existing [`newton_krylov`] API. This method uses restarted GMRES, not SciPy's
+/// default LGMRES augmentation; no Jacobian or n-by-n Krylov workspace is formed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NewtonKrylovOptions {
+    /// Stop when the L2 norm of the nonlinear residual is below this value.
+    pub f_tol: f64,
+    /// Maximum nonlinear iterations.
+    pub max_iter: usize,
+    /// Maximum Arnoldi basis size per restart (default 20).
+    pub inner_restart: usize,
+    /// Maximum Arnoldi steps per Newton solve, across all restarts (default 100).
+    /// A cycle also performs one product to check its true residual.
+    pub inner_maxiter: usize,
+}
+
+impl Default for NewtonKrylovOptions {
+    fn default() -> Self {
+        Self {
+            f_tol: 1e-10,
+            max_iter: 200,
+            inner_restart: 20,
+            inner_maxiter: 100,
+        }
+    }
+}
+
+/// Solve F(x) = 0 with a Jacobian-free Newton method and restarted GMRES.
+///
+/// Jacobian-vector products use finite differences and the Newton step is
+/// globalized by an Armijo line search. The inner basis is bounded at 20 vectors
+/// by default, so workspace grows linearly with the number of unknowns.
+/// Use [`newton_krylov_with_options`] to set the restart and inner iteration limits.
+///
+/// Terminates when the L2 residual norm is below `f_tol`. Returns
+/// [`OptError::NoConvergence`] on exhaustion; [`root`] with
+/// [`MultivariateRootMethod::NewtonKrylov`] instead returns a nonconverged result.
 pub fn newton_krylov<F>(
     func: F,
     x0: &[f64],
@@ -2643,7 +2740,32 @@ pub fn newton_krylov<F>(
 where
     F: Fn(&[f64]) -> Vec<f64>,
 {
-    raise_no_convergence(newton_krylov_iterate(func, x0, f_tol, maxiter))
+    newton_krylov_with_options(
+        func,
+        x0,
+        NewtonKrylovOptions {
+            f_tol,
+            max_iter: maxiter,
+            ..NewtonKrylovOptions::default()
+        },
+    )
+}
+
+/// Configurable Jacobian-free Newton solve with bounded-memory restarted GMRES.
+///
+/// The Jacobian-free workspace is `O(n*m + m*m)`, where m is the smaller of the
+/// problem dimension, `inner_restart` and `inner_maxiter`. Every residual callback
+/// must return exactly one finite value per unknown, including during numerical
+/// differentiation and line search; callback failures return a typed error.
+pub fn newton_krylov_with_options<F>(
+    func: F,
+    x0: &[f64],
+    options: NewtonKrylovOptions,
+) -> Result<MultivariateRootResult, OptError>
+where
+    F: Fn(&[f64]) -> Vec<f64>,
+{
+    raise_no_convergence(newton_krylov_iterate_with_options(func, x0, options))
 }
 
 fn newton_krylov_iterate<F>(
@@ -2655,51 +2777,114 @@ fn newton_krylov_iterate<F>(
 where
     F: Fn(&[f64]) -> Vec<f64>,
 {
-    validate_multivariate_root_params(x0, f_tol, maxiter)?;
+    newton_krylov_iterate_with_options(
+        func,
+        x0,
+        NewtonKrylovOptions {
+            f_tol,
+            max_iter: maxiter,
+            ..NewtonKrylovOptions::default()
+        },
+    )
+}
+
+fn newton_krylov_iterate_with_options<F>(
+    func: F,
+    x0: &[f64],
+    options: NewtonKrylovOptions,
+) -> Result<MultivariateRootResult, OptError>
+where
+    F: Fn(&[f64]) -> Vec<f64>,
+{
+    let NewtonKrylovOptions {
+        f_tol,
+        max_iter,
+        inner_restart,
+        inner_maxiter,
+    } = options;
+    validate_multivariate_root_params(x0, f_tol, max_iter)?;
+    if inner_restart == 0 || inner_maxiter == 0 {
+        return Err(OptError::InvalidArgument {
+            detail: String::from("newton_krylov: inner iteration limits must be positive"),
+        });
+    }
     let n = x0.len();
+    let evaluate = |point: &[f64]| {
+        nk_check_vector(point, n, "evaluation point")?;
+        evaluate_multivariate_root(&func, point, n, "newton_krylov")
+    };
     let mut x = x0.to_vec();
-    let mut fx = evaluate_multivariate_root(&func, &x, n, "newton_krylov")?;
+    let mut fx = evaluate(&x)?;
     let mut nfev = 1usize;
 
-    for iteration in 0..maxiter {
+    for iteration in 0..max_iter {
         let norm_fx = nk_norm(&fx);
         if norm_fx < f_tol {
             return Ok(MultivariateRootResult {
                 x,
                 fun: fx,
-                // status: ‖F(x)‖₂ < f_tol
+                // status: the L2 nonlinear residual is below f_tol.
                 converged: true,
                 message: "newton_krylov converged".to_string(),
                 iterations: iteration,
                 function_calls: nfev,
             });
         }
+        if !norm_fx.is_finite() {
+            return Err(OptError::NonFiniteInput {
+                detail: String::from("newton_krylov: residual norm is not finite"),
+            });
+        }
 
-        // Inexact-Newton inner tolerance (Eisenstat-Walker style, capped).
         let eta = (0.1 * norm_fx).clamp(1e-10, 0.1);
         let rhs: Vec<f64> = fx.iter().map(|v| -v).collect();
         let normx = nk_norm(&x);
-        let rdiff = f64::EPSILON.sqrt();
-        let mut matvec = |v: &[f64]| -> Vec<f64> {
+        if !normx.is_finite() {
+            return Err(OptError::NonFiniteInput {
+                detail: String::from("newton_krylov: parameter norm is not finite"),
+            });
+        }
+        let step = f64::EPSILON.sqrt() * (1.0 + normx);
+        let mut matvec = |v: &[f64]| -> Result<Vec<f64>, OptError> {
             let normv = nk_norm(v);
             if normv == 0.0 {
-                return vec![0.0; n];
+                return Ok(vec![0.0; n]);
             }
-            let eps = rdiff * (1.0 + normx) / normv;
-            let xp: Vec<f64> = x.iter().zip(v).map(|(xi, vi)| xi + eps * vi).collect();
-            let fxp = func(&xp);
+            if !normv.is_finite() {
+                return Err(OptError::NonFiniteInput {
+                    detail: String::from("newton_krylov: direction norm is not finite"),
+                });
+            }
+            // Normalize before applying the step: step/normv can overflow
+            // for a tiny vector even when its perturbation is representable.
+            let xp: Vec<f64> = x
+                .iter()
+                .zip(v)
+                .map(|(xi, vi)| xi + step * (vi / normv))
+                .collect();
+            let fxp = evaluate(&xp)?;
             nfev += 1;
-            fxp.iter().zip(&fx).map(|(a, b)| (a - b) / eps).collect()
+            let product: Vec<f64> = fxp
+                .iter()
+                .zip(&fx)
+                .map(|(a, b)| ((a - b) / step) * normv)
+                .collect();
+            nk_check_vector(&product, n, "finite-difference Jacobian product")?;
+            Ok(product)
         };
-        let dx = nk_gmres(&mut matvec, &rhs, eta, n);
+        let dx = nk_gmres(&mut matvec, &rhs, eta, inner_restart, inner_maxiter)?;
 
-        // Armijo backtracking line search on ‖F‖.
         let mut lam = 1.0_f64;
         let (x_next, fx_next) = loop {
             let x_new: Vec<f64> = x.iter().zip(&dx).map(|(xi, di)| xi + lam * di).collect();
-            let fx_new = func(&x_new);
+            let fx_new = evaluate(&x_new)?;
             nfev += 1;
             let norm_new = nk_norm(&fx_new);
+            if !norm_new.is_finite() {
+                return Err(OptError::NonFiniteInput {
+                    detail: String::from("newton_krylov: trial residual norm is not finite"),
+                });
+            }
             if norm_new < (1.0 - 1e-4 * lam) * norm_fx || lam < 1e-10 {
                 break (x_new, fx_new);
             }
@@ -2719,7 +2904,7 @@ where
         } else {
             "newton_krylov reached maxiter without converging".to_string()
         },
-        iterations: maxiter,
+        iterations: max_iter,
         function_calls: nfev,
     })
 }
@@ -3322,6 +3507,212 @@ mod tests {
             "x2 = {:?}",
             r2.x
         );
+    }
+
+    #[test]
+    fn nk_gmres_restarts_nonsymmetric_system() {
+        let apply = |x: &[f64]| -> Vec<f64> {
+            (0..x.len())
+                .map(|i| {
+                    4.0 * x[i] - x[(i + 1) % x.len()] + 0.25 * x[(i + x.len() - 1) % x.len()]
+                })
+                .collect()
+        };
+        let expected: Vec<f64> = (0..37).map(|i| [0.5, -1.0, 2.0, 0.75][i % 4]).collect();
+        let rhs = apply(&expected);
+        let calls = std::cell::Cell::new(0usize);
+        let mut matvec = |x: &[f64]| {
+            calls.set(calls.get() + 1);
+            Ok(apply(x))
+        };
+        let result = super::nk_gmres(&mut matvec, &rhs, 1e-11, 3, 90).unwrap();
+        let residual: Vec<f64> = apply(&result).iter().zip(&rhs).map(|(a, b)| a - b).collect();
+        assert!(super::nk_norm(&residual) / super::nk_norm(&rhs) <= 1e-11);
+        assert!(calls.get() > 4, "fixture must require at least one restart");
+        assert!(calls.get() <= 120, "90 Arnoldi steps plus at most 30 residual checks");
+        for (actual, expected) in result.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn nk_gmres_honors_inner_iteration_budget() {
+        let calls = std::cell::Cell::new(0usize);
+        let mut matvec = |x: &[f64]| {
+            calls.set(calls.get() + 1);
+            Ok(vec![x[0], 10.0 * x[1], 100.0 * x[2]])
+        };
+        let rhs = [1.0, 1.0, 1.0];
+        let result = super::nk_gmres(&mut matvec, &rhs, 1e-12, 2, 1).unwrap();
+        assert_eq!(calls.get(), 2, "one Arnoldi step and one true-residual check");
+        let residual = [result[0] - 1.0, 10.0 * result[1] - 1.0, 100.0 * result[2] - 1.0];
+        assert!(super::nk_norm(&residual) > 0.1, "one step cannot solve this system");
+    }
+
+    #[test]
+    fn nk_gmres_is_invariant_to_rhs_scale() {
+        for scale in [1e-200, 1.0, 1e200] {
+            let mut matvec = |x: &[f64]| Ok(vec![x[0], 2.0 * x[1], 3.0 * x[2]]);
+            let result =
+                super::nk_gmres(&mut matvec, &[scale, scale, scale], 1e-12, 3, 9).unwrap();
+            for (actual, expected) in result.iter().zip([1.0, 0.5, 1.0 / 3.0]) {
+                assert!((actual / scale - expected).abs() < 1e-12, "scale={scale:e}");
+            }
+        }
+    }
+
+    #[test]
+    fn newton_krylov_large_diagonal_system() {
+        // The old full-dimensional Hessenberg allocation alone needed over
+        // 3 GB here, even though this operator has only three eigenvalues.
+        let n = 20_000;
+        let residual = |x: &[f64]| {
+            x.iter()
+                .enumerate()
+                .map(|(i, &value)| {
+                    [1.0, 2.0, 3.0][i % 3] * (value - [0.5, 1.5, -2.0, 0.75][i % 4])
+                })
+                .collect::<Vec<_>>()
+        };
+        let result = newton_krylov(residual, &vec![0.0; n], 1e-8, 20).unwrap();
+        assert!(result.converged);
+        assert_eq!(result.fun, residual(&result.x));
+        assert!(super::nk_norm(&result.fun) < 1e-8);
+        assert!(
+            result.function_calls < 250,
+            "three-eigenvalue system should converge promptly"
+        );
+        for (i, &value) in result.x.iter().enumerate() {
+            assert!((value - [0.5, 1.5, -2.0, 0.75][i % 4]).abs() < 1e-8);
+        }
+    }
+
+    #[test]
+    fn newton_krylov_configurable_restarts_and_root_interfaces() {
+        let residual = |x: &[f64]| vec![x[0] - 1.0, 2.0 * (x[1] + 0.5), 3.0 * (x[2] - 2.0)];
+        let result = super::newton_krylov_with_options(
+            residual,
+            &[0.0; 3],
+            super::NewtonKrylovOptions {
+                inner_restart: 1,
+                inner_maxiter: 30,
+                ..super::NewtonKrylovOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(result.converged);
+        assert_eq!(result.fun, residual(&result.x));
+        assert!(super::nk_norm(&result.fun) < 1e-10);
+
+        let options = MultivariateRootOptions {
+            method: MultivariateRootMethod::NewtonKrylov,
+            ..MultivariateRootOptions::default()
+        };
+        let single = root(residual, &[0.0; 3], options.clone()).unwrap();
+        let batch = root_many(
+            |x, shift: &[f64]| vec![x[0] - shift[0], 2.0 * (x[1] + 0.5), 3.0 * (x[2] - 2.0)],
+            &[0.0; 3],
+            &[vec![1.0], vec![-2.0]],
+            options.clone(),
+        );
+        assert!(single.converged && super::nk_norm(&single.fun) < options.tol);
+        for (result, expected) in batch.into_iter().zip([1.0, -2.0]) {
+            let result = result.unwrap();
+            assert!(result.converged && super::nk_norm(&result.fun) < options.tol);
+            assert!((result.x[0] - expected).abs() < 1e-9);
+        }
+
+        let exhausted = root(
+            |_| vec![1.0],
+            &[0.0],
+            MultivariateRootOptions {
+                max_iter: 1,
+                ..options
+            },
+        )
+        .unwrap();
+        assert!(!exhausted.converged);
+        assert_eq!(exhausted.fun, vec![1.0]);
+        let error = super::newton_krylov_with_options(
+            |_| vec![1.0],
+            &[0.0],
+            super::NewtonKrylovOptions {
+                max_iter: 1,
+                inner_maxiter: 1,
+                ..super::NewtonKrylovOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, crate::OptError::NoConvergence { .. }));
+    }
+
+    #[test]
+    fn newton_krylov_rejects_invalid_inner_limits() {
+        for (inner_restart, inner_maxiter) in [(0, 10), (10, 0)] {
+            let error = super::newton_krylov_with_options(
+                |_| panic!("invalid options must fail before evaluating the model"),
+                &[0.0],
+                super::NewtonKrylovOptions {
+                    inner_restart,
+                    inner_maxiter,
+                    ..super::NewtonKrylovOptions::default()
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(error, crate::OptError::InvalidArgument { .. }));
+        }
+    }
+
+    #[test]
+    fn newton_krylov_rejects_shape_changes_in_products_and_trials() {
+        // Zero catches a differencing sample; 0.25 permits all samples near
+        // x0 but rejects the full trial. Check both shorter and longer output.
+        for limit in [0.0, 0.25] {
+            for invalid in [vec![], vec![0.0, 0.0]] {
+                let residual = |x: &[f64]| {
+                    if x[0] > limit {
+                        invalid.clone()
+                    } else {
+                        vec![x[0] - 1.0]
+                    }
+                };
+                let error = newton_krylov(residual, &[0.0], 1e-10, 10).unwrap_err();
+                assert!(matches!(error, crate::OptError::InvalidArgument { .. }));
+                let error = root(
+                    residual,
+                    &[0.0],
+                    MultivariateRootOptions {
+                        method: MultivariateRootMethod::NewtonKrylov,
+                        ..MultivariateRootOptions::default()
+                    },
+                )
+                .unwrap_err();
+                assert!(matches!(error, crate::OptError::InvalidArgument { .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn newton_krylov_rejects_nonfinite_products_and_trials() {
+        for limit in [0.0, 0.25] {
+            for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let residual = |x: &[f64]| {
+                    assert!(x.iter().all(|value| value.is_finite()));
+                    vec![if x[0] > limit { invalid } else { x[0] - 1.0 }]
+                };
+                let error = newton_krylov(residual, &[0.0], 1e-10, 10).unwrap_err();
+                assert!(matches!(error, crate::OptError::NonFiniteInput { .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn newton_krylov_small_residual_does_not_underflow() {
+        let result = newton_krylov(|x| vec![1e-200 * (x[0] - 1.0)], &[0.0], 1e-210, 20)
+            .unwrap();
+        assert!(result.converged);
+        assert!((result.x[0] - 1.0).abs() < 1e-10);
+        assert!(result.fun[0].abs() < 1e-210);
     }
 
     #[test]
