@@ -61,8 +61,7 @@ const EPS: f64 = f64::EPSILON;
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComplexSolveResult {
     pub x: Vec<C64>,
-    /// LAPACK `zgecon`'s 1-norm reciprocal condition estimate of `a` (1.0 for triangular and
-    /// diagonal solves, which SciPy does not estimate either).
+    /// Reciprocal 1-norm condition estimate of the selected matrix (exact for diagonal systems).
     pub rcond: f64,
     /// SciPy's `LinAlgWarning`: `rcond < eps`.
     pub warning: Option<LinalgWarning>,
@@ -243,15 +242,29 @@ fn zladiv(a: C64, b: C64) -> C64 {
     const LOW: f64 = f64::from_bits((1023 - 250) << 52);
     const HIGH: f64 = f64::from_bits((1023 + 250) << 52);
     let ordinary = |x: f64| x == 0.0 || (LOW..=HIGH).contains(&x.abs());
-    if !(ordinary(a.re) && ordinary(a.im) && ordinary(b.re) && ordinary(b.im))
+    // A purely real or imaginary divisor has a zero ratio: Smith's formula
+    // already divides each component safely and preserves IEEE signed zeros.
+    if b.re != 0.0
+        && b.im != 0.0
+        && a != CZERO
+        && !(ordinary(a.re) && ordinary(a.im) && ordinary(b.re) && ordinary(b.im))
         && is_finite(a)
         && is_finite(b)
-        && b != CZERO
     {
         let norm = scaled_sum_of_products(b.re, b.re, b.im, b.im);
         let real = scaled_sum_of_products(a.re, b.re, a.im, b.im);
         let imag = scaled_sum_of_products(a.im, b.re, -a.re, b.im);
-        return Complex::new(scaled_quotient(real, norm), scaled_quotient(imag, norm));
+        let divisor = if b.re.abs() >= b.im.abs() { b.re } else { b.im };
+        let component = |numerator: (f64, i32)| {
+            if numerator.0 == 0.0 {
+                // Exact cancellation gives +0 before Smith's final division by
+                // the signed dominant denominator. Its sign matters at branch cuts.
+                0.0_f64.copysign(divisor)
+            } else {
+                scaled_quotient(numerator, norm)
+            }
+        };
+        return Complex::new(component(real), component(imag));
     }
     if b.re.abs() >= b.im.abs() {
         let r = b.im / b.re;
@@ -287,9 +300,6 @@ fn scaled_sum_of_products(x: f64, y: f64, z: f64, w: f64) -> (f64, i32) {
 
 /// Apply the exponent difference only after forming the quotient of significands.
 fn scaled_quotient((a, ea): (f64, i32), (b, eb): (f64, i32)) -> f64 {
-    if a == 0.0 {
-        return a;
-    }
     let (fraction, adjustment) = super::jacobi_frexp(a / b);
     let exponent = ea - eb + adjustment;
     if exponent > 1024 {
@@ -909,7 +919,11 @@ fn solve_columns(
                     *x = zladiv(*x, am[(i, i)]);
                 }
             }
-            Ok(1.0)
+            Ok(if estimate_condition {
+                diagonal_rcond(&am)
+            } else {
+                1.0
+            })
         }
         Some(MatrixAssumption::UpperTriangular | MatrixAssumption::LowerTriangular) => {
             let upper = matches!(options.assume_a, Some(MatrixAssumption::UpperTriangular));
@@ -917,9 +931,13 @@ fn solve_columns(
                 return Err(LinalgError::SingularMatrix);
             }
             for col in rhs.chunks_exact_mut(n) {
-                triangular_solve_in_place(&am, col, upper);
+                triangular_solve_in_place(&am, col, upper, false);
             }
-            Ok(1.0)
+            Ok(if estimate_condition {
+                triangular_rcond(am, upper)
+            } else {
+                1.0
+            })
         }
         Some(MatrixAssumption::PositiveDefinite) => {
             let u = potrf_upper(&am)?;
@@ -954,26 +972,99 @@ fn solve_columns(
     }
 }
 
-/// In-place column-oriented triangular substitution.
-fn triangular_solve_in_place(t: &DMatrix<C64>, x: &mut [C64], upper: bool) {
+fn diagonal_rcond(a: &DMatrix<C64>) -> f64 {
+    let n = a.nrows();
+    let scale = (0..n)
+        .map(|i| a[(i, i)].re.abs().max(a[(i, i)].im.abs()))
+        .fold(0.0_f64, f64::max);
+    if scale == 0.0 || !scale.is_finite() {
+        return 0.0;
+    }
+    let mut smallest = f64::INFINITY;
+    let mut largest = 0.0_f64;
+    for i in 0..n {
+        let z = a[(i, i)];
+        let magnitude = (z.re / scale).hypot(z.im / scale);
+        if !magnitude.is_finite() {
+            return 0.0;
+        }
+        smallest = smallest.min(magnitude);
+        largest = largest.max(magnitude);
+    }
+    smallest / largest
+}
+
+/// Estimate ||T⁻¹||₁ using the same reverse-communication norm estimator as LU.
+/// Rescale by a common power of two so both the norm and inverse applications
+/// stay representable on uniformly large or small matrices.
+fn triangular_rcond(mut t: DMatrix<C64>, upper: bool) -> f64 {
     let n = t.nrows();
-    if upper {
+    let mut largest = 0.0_f64;
+    let mut smallest_diagonal = f64::INFINITY;
+    for j in 0..n {
+        for i in 0..n {
+            if (upper && i > j) || (!upper && i < j) {
+                t[(i, j)] = CZERO;
+                continue;
+            }
+            let z = t[(i, j)];
+            if !is_finite(z) {
+                return 0.0;
+            }
+            let size = z.re.abs().max(z.im.abs());
+            largest = largest.max(size);
+            if i == j {
+                smallest_diagonal = smallest_diagonal.min(size);
+            }
+        }
+    }
+    if smallest_diagonal == 0.0 {
+        return 0.0;
+    }
+    let exponent = (super::jacobi_frexp(largest).1
+        + super::jacobi_frexp(smallest_diagonal).1) / 2;
+    let scale = 2.0_f64.powi(exponent.clamp(-1022, 1023));
+    for z in t.iter_mut() {
+        z.re /= scale;
+        z.im /= scale;
+    }
+    let anorm = one_norm(&t);
+    if !anorm.is_finite() {
+        return 0.0;
+    }
+    let inverse_norm = zlacn2(n, |x, adjoint| {
+        triangular_solve_in_place(&t, x, upper, adjoint);
+    });
+    if inverse_norm > 0.0 && inverse_norm.is_finite() {
+        ((1.0 / anorm) / inverse_norm).min(1.0)
+    } else {
+        0.0
+    }
+}
+
+/// In-place column-oriented triangular substitution.
+fn triangular_solve_in_place(t: &DMatrix<C64>, x: &mut [C64], upper: bool, adjoint: bool) {
+    let n = t.nrows();
+    let at = |i: usize, j: usize| {
+        if adjoint { t[(j, i)].conj() } else { t[(i, j)] }
+    };
+    if upper != adjoint {
         for j in (0..n).rev() {
             if x[j] != CZERO {
-                x[j] = zladiv(x[j], t[(j, j)]);
+                x[j] = zladiv(x[j], at(j, j));
                 let xj = x[j];
                 for i in 0..j {
-                    x[i] -= xj * t[(i, j)];
+                    x[i] -= xj * at(i, j);
                 }
             }
         }
     } else {
         for j in 0..n {
             if x[j] != CZERO {
-                x[j] = zladiv(x[j], t[(j, j)]);
+                x[j] = zladiv(x[j], at(j, j));
                 let xj = x[j];
                 for i in j + 1..n {
-                    x[i] -= xj * t[(i, j)];
+                    x[i] -= xj * at(i, j);
                 }
             }
         }
@@ -2630,7 +2721,7 @@ fn logm_triu(t0: &DMatrix<C64>) -> Result<DMatrix<C64>, LinalgError> {
         let lhs = &ident + &r * Complex::new(beta, 0.0);
         for c in 0..n {
             let mut x: Vec<C64> = (0..n).map(|i| r[(i, c)] * alpha).collect();
-            triangular_solve_in_place(&lhs, &mut x, true);
+            triangular_solve_in_place(&lhs, &mut x, true, false);
             for i in 0..n {
                 u[(i, c)] += x[i];
             }
@@ -2997,6 +3088,65 @@ mod tests {
         let a = [vec![huge, CZERO], vec![CZERO, huge.conj()]];
         let x = solve(&a, &[huge, huge], options).unwrap().x;
         assert_eq!(x, [CONE, c(0.0, 1.0)]);
+    }
+
+    #[test]
+    fn complex_solve_preserves_signed_zero_at_extreme_scale() {
+        let scalar = |a, b| {
+            solve(&[vec![a]], &[b], SolveOptions::default())
+                .unwrap()
+                .x[0]
+        };
+        let x = scalar(c(2.0, 0.0), c(f64::MAX, -0.0));
+        assert_eq!(x.re, f64::MAX / 2.0);
+        assert_eq!(x.im.to_bits(), (-0.0_f64).to_bits());
+
+        let d = c(-f64::MAX, f64::MAX);
+        let x = scalar(d, d);
+        assert_eq!(x.re, 1.0);
+        assert_eq!(x.im.to_bits(), (-0.0_f64).to_bits());
+        let x = scalar(d, CZERO);
+        assert_eq!(x.re.to_bits(), (-0.0_f64).to_bits());
+    }
+
+    #[test]
+    fn structured_complex_condition_uses_only_the_active_coefficients() {
+        let small = 2.0_f64.powi(-60);
+        let shear = 2.0_f64.powi(30);
+        for scale in [2.0_f64.powi(-900), 1.0, 2.0_f64.powi(900)] {
+            let diag = c(scale, scale);
+            let tiny = diag * small;
+            let ignored = c(f64::MAX, -f64::MAX);
+            let a = [vec![diag, ignored], vec![ignored, tiny]];
+            let options = SolveOptions {
+                assume_a: Some(MatrixAssumption::Diagonal),
+                ..SolveOptions::default()
+            };
+            let r = solve(&a, &[diag, tiny], options).unwrap();
+            assert_eq!(r.x, [CONE, CONE]);
+            assert!((r.rcond / small - 1.0).abs() < 1e-14);
+            assert!(r.warning.is_some());
+
+            // T and its inverse both have column-sum norm 1 + shear before scaling.
+            for upper in [true, false] {
+                let mut t = [vec![c(scale, 0.0), ignored], vec![ignored, c(scale, 0.0)]];
+                let assumption = if upper {
+                    t[0][1] = c(0.0, shear * scale);
+                    MatrixAssumption::UpperTriangular
+                } else {
+                    t[1][0] = c(0.0, shear * scale);
+                    MatrixAssumption::LowerTriangular
+                };
+                let options = SolveOptions {
+                    assume_a: Some(assumption),
+                    ..SolveOptions::default()
+                };
+                let r = solve(&t, &[CZERO, CZERO], options).unwrap();
+                let expected = 1.0 / (1.0 + shear).powi(2);
+                assert!((r.rcond / expected - 1.0).abs() < 1e-14, "{}", r.rcond);
+                assert!(r.warning.is_some());
+            }
+        }
     }
 
     #[test]
