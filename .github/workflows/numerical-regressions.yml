@@ -78,6 +78,7 @@ jobs:
         run: |
           case "$LANE" in
             least-squares)
+              cargo test --locked -p fsci-opt --lib fsolve -- --nocapture
               cargo test --locked -p fsci-opt --lib lm_root -- --nocapture
               cargo test --locked -p fsci-conformance --no-default-features --test diff_opt_lm_root -- --nocapture
               cargo test --locked -p fsci-opt --lib curvefit::tests -- --nocapture

@@ -1701,7 +1701,7 @@ where
     validate_multivariate_root_params(x0, tol, maxiter)?;
     let n = x0.len();
 
-    let eps = 1e-8; // finite difference step
+    let eps = f64::EPSILON.sqrt();
 
     let mut x: Vec<f64> = x0.to_vec();
     let mut nfev = 0usize;
@@ -1723,8 +1723,8 @@ where
     // evaluation plus the O(n^2) update.
     let mut jac_valid = false;
 
-    for iteration in 0..maxiter {
-        let norm_fx: f64 = fx.iter().map(|v| v * v).sum::<f64>().sqrt();
+    for iteration in 0..=maxiter {
+        let norm_fx = euclidean_norm(&fx);
         if norm_fx < tol {
             return Ok(MultivariateRootResult {
                 x,
@@ -1737,12 +1737,22 @@ where
             });
         }
 
+        if iteration == maxiter {
+            break;
+        }
+
         // (Re)build the finite-difference Jacobian only when we lack a usable one.
         if !jac_valid {
             for j in 0..n {
-                let h = eps * (1.0 + x[j].abs());
                 let original = x[j];
-                x[j] += h;
+                let step = eps * original.abs().max(1.0);
+                let forward = original + step;
+                x[j] = if forward.is_finite() {
+                    forward
+                } else {
+                    original - step
+                };
+                let h = x[j] - original;
                 let fx_plus = evaluate_multivariate_root(&func, &x, n, "fsolve")?;
                 x[j] = original; // restore
                 nfev += 1;
@@ -1812,7 +1822,7 @@ where
                 .collect();
             let ftrial = evaluate_multivariate_root(&func, &trial, n, "fsolve")?;
             nfev += 1;
-            let trial_norm: f64 = ftrial.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let trial_norm = euclidean_norm(&ftrial);
             if trial_norm < norm_fx {
                 new_x = trial;
                 new_fx = ftrial;
@@ -1881,16 +1891,27 @@ where
 /// Returns None if the matrix is singular.
 fn solve_dense(a: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
     let n = a.len();
-    // Augmented matrix.
-    let mut aug: Vec<Vec<f64>> = a
-        .iter()
-        .zip(b.iter())
-        .map(|(row, &bi)| {
-            let mut r = row.clone();
-            r.push(bi);
-            r
-        })
-        .collect();
+    // Equilibrate each equation before comparing pivots. Changing the units
+    // of a row must not turn an otherwise well-conditioned solve singular.
+    let mut aug = Vec::with_capacity(n);
+    let mut pivot_scales = Vec::with_capacity(n);
+    for (row, &rhs) in a.iter().zip(b) {
+        let row_scale = row.iter().fold(0.0_f64, |s, x| s.max(x.abs()));
+        if row_scale == 0.0 || !row_scale.is_finite() || !rhs.is_finite() {
+            return None;
+        }
+        // When rhs/row_scale would overflow, normalizing by rhs instead
+        // can still leave usable coefficients (for example a two-term sum).
+        let scale = if (rhs / row_scale).is_finite() {
+            row_scale
+        } else {
+            rhs.abs()
+        };
+        let mut scaled: Vec<f64> = row.iter().map(|value| value / scale).collect();
+        pivot_scales.push(row_scale / scale);
+        scaled.push(rhs / scale);
+        aug.push(scaled);
+    }
 
     for col in 0..n {
         // Partial pivoting.
@@ -1898,9 +1919,11 @@ fn solve_dense(a: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
             .max_by(|&i, &j| aug[i][col].abs().total_cmp(&aug[j][col].abs()))
             .unwrap_or(col);
         aug.swap(col, max_row);
+        pivot_scales.swap(col, max_row);
 
-        if aug[col][col].abs() < 1e-15 {
-            return None; // Singular
+        let pivot_floor = (n as f64 * f64::EPSILON) * pivot_scales[col];
+        if aug[col][col].abs() <= pivot_floor || !aug[col][col].is_finite() {
+            return None;
         }
 
         let pivot = aug[col][col];
@@ -1926,6 +1949,9 @@ fn solve_dense(a: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
             sum -= aug[i][j] * x[j];
         }
         x[i] = sum / aug[i][i];
+        if !x[i].is_finite() {
+            return None;
+        }
     }
 
     Some(x)
@@ -2528,7 +2554,7 @@ where
 
 // Scaled L2 norm: finite tiny/large residuals must not become zero/infinity
 // merely because their squares underflow/overflow.
-fn nk_norm(v: &[f64]) -> f64 {
+fn euclidean_norm(v: &[f64]) -> f64 {
     v.iter().fold(0.0_f64, |norm, &value| norm.hypot(value))
 }
 
@@ -2573,7 +2599,7 @@ where
         });
     }
     let n = b.len();
-    let bnorm = nk_norm(b);
+    let bnorm = euclidean_norm(b);
     if !bnorm.is_finite() {
         return Err(OptError::NonFiniteInput {
             detail: String::from("newton_krylov: inner right-hand-side norm is not finite"),
@@ -2588,7 +2614,7 @@ where
     let mut iterations = 0usize;
 
     while iterations < max_iter {
-        let beta = nk_norm(&residual);
+        let beta = euclidean_norm(&residual);
         if beta / bnorm <= tol {
             break;
         }
@@ -2606,7 +2632,7 @@ where
         for k in 0..m {
             let mut w = matvec(&q[k])?;
             nk_check_vector(&w, n, "Jacobian-vector product")?;
-            let column_norm = nk_norm(&w);
+            let column_norm = euclidean_norm(&w);
             if !column_norm.is_finite() {
                 return Err(OptError::NonFiniteInput {
                     detail: String::from("newton_krylov: Arnoldi column norm is not finite"),
@@ -2623,7 +2649,7 @@ where
                     }
                 }
             }
-            h[k + 1][k] = nk_norm(&w);
+            h[k + 1][k] = euclidean_norm(&w);
             // Arnoldi breakdown depends on the operator column, not ||b||:
             // rescaling the residual must not change the retained subspace.
             let breakdown = h[k + 1][k] <= f64::EPSILON * column_norm;
@@ -2677,7 +2703,7 @@ where
         nk_check_vector(&ax, n, "restarted Jacobian-vector product")?;
         residual = b.iter().zip(ax).map(|(b, ax)| b - ax).collect();
         nk_check_vector(&residual, n, "inner residual")?;
-        if !nk_norm(&residual).is_finite() {
+        if !euclidean_norm(&residual).is_finite() {
             return Err(OptError::NonFiniteInput {
                 detail: String::from("newton_krylov: inner residual norm is not finite"),
             });
@@ -2818,7 +2844,7 @@ where
     let mut nfev = 1usize;
 
     for iteration in 0..max_iter {
-        let norm_fx = nk_norm(&fx);
+        let norm_fx = euclidean_norm(&fx);
         if norm_fx < f_tol {
             return Ok(MultivariateRootResult {
                 x,
@@ -2838,7 +2864,7 @@ where
 
         let eta = (0.1 * norm_fx).clamp(1e-10, 0.1);
         let rhs: Vec<f64> = fx.iter().map(|v| -v).collect();
-        let normx = nk_norm(&x);
+        let normx = euclidean_norm(&x);
         if !normx.is_finite() {
             return Err(OptError::NonFiniteInput {
                 detail: String::from("newton_krylov: parameter norm is not finite"),
@@ -2846,7 +2872,7 @@ where
         }
         let step = f64::EPSILON.sqrt() * (1.0 + normx);
         let mut matvec = |v: &[f64]| -> Result<Vec<f64>, OptError> {
-            let normv = nk_norm(v);
+            let normv = euclidean_norm(v);
             if normv == 0.0 {
                 return Ok(vec![0.0; n]);
             }
@@ -2879,7 +2905,7 @@ where
             let x_new: Vec<f64> = x.iter().zip(&dx).map(|(xi, di)| xi + lam * di).collect();
             let fx_new = evaluate(&x_new)?;
             nfev += 1;
-            let norm_new = nk_norm(&fx_new);
+            let norm_new = euclidean_norm(&fx_new);
             if !norm_new.is_finite() {
                 return Err(OptError::NonFiniteInput {
                     detail: String::from("newton_krylov: trial residual norm is not finite"),
@@ -2894,7 +2920,7 @@ where
         fx = fx_next;
     }
 
-    let converged = nk_norm(&fx) < f_tol;
+    let converged = euclidean_norm(&fx) < f_tol;
     Ok(MultivariateRootResult {
         x,
         fun: fx,
@@ -3410,7 +3436,7 @@ mod tests {
         };
         let result = super::nk_gmres(&mut matvec, &rhs, 1e-11, 3, 90).unwrap();
         let residual: Vec<f64> = apply(&result).iter().zip(&rhs).map(|(a, b)| a - b).collect();
-        assert!(super::nk_norm(&residual) / super::nk_norm(&rhs) <= 1e-11);
+        assert!(super::euclidean_norm(&residual) / super::euclidean_norm(&rhs) <= 1e-11);
         assert!(calls.get() > 4, "fixture must require at least one restart");
         assert!(calls.get() <= 120, "90 Arnoldi steps plus at most 30 residual checks");
         for (actual, expected) in result.iter().zip(expected) {
@@ -3429,7 +3455,7 @@ mod tests {
         let result = super::nk_gmres(&mut matvec, &rhs, 1e-12, 2, 1).unwrap();
         assert_eq!(calls.get(), 2, "one Arnoldi step and one true-residual check");
         let residual = [result[0] - 1.0, 10.0 * result[1] - 1.0, 100.0 * result[2] - 1.0];
-        assert!(super::nk_norm(&residual) > 0.1, "one step cannot solve this system");
+        assert!(super::euclidean_norm(&residual) > 0.1, "one step cannot solve this system");
     }
 
     #[test]
@@ -3460,7 +3486,7 @@ mod tests {
         let result = newton_krylov(residual, &vec![0.0; n], 1e-8, 20).unwrap();
         assert!(result.converged);
         assert_eq!(result.fun, residual(&result.x));
-        assert!(super::nk_norm(&result.fun) < 1e-8);
+        assert!(super::euclidean_norm(&result.fun) < 1e-8);
         assert!(
             result.function_calls < 250,
             "three-eigenvalue system should converge promptly"
@@ -3485,7 +3511,7 @@ mod tests {
         .unwrap();
         assert!(result.converged);
         assert_eq!(result.fun, residual(&result.x));
-        assert!(super::nk_norm(&result.fun) < 1e-10);
+        assert!(super::euclidean_norm(&result.fun) < 1e-10);
 
         let options = MultivariateRootOptions {
             method: MultivariateRootMethod::NewtonKrylov,
@@ -3498,10 +3524,10 @@ mod tests {
             &[vec![1.0], vec![-2.0]],
             options.clone(),
         );
-        assert!(single.converged && super::nk_norm(&single.fun) < options.tol);
+        assert!(single.converged && super::euclidean_norm(&single.fun) < options.tol);
         for (result, expected) in batch.into_iter().zip([1.0, -2.0]) {
             let result = result.unwrap();
-            assert!(result.converged && super::nk_norm(&result.fun) < options.tol);
+            assert!(result.converged && super::euclidean_norm(&result.fun) < options.tol);
             assert!((result.x[0] - expected).abs() < 1e-9);
         }
 
@@ -4416,6 +4442,40 @@ mod tests {
         assert!((result.x[0] - 1.0).abs() < 0.1, "x = {}", result.x[0]);
         assert!((result.x[1] - 2.0).abs() < 0.1, "y = {}", result.x[1]);
         assert!((result.x[2] - 3.0).abs() < 0.1, "z = {}", result.x[2]);
+    }
+
+    #[test]
+    fn fsolve_respects_residual_units_and_the_final_trial() {
+        for scale in [2.0_f64.powi(-650), 1.0, 2.0_f64.powi(650)] {
+            let result = root(
+                |x| vec![scale * (x[0] + x[1] - 3.0), scale * (x[0] - x[1] - 1.0)],
+                &[0.0, 0.0],
+                MultivariateRootOptions {
+                    tol: scale * 1e-10,
+                    max_iter: 1,
+                    ..MultivariateRootOptions::default()
+                },
+            )
+            .expect("full-rank two-equation system");
+            assert!(result.converged, "{result:?}");
+            assert_eq!(result.x, [2.0, 1.0]);
+            assert_eq!(result.fun, [0.0, 0.0]);
+            assert_eq!((result.iterations, result.function_calls), (1, 4));
+        }
+    }
+
+    #[test]
+    fn fsolve_equilibrates_independently_scaled_rows() {
+        let tiny = 2.0_f64.powi(-650);
+        let huge = 2.0_f64.powi(650);
+        let result = fsolve(
+            |x| vec![tiny * (x[0] + x[1] - 3.0), huge * (x[0] - x[1] - 1.0)],
+            &[0.0, 0.0],
+        )
+        .expect("independently scaled equations");
+        assert!(result.converged, "{result:?}");
+        assert_eq!(result.x, [2.0, 1.0]);
+        assert_eq!(result.fun, [0.0, 0.0]);
     }
 
     #[test]
