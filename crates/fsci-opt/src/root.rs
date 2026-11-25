@@ -728,7 +728,7 @@ fn toms748_inverse_poly_zero(points: [f64; 4], values: [f64; 4]) -> f64 {
 ///
 /// Used only for the "the two endpoint f-values differ by more than `2^50`"
 /// test in the double-length secant step.
-fn toms748_frexp_exponent(x: f64) -> i32 {
+fn frexp_exponent(x: f64) -> i32 {
     if x == 0.0 || !x.is_finite() {
         return 0;
     }
@@ -963,8 +963,8 @@ where
             // root is essentially at `u`. Nudge deliberately rather than
             // stalling into pure bisection for the rest of the solve.
             let exponents = [
-                toms748_frexp_exponent(fab[0]),
-                toms748_frexp_exponent(fab[1]),
+                frexp_exponent(fab[0]),
+                frexp_exponent(fab[1]),
             ];
             c = if exponents[uix] < exponents[1 - uix] - 50 {
                 (31.0 * ab[uix] + ab[1 - uix]) / 32.0
@@ -1909,21 +1909,21 @@ fn solve_dense(a: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
     // Equilibrate each equation before comparing pivots. Changing the units
     // of a row must not turn an otherwise well-conditioned solve singular.
     let mut aug = Vec::with_capacity(n);
-    let mut pivot_scales = Vec::with_capacity(n);
     for (row, &rhs) in a.iter().zip(b) {
         let row_scale = row.iter().fold(0.0_f64, |s, x| s.max(x.abs()));
-        if row_scale == 0.0 || !row_scale.is_finite() || !rhs.is_finite() {
+        if row_scale == 0.0 || !rhs.is_finite() || row.iter().any(|value| !value.is_finite()) {
             return None;
         }
         // When rhs/row_scale would overflow, normalizing by rhs instead
         // can still leave usable coefficients (for example a two-term sum).
-        let scale = if (rhs / row_scale).is_finite() {
-            row_scale
-        } else {
-            rhs.abs()
-        };
+        // Powers of two preserve the represented coefficients, including
+        // small differences between nearly dependent rows.
+        let power_of_two = |value: f64| 2.0_f64.powi((frexp_exponent(value) - 1).max(-1022));
+        let mut scale = power_of_two(row_scale);
+        if !(rhs / scale).is_finite() {
+            scale = power_of_two(rhs);
+        }
         let mut scaled: Vec<f64> = row.iter().map(|value| value / scale).collect();
-        pivot_scales.push(row_scale / scale);
         scaled.push(rhs / scale);
         aug.push(scaled);
     }
@@ -1934,10 +1934,10 @@ fn solve_dense(a: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
             .max_by(|&i, &j| aug[i][col].abs().total_cmp(&aug[j][col].abs()))
             .unwrap_or(col);
         aug.swap(col, max_row);
-        pivot_scales.swap(col, max_row);
 
-        let pivot_floor = (n as f64 * f64::EPSILON) * pivot_scales[col];
-        if aug[col][col].abs() <= pivot_floor || !aug[col][col].is_finite() {
+        // Even a near-roundoff pivot can resolve an exact Newton step.
+        // The caller checks the candidate against the actual residual.
+        if aug[col][col] == 0.0 || !aug[col][col].is_finite() {
             return None;
         }
 
@@ -4512,6 +4512,23 @@ mod tests {
         .expect("line search retains a finite iterate");
         assert!(!result.converged, "{result:?}");
         assert!(result.x[0].is_finite() && result.fun[0] > 0.5);
+    }
+
+    #[test]
+    fn fsolve_retains_a_resolvable_near_singular_jacobian() {
+        let m = 2.0_f64.powi(50);
+        let result = root(
+            |x| vec![m * x[0] + m * x[1], m * x[0] + (m + 0.25) * x[1] + 0.25],
+            &[0.0, 0.0],
+            MultivariateRootOptions {
+                max_iter: 1,
+                ..MultivariateRootOptions::default()
+            },
+        )
+        .expect("small nonzero pivot resolves the root");
+        assert!(result.converged, "{result:?}");
+        assert_eq!(result.x, [1.0, -1.0]);
+        assert_eq!(result.fun, [0.0, 0.0]);
     }
 
     #[test]
