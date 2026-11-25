@@ -148,6 +148,50 @@ impl Loss {
         }
     }
 
+    /// The norm whose square is twice the cost, without squaring physical
+    /// residual or loss-scale units. Covariance needs this quantity even when
+    /// the stored cost underflows. This only evaluates built-in losses, so it
+    /// never calls a user loss callback after the solver has stopped.
+    pub(super) fn residual_norm(&self, f: &[f64]) -> f64 {
+        f.iter().fold(0.0_f64, |norm, &value| {
+            let magnitude = value.abs();
+            let scale = self.f_scale;
+            let root_loss = if self.kind == LossKind::Linear {
+                magnitude
+            } else if magnitude <= scale {
+                let z = (magnitude / scale).powi(2);
+                let factor = match self.kind {
+                    LossKind::Linear | LossKind::Huber => 1.0,
+                    LossKind::SoftL1 => 2.0 / (1.0 + (1.0 + z).sqrt()),
+                    LossKind::Cauchy if z != 0.0 => z.ln_1p() / z,
+                    LossKind::Arctan if z != 0.0 => z.atan() / z,
+                    LossKind::Cauchy | LossKind::Arctan => 1.0,
+                };
+                magnitude * factor.sqrt()
+            } else {
+                let ratio = scale / magnitude;
+                let z = ratio * ratio;
+                match self.kind {
+                    LossKind::Linear => magnitude,
+                    LossKind::Huber => scale.sqrt() * magnitude.sqrt() * (2.0 - ratio).sqrt(),
+                    LossKind::SoftL1 => {
+                        scale.sqrt() * magnitude.sqrt() * (2.0 * ((1.0 + z).sqrt() - ratio)).sqrt()
+                    }
+                    LossKind::Cauchy => {
+                        let log_ratio = if ratio.is_normal() {
+                            -ratio.ln()
+                        } else {
+                            magnitude.ln() - scale.ln()
+                        };
+                        scale * (2.0 * log_ratio + z.ln_1p()).sqrt()
+                    }
+                    LossKind::Arctan => scale * (std::f64::consts::FRAC_PI_2 - z.atan()).sqrt(),
+                }
+            };
+            norm.hypot(root_loss)
+        })
+    }
+
     /// Effective residual and Jacobian row factor. Computing the loss score
     /// directly avoids losing rho' to underflow before multiplication by f;
     /// dimensionless curvature avoids rho'' / f_scale² and its 0*infinity cases.
@@ -348,12 +392,15 @@ fn norm(a: &[f64]) -> f64 {
 }
 
 /// Half the sum of residual squares. Preserve the ordinary sum order, but do
-/// not reject a finite objective merely because the unhalved sum overflows.
-fn linear_cost(residuals: &[f64]) -> f64 {
+/// not lose a representable objective to an intermediate overflow or underflow.
+pub(super) fn linear_cost(residuals: &[f64]) -> f64 {
     let ordinary = 0.5 * dot(residuals, residuals);
-    if ordinary.is_finite() {
+    if ordinary.is_normal() || residuals.iter().all(|value| *value == 0.0) {
         ordinary
     } else {
+        // Individual squares can round to zero even when their half-sum is
+        // representable. The norm retains those contributions before the final
+        // multiplication rounds the objective to its result precision.
         let norm = residuals
             .iter()
             .fold(0.0_f64, |norm, &value| norm.hypot(value));
@@ -1769,6 +1816,94 @@ mod tests {
                     assert!(result.cost.is_finite() && result.cost < 1e-40);
                     assert!(result.optimality < 1e-14);
                     assert!(result.jac.all_finite());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn built_in_loss_residual_norm_retains_extreme_units() {
+        for kind in [
+            LossKind::Linear,
+            LossKind::Huber,
+            LossKind::SoftL1,
+            LossKind::Cauchy,
+            LossKind::Arctan,
+        ] {
+            // Closed-form losses at residuals 0.5 and -2 with unit f_scale.
+            let expected = match kind {
+                LossKind::Linear => 4.25_f64.sqrt(),
+                LossKind::Huber => 3.25_f64.sqrt(),
+                LossKind::SoftL1 => (2.0 * (1.25_f64.sqrt() + 5.0_f64.sqrt() - 2.0)).sqrt(),
+                LossKind::Cauchy => 6.25_f64.ln().sqrt(),
+                LossKind::Arctan => std::f64::consts::FRAC_PI_2.sqrt(),
+            };
+            for magnitude in [1.0, 1e-200, 1e200] {
+                let loss = Loss {
+                    kind,
+                    f_scale: magnitude,
+                };
+                let norm = loss.residual_norm(&[0.5 * magnitude, -2.0 * magnitude]);
+                assert!(norm.is_finite() && norm > 0.0);
+                assert!(
+                    (norm / magnitude / expected - 1.0).abs() < 1e-14,
+                    "{kind:?}, magnitude={magnitude}, norm={norm}"
+                );
+            }
+            // The residual/f_scale ratio itself overflows here, while the
+            // transformed norm stays representable for every built-in loss.
+            let loss = Loss {
+                kind,
+                f_scale: 1e-200,
+            };
+            let expected = match kind {
+                LossKind::Linear => 1e200,
+                LossKind::Huber | LossKind::SoftL1 => 2.0_f64.sqrt(),
+                LossKind::Cauchy => 1e-200 * (800.0 * 10.0_f64.ln()).sqrt(),
+                LossKind::Arctan => 1e-200 * std::f64::consts::FRAC_PI_2.sqrt(),
+            };
+            assert!((loss.residual_norm(&[1e200]) / expected - 1.0).abs() < 1e-14);
+        }
+    }
+
+    #[test]
+    fn least_squares_cost_keeps_representable_large_and_subnormal_values() {
+        // These are stationary residual systems with known nonzero objectives.
+        // Their unhalved squares overflow, or each square underflows to zero.
+        let cases = [
+            (vec![1.5e154], 1.125e308),
+            (vec![1e154, -1e154], 1e308),
+            (vec![1e-162; 10], f64::from_bits(1)),
+        ];
+        for method in [
+            LeastSquaresMethod::Lm,
+            LeastSquaresMethod::Trf,
+            LeastSquaresMethod::Dogbox,
+        ] {
+            for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+                for (values, expected) in &cases {
+                    let rows = values.len();
+                    let result = least_squares(
+                        |_| values.clone(),
+                        &[0.0],
+                        LeastSquaresOptions {
+                            method: Some(method),
+                            mode,
+                            jac: Some(LeastSquaresJacobian::new(move |_| vec![vec![0.0]; rows])),
+                            ..LeastSquaresOptions::default()
+                        },
+                    )
+                    .expect("a representable objective must retain its finite scale");
+                    assert!(result.success, "{method:?}/{mode:?}: {result:?}");
+                    assert!(result.cost.is_finite(), "{method:?}: {result:?}");
+                    if expected.is_subnormal() {
+                        assert_eq!(result.cost.to_bits(), expected.to_bits());
+                    } else {
+                        assert!(
+                            (result.cost / expected - 1.0).abs() < 2e-15,
+                            "{method:?}/{mode:?}: {result:?}"
+                        );
+                    }
                 }
             }
         }

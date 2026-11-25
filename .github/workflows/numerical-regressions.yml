@@ -82,6 +82,7 @@ jobs:
               cargo test --locked -p fsci-opt --lib lm_root -- --nocapture
               cargo test --locked -p fsci-conformance --no-default-features --test diff_opt_lm_root -- --nocapture
               cargo test --locked -p fsci-opt --lib curvefit::tests -- --nocapture
+              cargo test --locked -p fsci-opt --lib trf::tests -- --nocapture
               cargo test --locked -p fsci-opt --test weighted_curve_fit -- --nocapture
               cargo test --locked -p fsci-conformance --no-default-features --test diff_opt_curve_fit -- --nocapture
               cargo test --locked -p fsci-opt --lib trf_lsmr::tests -- --nocapture
@@ -134,6 +135,7 @@ jobs:
               cargo test --locked -p fsci-linalg --test differential_linalg default_fast_solve_matches_live_scipy -- --nocapture
               ;;
             distribution-fit)
+              cargo test --locked -p fsci-stats --lib normal_fit_tests -- --nocapture
               cargo test --locked -p fsci-stats --test mode_scipy -- --nocapture
               cargo test --locked -p fsci-stats --lib student_t -- --nocapture
               cargo test --locked -p fsci-stats --lib fit_only_stats_distributions_expose_typed_try_fit -- --nocapture

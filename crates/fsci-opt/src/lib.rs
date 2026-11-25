@@ -3077,7 +3077,7 @@ where
                 maxfev: Some(options.local_max_evaluations),
                 ..MinimizeOptions::default()
             };
-            let mut local = minimize(&local_objective, start, local_options);
+            let mut local = minimize(local_objective, start, local_options);
             local_minimizations += 1;
             if let Ok(first) = &local
                 && first.success
@@ -3109,7 +3109,7 @@ where
                 nljev += first.njev;
                 nlhev += first.nhev;
                 local = minimize(
-                    &local_objective,
+                    local_objective,
                     &first.x,
                     MinimizeOptions {
                         bounds: Some(&global_bounds),

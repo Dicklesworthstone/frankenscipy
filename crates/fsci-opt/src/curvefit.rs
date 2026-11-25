@@ -1215,7 +1215,7 @@ pub(super) fn lm_iterations(
         };
     }
 
-    let mut cost = 0.5 * dot_vec(&r, &r);
+    let mut cost = trf::linear_cost(&r);
     let mut residual_norm = r.iter().fold(0.0_f64, |norm, &value| norm.hypot(value));
     if !residual_norm.is_finite() {
         return Err(OptError::NonFiniteInput {
@@ -1294,7 +1294,7 @@ pub(super) fn lm_iterations(
                 detail: format!("residuals changed length from {m} to {}", r_new.len()),
             });
         }
-        let cost_new = 0.5 * dot_vec(&r_new, &r_new);
+        let cost_new = trf::linear_cost(&r_new);
 
         // Compare relative reductions in units of the current residual norm.
         // Squaring tiny residuals first would underflow both costs to zero and
@@ -1394,17 +1394,7 @@ pub(super) fn lm_iterations(
             } else {
                 (0, format!("max function evaluations exceeded ({max_nfev})"))
             };
-            return Ok(lm_result(
-                x,
-                r,
-                cost,
-                status,
-                message,
-                nfev,
-                njev,
-                nit,
-                jac,
-            ));
+            return Ok(lm_result(x, r, cost, status, message, nfev, njev, nit, jac));
         }
     }
 
@@ -2125,6 +2115,10 @@ where
     };
 
     // SciPy's curve_fit(method=None) runs 'lm' when there are no bounds.
+    let covariance_loss = options.ls_options.custom_loss.is_none().then_some(Loss {
+        kind: options.ls_options.loss,
+        f_scale: options.ls_options.f_scale,
+    });
     let mut ls_options = LeastSquaresOptions {
         method: Some(method),
         ..options.ls_options
@@ -2230,7 +2224,12 @@ where
     };
     require_fit_converged(&ls_result)?;
 
-    let pcov = curve_fit_covariance(&ls_result, method, options.absolute_sigma)?;
+    let pcov = curve_fit_covariance(
+        &ls_result,
+        method,
+        options.absolute_sigma,
+        covariance_loss.as_ref(),
+    )?;
     warn_if_covariance_not_estimated(&pcov);
 
     Ok(CurveFitResult {
@@ -3069,6 +3068,7 @@ fn curve_fit_covariance(
     result: &LeastSquaresResult,
     method: LeastSquaresMethod,
     absolute_sigma: bool,
+    loss: Option<&Loss>,
 ) -> Result<Vec<Vec<f64>>, OptError> {
     let m = result.fun.len();
     let n = result.x.len();
@@ -3093,14 +3093,25 @@ fn curve_fit_covariance(
     if method == LeastSquaresMethod::Lm {
         return Ok(compute_covariance(jac, &result.fun, n, absolute_sigma));
     }
-    // Normalize before the Jacobi SVD: its column inner products otherwise overflow
-    // or underflow for large/small model derivatives, even when the covariance is finite.
     let scale = jac
         .iter()
         .flatten()
         .fold(0.0_f64, |maximum, value| maximum.max(value.abs()));
     let mut covariance = vec![vec![0.0; n]; n];
     if scale != 0.0 {
+        // Apply the residual standard deviation before forming inverse-Jacobian
+        // outer products. Squaring the inverse first can overflow while the
+        // residual variance underflows, even when their product is finite.
+        // Built-in losses retain the transformed residual norm even if their
+        // cost underflows. Custom losses use the stored cost without another
+        // callback evaluation, which could have side effects or fail.
+        let residual_scale = if absolute_sigma {
+            1.0
+        } else if let Some(loss) = loss {
+            loss.residual_norm(&result.fun) / ((m - n) as f64).sqrt()
+        } else {
+            result.cost.sqrt() * (2.0 / (m - n) as f64).sqrt()
+        };
         let normalized: Vec<Vec<f64>> = jac
             .iter()
             .map(|row| row.iter().map(|value| value / scale).collect())
@@ -3109,27 +3120,23 @@ fn curve_fit_covariance(
         let threshold = f64::EPSILON * m.max(n) as f64 * singular_values[0];
         for (&singular, vector) in singular_values.iter().zip(&right_vectors) {
             if singular > threshold {
+                // Keep small residual and Jacobian units together. If their
+                // quotient overflows, divide by the normalized singular value
+                // first; its cutoff bounds the reciprocal for retained columns.
+                let mut factor = (residual_scale / scale) / singular;
+                if !factor.is_finite() {
+                    factor = (residual_scale / singular) / scale;
+                }
                 for (i, row) in covariance.iter_mut().enumerate() {
                     for (j, entry) in row.iter_mut().enumerate() {
-                        *entry += (vector[i] / singular) * (vector[j] / singular);
+                        *entry += (vector[i] * factor) * (vector[j] * factor);
                     }
                 }
             }
         }
-        // Divide twice instead of forming scale², which can overflow for a finite J.
-        for entry in covariance.iter_mut().flatten() {
-            *entry /= scale;
-            *entry /= scale;
-        }
     }
     if covariance.iter().flatten().any(|value| value.is_nan()) {
         return Ok(vec![vec![f64::INFINITY; n]; n]);
-    }
-    if !absolute_sigma {
-        let residual_variance = 2.0 * result.cost / (m - n) as f64;
-        for entry in covariance.iter_mut().flatten() {
-            *entry *= residual_variance;
-        }
     }
     Ok(covariance)
 }
@@ -4590,6 +4597,29 @@ mod tests {
     }
 
     #[test]
+    fn least_squares_lm_retains_finite_cost_after_an_accepted_large_residual_step() {
+        // The optimum is x=1 with cost 1e308. The sum of squared residuals
+        // overflows both before and after this nontrivial accepted step.
+        let result = least_squares(
+            |x| vec![1e154 * (x[0] - 1.0), 1e154, -1e154],
+            &[0.0],
+            LeastSquaresOptions {
+                method: Some(LeastSquaresMethod::Lm),
+                jac: Some(LeastSquaresJacobian::new(|_| {
+                    vec![vec![1e154], vec![0.0], vec![0.0]]
+                })),
+                ..LeastSquaresOptions::default()
+            },
+        )
+        .expect("the norm-based LM acceptance test can resolve this finite optimum");
+        assert!(result.success, "{result:?}");
+        assert!(result.nfev > 1);
+        assert!((result.x[0] - 1.0).abs() < 1e-14, "{result:?}");
+        assert!(result.cost.is_finite());
+        assert!((result.cost / 1e308 - 1.0).abs() < 2e-15);
+    }
+
+    #[test]
     fn least_squares_lm_rejects_nonfinite_trials_and_recovers() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let invalid_trials = AtomicUsize::new(0);
@@ -4954,6 +4984,85 @@ mod tests {
         assert!((fit.pcov[1][1] / 1.0e300 - 1.0).abs() < 1e-12);
         assert_eq!(fit.pcov[0][1], 0.0);
         assert_eq!(fit.pcov[1][0], 0.0);
+    }
+
+    #[test]
+    fn curve_fit_relative_covariance_preserves_small_and_large_measurement_units() {
+        for method in [
+            LeastSquaresMethod::Lm,
+            LeastSquaresMethod::Trf,
+            LeastSquaresMethod::Dogbox,
+        ] {
+            for magnitude in [1.0, 1e-200, 1e154] {
+                // The fitted mean is zero. RSS and JᵀJ are both
+                // 2*magnitude², so one residual degree of freedom gives
+                // covariance=1 regardless of the measurement units.
+                let fit = curve_fit(
+                    |_, p| magnitude * p[0],
+                    &[0.0, 1.0],
+                    &[-magnitude, magnitude],
+                    CurveFitOptions {
+                        p0: Some(vec![0.0]),
+                        ls_options: LeastSquaresOptions {
+                            method: Some(method),
+                            jac: Some(LeastSquaresJacobian::new(move |_| {
+                                vec![vec![magnitude], vec![magnitude]]
+                            })),
+                            ..LeastSquaresOptions::default()
+                        },
+                        ..CurveFitOptions::default()
+                    },
+                )
+                .expect("relative covariance is finite in the original parameter units");
+                assert_eq!(fit.popt, [0.0]);
+                assert!(
+                    (fit.pcov[0][0] - 1.0).abs() < 1e-12,
+                    "{method:?}, magnitude={magnitude}: {fit:?}"
+                );
+                assert!(fit.ls_result.cost.is_finite());
+                if magnitude >= 1.0 {
+                    assert!((fit.ls_result.cost / magnitude / magnitude - 1.0).abs() < 2e-15);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn curve_fit_robust_covariance_scales_the_chosen_objective_before_squaring() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            for magnitude in [1.0, 1e-200, 1.3e154] {
+                // Symmetric soft_l1 residuals at z=1 have modified JᵀJ
+                // magnitude²/sqrt(2), and cost 2*magnitude²*(sqrt(2)-1).
+                // Relative covariance is therefore 8-4*sqrt(2), not the
+                // linear-loss variance. At the large scale 2*cost overflows;
+                // at the small scale cost underflows while covariance stays finite.
+                let fit = curve_fit(
+                    |_, p| magnitude * p[0],
+                    &[0.0, 1.0],
+                    &[-magnitude, magnitude],
+                    CurveFitOptions {
+                        p0: Some(vec![0.0]),
+                        ls_options: LeastSquaresOptions {
+                            method: Some(method),
+                            loss: LossKind::SoftL1,
+                            f_scale: magnitude,
+                            jac: Some(LeastSquaresJacobian::new(move |_| {
+                                vec![vec![magnitude], vec![magnitude]]
+                            })),
+                            ..LeastSquaresOptions::default()
+                        },
+                        ..CurveFitOptions::default()
+                    },
+                )
+                .expect("the robust parameter covariance is finite");
+                assert_eq!(fit.popt, [0.0]);
+                assert!(fit.ls_result.cost.is_finite());
+                assert!(
+                    (fit.pcov[0][0] - (8.0 - 4.0 * 2.0_f64.sqrt())).abs() < 1e-12,
+                    "{method:?}, magnitude={magnitude}: {fit:?}"
+                );
+            }
+        }
     }
 
     #[test]
