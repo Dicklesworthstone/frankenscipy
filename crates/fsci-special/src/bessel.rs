@@ -231,6 +231,12 @@ pub fn j1(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     map_real_input("j1", z, mode, 1 << 18, |x| Ok(j1_core(x)))
 }
 
+/// Scalar convenience function for the Bessel function J_1(x).
+#[must_use]
+pub fn j1_scalar(x: f64) -> f64 {
+    j1_core(x)
+}
+
 pub fn jn(n: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     map_real_binary("jn", n, z, mode, |order, x| jn_scalar(order, x, mode))
 }

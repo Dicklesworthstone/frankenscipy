@@ -160,6 +160,8 @@ jobs:
               cargo test --locked -p fsci-conformance --no-default-features --test diff_linalg_matrix_functions -- --nocapture
               ;;
             image-rotation)
+              cargo test --locked -p fsci-ndimage --lib fourier_ -- --nocapture
+              cargo test --locked -p fsci-ndimage --bin diff_fourier -- --nocapture
               cargo test --locked -p fsci-special --lib degree_trig_preserves_scipy_cosine_rounding -- --nocapture
               cargo test --locked -p fsci-ndimage --lib rotate_ -- --nocapture
               cargo test --locked -p fsci-ndimage --test rotate_axes_scipy -- --nocapture

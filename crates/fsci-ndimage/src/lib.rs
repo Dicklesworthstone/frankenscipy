@@ -13922,7 +13922,9 @@ pub fn fourier_ellipsoid(input: &[Complex64], shape: &[usize], size: &[f64]) -> 
             (PI * r).sin() / (PI * r)
         } else if ndim == 2 {
             let pr = PI * r;
-            2.0 * pr.sin() / pr - 2.0 * (1.0 - pr.cos()) / (pr * pr)
+            // A 2-D ellipsoid is a disk after rescaling the axes. Its
+            // normalized Fourier transform is 2*J1(pi*r)/(pi*r).
+            2.0 * fsci_special::j1_scalar(pr) / pr
         } else {
             let pr = PI * r;
             (pr.sin() - pr * pr.cos()) * 3.0 / (pr * pr * pr)
@@ -23695,6 +23697,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn fourier_ellipsoid_2d_matches_scipy_disk_kernel() {
+        let input = vec![(1.0, -2.0); 64];
+        let output = fourier_ellipsoid(&input, &[8, 8], &[2.0, 2.0]);
+        // SciPy 1.17.1 / NumPy 2.4.3, fourier_ellipsoid(ones((8, 8)), (2, 2)).
+        // Include DC, the Nyquist axes, diagonal frequencies, and both signs
+        // of the disk transform. The former trigonometric 2-D formula gives
+        // -0.4052847 at index 4 instead of +0.1811918.
+        for (index, expected) in [
+            (0, 1.0),
+            (1, 0.924_850_235_900_226_5),
+            (2, 0.721_702_844_903_438_3),
+            (3, 0.449_233_151_694_562_2),
+            (4, 0.181_191_754_987_415_24),
+            (9, 0.853_513_968_361_937_5),
+            (19, 0.281_839_010_712_230_9),
+            (36, -0.096_889_689_415_707_91),
+            (63, 0.853_513_968_361_937_5),
+        ] {
+            assert!((output[index].0 - expected).abs() < 2.0e-14);
+            assert!((output[index].1 + 2.0 * expected).abs() < 4.0e-14);
+        }
+        assert_eq!(output[0], input[0]);
     }
 
     #[test]
