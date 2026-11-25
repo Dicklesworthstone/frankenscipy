@@ -3,7 +3,8 @@
 //!
 //! Resolves [frankenscipy-k78ra]. Multivariate root systems may have
 //! multiple solutions; use the property ||F(x)||_∞ < 1e-5 on both
-//! fsci and scipy solutions instead of comparing x directly.
+//! fsci and scipy solutions. For inconsistent linear systems with a unique
+//! minimum, compare the fitted parameters and check stationarity.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -96,6 +97,7 @@ fn func(name: &str, x: &[f64]) -> Vec<f64> {
         ],
         // F(x) = [x[0] - 1, x[1] - 2]; trivial
         "linear_2d" => vec![x[0] - 1.0, x[1] - 2.0],
+        "inconsistent_line" => vec![x[0] - 1.0, x[1] - 2.0, x[0] + x[1] - 4.0],
         _ => vec![],
     }
 }
@@ -106,6 +108,8 @@ fn generate_query() -> OracleQuery {
         ("two_var_quad", vec![2.5, 0.5]),
         ("cubic_3d", vec![1.8, 1.8, 1.8]),
         ("linear_2d", vec![0.0, 0.0]),
+        ("inconsistent_line", vec![0.0, 0.0]),
+        ("inconsistent_line", vec![100.0, -70.0]),
     ];
     let points = probes
         .iter()
@@ -131,6 +135,7 @@ def f(name, x):
     if name == "two_var_quad": return np.array([x[0]**2 + x[1] - 4.0, x[0] + x[1]**2 - 4.0])
     if name == "cubic_3d":     return np.array([x[0]+x[1]+x[2]-6.0, x[0]-x[1], x[0]*x[1]*x[2]-8.0])
     if name == "linear_2d":    return np.array([x[0]-1.0, x[1]-2.0])
+    if name == "inconsistent_line": return np.array([x[0]-1.0, x[1]-2.0, x[0]+x[1]-4.0])
     return np.zeros(len(x))
 
 q = json.load(sys.stdin)
@@ -235,7 +240,17 @@ fn diff_opt_lm_root() {
         let scipy_f = func(&case.func, scipy_x);
         let fsci_residual = fsci_f.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
         let scipy_residual = scipy_f.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-        let abs_d = fsci_residual.max(scipy_residual);
+        let abs_d = if case.func == "inconsistent_line" {
+            // J^T r = [r0 + r2, r1 + r2]. The unique minimum has
+            // x = (4/3, 7/3) and a nonzero residual.
+            (fsci_x[0] - scipy_x[0])
+                .abs()
+                .max((fsci_x[1] - scipy_x[1]).abs())
+                .max((fsci_f[0] + fsci_f[2]).abs())
+                .max((fsci_f[1] + fsci_f[2]).abs())
+        } else {
+            fsci_residual.max(scipy_residual)
+        };
         max_overall = max_overall.max(abs_d);
         // The residual max folds swallow a NaN component, so one fails the case explicitly.
         let no_nan = !fsci_f.iter().chain(&scipy_f).any(|v| v.is_nan());

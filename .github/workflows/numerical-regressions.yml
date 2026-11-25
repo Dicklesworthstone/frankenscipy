@@ -24,6 +24,7 @@ on:
       - "crates/fsci-conformance/tests/diff_integrate_monte_carlo_qmc_quad.rs"
       - "crates/fsci-conformance/tests/diff_linalg_matrix_functions.rs"
       - "crates/fsci-conformance/tests/diff_opt_curve_fit.rs"
+      - "crates/fsci-conformance/tests/diff_opt_lm_root.rs"
       - ".github/workflows/numerical-regressions.yml"
   workflow_dispatch:
 
@@ -77,6 +78,8 @@ jobs:
         run: |
           case "$LANE" in
             least-squares)
+              cargo test --locked -p fsci-opt --lib lm_root -- --nocapture
+              cargo test --locked -p fsci-conformance --no-default-features --test diff_opt_lm_root -- --nocapture
               cargo test --locked -p fsci-opt --lib curvefit::tests -- --nocapture
               cargo test --locked -p fsci-opt --test weighted_curve_fit -- --nocapture
               cargo test --locked -p fsci-conformance --no-default-features --test diff_opt_curve_fit -- --nocapture
@@ -93,6 +96,7 @@ jobs:
               cargo test --locked -p fsci-opt --test shgo_scipy -- --nocapture
               ;;
             sparse-lsmr)
+              cargo test --locked -p fsci-sparse --no-default-features --lib gmres_ -- --nocapture
               cargo test --locked -p fsci-sparse --no-default-features --lib cg_ -- --nocapture
               cargo test --locked -p fsci-sparse --no-default-features --test cg_preconditioned_scipy -- --nocapture
               cargo test --locked -p fsci-sparse --no-default-features --lib lsmr -- --nocapture
@@ -146,6 +150,7 @@ jobs:
               cargo test --locked -p fsci-stats --test mle_scipy -- --nocapture
               ;;
             matrix-functions)
+              cargo test --locked -p fsci-linalg --lib complex::tests -- --nocapture
               cargo test --locked -p fsci-linalg --lib matrix_functions_ -- --nocapture
               cargo test --locked -p fsci-linalg --lib logm -- --nocapture
               cargo test --locked -p fsci-linalg --lib sqrtm -- --nocapture
