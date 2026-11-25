@@ -4376,7 +4376,7 @@ where
         let left = nsum_right(|x| f(-x), step, step, 0.5 * atol, rtol);
         let sum = right.sum + left.sum;
         let error = if sum.is_finite() {
-            right.error + left.error
+            right.error + left.error + sum_residual(right.sum, left.sum, sum).abs()
         } else {
             f64::INFINITY
         };
@@ -4532,7 +4532,17 @@ where
         let d3 = (fp2 - 2.0 * fp + 2.0 * fm - fm2) / (2.0 * delta.powi(3)); // f'''(n_m)
 
         let integral_atol = (atol * s).min(f64::MAX);
-        let integ = tanhsinh(&f, n_m, f64::INFINITY, integral_atol, rtol, 16);
+        // The lattice term f(n_m) has already been sampled and is finite.
+        // Integrating in the offset u keeps the exp-sinh weight for tiny u
+        // even when n_m + u rounds back to n_m. Otherwise a harmless large
+        // translation can force every refinement level at the lower bound.
+        let integ = if n_m <= 0.5 * f64::MAX {
+            tanhsinh(|u| f(n_m + u), 0.0, f64::INFINITY, integral_atol, rtol, 16)
+        } else {
+            // Keep the native transform's overflow check for an upper-range
+            // origin where adding a positive offset could produce infinity.
+            tanhsinh(&f, n_m, f64::INFINITY, integral_atol, rtol, 16)
+        };
         nfev += integ.neval;
         if !integ.integral.is_finite() {
             return NsumResult {
@@ -8909,6 +8919,10 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(result.nfev, calls.get());
+        assert!(
+            result.nfev < 5000,
+            "shifted endpoint exhausted refinement: {result:?}"
+        );
     }
 
     #[test]
@@ -8936,6 +8950,48 @@ mod tests {
         );
         assert!(result.error <= 1e-12 + 1e-10 * result.sum.abs());
         assert_eq!(result.nfev, calls.get());
+    }
+
+    #[test]
+    fn nsum_bilateral_tests_error_against_the_combined_sum() {
+        let cancelled = nsum(
+            |x| {
+                if x == 0.0 {
+                    0.0
+                } else {
+                    x.signum() / (1.0 + x * x)
+                }
+            },
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            1.0,
+            0.0,
+            1e-6,
+        );
+        // Both one-sided series converge. Their exact sum is zero, so
+        // agreement to a relative tolerance on each tail is insufficient.
+        assert!(cancelled.sum.is_finite() && cancelled.error.is_finite());
+        assert!(!cancelled.converged && cancelled.error > 1e-6 * cancelled.sum.abs());
+
+        let large = (1_u64 << 53) as f64;
+        let rounded = nsum(
+            |x| {
+                if x == 0.0 {
+                    large
+                } else if x == -1.0 {
+                    1.0
+                } else {
+                    0.0
+                }
+            },
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            1.0,
+            0.0,
+            1e-20,
+        );
+        assert!(!rounded.converged);
+        assert_eq!((rounded.sum, rounded.error), (large, 1.0));
     }
 
     #[test]
