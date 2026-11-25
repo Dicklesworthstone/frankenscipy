@@ -130,6 +130,9 @@ jobs:
               cargo test --locked -p fsci-stats --lib fit_only_stats_distributions_expose_typed_try_fit -- --nocapture
               cargo test --locked -p fsci-stats --lib doublegamma_ -- --nocapture
               cargo test --locked -p fsci-stats --lib gennorm_fit -- --nocapture
+              cargo test --locked -p fsci-stats --lib gen_gamma_fit -- --nocapture
+              cargo test --locked -p fsci-stats --lib generalized_exponential_fit_is_at_least_as_good_as_scipy -- --nocapture
+              cargo test --locked -p fsci-stats --lib noncentral_f_fit_is_at_least_as_good_as_scipy -- --nocapture
               cargo test --locked -p fsci-stats --lib try_fit_folded_normal -- --nocapture
               cargo test --locked -p fsci-stats --lib try_fit_laplace_asymmetric -- --nocapture
               cargo test --locked -p fsci-stats --lib test_fit_cauchy -- --nocapture

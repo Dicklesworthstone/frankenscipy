@@ -18,8 +18,8 @@ use fsci_stats::{
     with_hardened_stats_caps, with_stats_runtime_mode,
 };
 use fsci_stats::{
-    Cauchy, DoubleGamma, Erlang, ExponNorm, FoldedNormal, GenNorm, HalfGenNorm, LaplaceAsymmetric,
-    NoncentralChiSquared, SkewNorm,
+    Cauchy, DoubleGamma, Erlang, ExponNorm, FoldedNormal, GenGamma, GenNorm, HalfGenNorm,
+    LaplaceAsymmetric, NoncentralChiSquared, SkewNorm,
 };
 use rand::{SeedableRng, rngs::StdRng};
 
@@ -65,6 +65,8 @@ cases = [
     ('ncx2', stats.ncx2, [(1.0, 0.5), (5.0, 2.0), (100.0, 200.0)]),
     ('gennorm', stats.gennorm, [(0.3,), (2.0,), (20.0,)]),
     ('halfgennorm', stats.halfgennorm, [(0.3,), (2.0,), (20.0,)]),
+    ('gengamma', stats.gengamma, [(0.5, 0.5), (2.0, 1.5), (4.0, 3.0),
+                                (0.5, -0.5), (2.0, -1.5), (4.0, -3.0)]),
 ]
 for family_index, (name, dist, shapes) in enumerate(cases):
     for case_index, shape in enumerate(shapes):
@@ -84,6 +86,15 @@ for family_index, (name, dist, shapes) in enumerate(cases):
             fits = [dist.fit(data, f0=k, floc=0) for k in candidates]
             fitted = min(fits, key=lambda p: -np.sum(dist.logpdf(
                 data, p[0], loc=p[-2], scale=p[-1])))
+        elif name == 'gengamma':
+            # Both signs of c are valid and separated by the excluded c=0
+            # boundary. SciPy's default positive start can miss a much
+            # better negative-c optimum, so compare both regions live.
+            fits = [dist.fit(data, a0, c0, **kwargs)
+                    for a0, c0 in ((1.0, 1.0), (2.0, 1.5), (0.5, 0.8),
+                                   (1.0, -1.0), (2.0, -1.5), (0.5, -0.8))]
+            fitted = min(fits, key=lambda p: -np.sum(dist.logpdf(
+                data, *p[:-2], loc=p[-2], scale=p[-1])))
         else:
             fitted = dist.fit(data, **kwargs)
         nll = -np.sum(dist.logpdf(data, *fitted[:-2], loc=fitted[-2], scale=fitted[-1]))
@@ -3492,6 +3503,10 @@ fn mle_matches_live_scipy_on_seeded_fits() {
         let two_positive = [MleParameter::Positive(1.0), MleParameter::Positive(1.0)];
         let options = MleOptions::default();
         let (actual, nll) = match family {
+            "gengamma" => {
+                let fitted = GenGamma::try_fit(&data).unwrap();
+                (vec![fitted.a, fitted.c], likelihood(&fitted, &data))
+            }
             "gennorm" => {
                 let fitted = GenNorm::try_fit(&data).unwrap();
                 (vec![fitted.beta], likelihood(&fitted, &data))
@@ -3672,7 +3687,7 @@ fn mle_matches_live_scipy_on_seeded_fits() {
         );
         if matches!(
             family,
-            "gamma" | "beta" | "weibull_min" | "lognorm" | "mielke" | "exponweib"
+            "gamma" | "beta" | "weibull_min" | "lognorm" | "mielke" | "exponweib" | "gengamma"
         ) {
             for (&value, &reference) in actual.iter().zip(&expected) {
                 assert!(
@@ -3688,10 +3703,10 @@ fn mle_matches_live_scipy_on_seeded_fits() {
         compared += 1;
     }
     assert_eq!(
-        compared, 93,
+        compared, 99,
         "every seeded case must produce a real comparison"
     );
-    eprintln!("MLE compared cases = {compared}; families = 31; samples per case = 2000");
+    eprintln!("MLE compared cases = {compared}; families = 32; samples per case = 2000");
 }
 
 #[test]

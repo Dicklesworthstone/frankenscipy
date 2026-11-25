@@ -5640,72 +5640,50 @@ impl ContinuousDistribution for GenGamma {
     }
 
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        // Maximum-likelihood fit (standardized GenGamma, loc=0/scale=1) via
-        // multi-start Nelder-Mead over (ln a, c); matches
-        // scipy.stats.gengamma.fit(.., floc=0, fscale=1). The 2-parameter
-        // moment system is ill-conditioned, so fit by likelihood instead.
-        if data.len() < 2 {
-            return Err(FitError::InsufficientData {
-                required: 2,
-                actual: data.len(),
+        // The valid shape space has two disconnected regions, c > 0 and
+        // c < 0. Searching only from positive c can settle at a much worse
+        // local maximum for inverse generalized-gamma observations. Fit
+        // both regions in (ln a, ln |c|), then compare their log likelihoods.
+        if active_stats_mode() == RuntimeMode::Hardened && data.len() > hardened_max_sample_len() {
+            return Err(FitError::ResourceExhausted {
+                detail: "Hardened mode fit sample length exceeds HARDENED_MAX_SAMPLE_LEN",
             });
         }
-        for &x in data {
-            if !x.is_finite() {
-                return Err(FitError::UnsupportedData(format!(
-                    "GenGamma data contains non-finite value: {x}"
-                )));
-            }
-            if x <= 0.0 {
-                return Err(FitError::UnsupportedData(format!(
-                    "GenGamma support is (0, ∞); got {x}"
-                )));
-            }
-        }
-        let owned: Vec<f64> = data.to_vec();
-        let nll = |p: &[f64]| -> f64 {
-            let a = p[0].exp();
-            let c = p[1];
-            if !a.is_finite() || !c.is_finite() || c.abs() < 1e-8 {
-                return f64::INFINITY;
-            }
-            let dist = GenGamma { a, c };
-            let mut total = 0.0;
-            for &x in &owned {
-                let d = dist.pdf(x);
-                if d <= 0.0 || !d.is_finite() {
-                    return f64::INFINITY;
-                }
-                total -= d.ln();
-            }
-            total
+        // Repeated positive observations admit arbitrarily concentrated
+        // densities, so there is no attained finite MLE for a constant sample.
+        mle::validate_positive_sample(data, "GenGamma")?;
+        let options = MleOptions {
+            max_iterations: 2_000,
+            max_evaluations: 4_000,
+            parameter_tolerance: 1e-9,
+            likelihood_tolerance: 1e-10,
         };
-        let starts = [[1.0_f64, 1.0], [2.0, 1.5], [0.5, 0.8]];
-        let mut best: Option<(f64, [f64; 2])> = None;
-        for s in &starts {
-            let x0 = [s[0].ln(), s[1]];
-            let opts = fsci_opt::MinimizeOptions {
-                maxiter: Some(2000),
-                maxfev: Some(4000),
-                tol: Some(1e-9),
-                ..Default::default()
-            };
-            if let Ok(res) = fsci_opt::nelder_mead(&nll, &x0, opts)
-                && let Some(f) = res.fun
-                && f.is_finite()
-                && best.as_ref().is_none_or(|(bf, _)| f < *bf)
-            {
-                best = Some((f, [res.x[0].exp(), res.x[1]]));
+        let mut best: Option<MleResult<Self>> = None;
+        for sign in [-1.0, 1.0] {
+            for [a, abs_c] in [[1.0, 1.0], [2.0, 1.5], [0.5, 0.8]] {
+                // The shared fitter uses logpdf directly and accepts only
+                // converged, finite, unpenalized likelihoods. A finite PDF
+                // is not required: legitimate tail densities can underflow.
+                if let Ok(candidate) = fit_mle(
+                    data,
+                    &[MleParameter::Positive(a), MleParameter::Positive(abs_c)],
+                    |p| {
+                        Some(Self {
+                            a: p[0],
+                            c: sign * p[1],
+                        })
+                    },
+                    options,
+                ) && best.as_ref().is_none_or(|previous| {
+                    candidate.negative_log_likelihood < previous.negative_log_likelihood
+                }) {
+                    best = Some(candidate);
+                }
             }
         }
-        match best {
-            Some((_, p)) if p[0] > 0.0 && p[1].abs() > 1e-8 && p.iter().all(|v| v.is_finite()) => {
-                Ok(Self { a: p[0], c: p[1] })
-            }
-            _ => Err(FitError::NonConvergent(
-                "GenGamma MLE failed to converge".to_owned(),
-            )),
-        }
+        best.map(|fitted| fitted.distribution).ok_or_else(|| {
+            FitError::NonConvergent("GenGamma MLE failed to converge in either shape region".into())
+        })
     }
 
     fn skewness(&self) -> f64 {
@@ -103748,15 +103726,95 @@ mod tests {
     }
 
     #[test]
+    fn gen_gamma_fit_searches_both_shape_signs() {
+        // SciPy 1.17.1 multi-start fits of these deterministic quantile
+        // samples. Starting only at c > 0 misses the negative-c maximum:
+        // for (2, -1.5), it settles at NLL 53.9066 instead of 36.6338.
+        for (a, c, expected_a, expected_c, expected_nll) in [
+            (
+                2.0,
+                -1.5,
+                2.006_726_269_424_872,
+                -1.509_437_334_640_871_6,
+                36.633_783_273_589_56,
+            ),
+            (
+                4.0,
+                -3.0,
+                4.024_102_025_975_214,
+                -3.014_472_437_492_235_4,
+                -60.666_558_900_186_104,
+            ),
+            (
+                2.0,
+                1.5,
+                2.006_726_267_252_238_6,
+                1.509_437_330_790_347_7,
+                81.907_683_146_845_29,
+            ),
+        ] {
+            let source = GenGamma::new(a, c);
+            let data: Vec<_> = (0..80)
+                .map(|i| source.ppf((i as f64 + 0.5) / 80.0))
+                .collect();
+            let fitted = GenGamma::try_fit(&data).expect("finite generalized-gamma MLE");
+            let nll = -data.iter().map(|&x| fitted.logpdf(x)).sum::<f64>();
+            assert!(
+                (nll - expected_nll).abs() < 1e-7,
+                "source ({a}, {c}): fit ({}, {}), NLL {nll} != {expected_nll}",
+                fitted.a,
+                fitted.c
+            );
+            assert!((fitted.a - expected_a).abs() < 2e-6);
+            assert!((fitted.c - expected_c).abs() < 2e-6);
+            for factor in [0.95, 1.05] {
+                for alternative in [
+                    GenGamma::new(fitted.a * factor, fitted.c),
+                    GenGamma::new(fitted.a, fitted.c * factor),
+                ] {
+                    let alternative_nll = -data.iter().map(|&x| alternative.logpdf(x)).sum::<f64>();
+                    assert!(alternative_nll > nll);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn gen_gamma_fit_rejects_invalid_input() {
         assert!(matches!(
             GenGamma::try_fit(&[1.0]).expect_err("n=1"),
             FitError::InsufficientData { .. }
         ));
-        assert!(matches!(
-            GenGamma::try_fit(&[1.0, -2.0, 3.0]).expect_err("nonpositive"),
-            FitError::UnsupportedData(_)
-        ));
+        for invalid in [0.0, -2.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(matches!(
+                GenGamma::try_fit(&[1.0, invalid, 3.0]),
+                Err(FitError::UnsupportedData(_))
+            ));
+            let fitted = GenGamma::fit(&[1.0, invalid, 3.0]);
+            assert!(fitted.a.is_nan() && fitted.c.is_nan());
+        }
+    }
+
+    #[test]
+    fn gen_gamma_fit_rejects_unattained_constant_mle_and_honors_caps() {
+        // Either sign can concentrate the density at a repeated positive
+        // observation with unbounded likelihood; no finite MLE exists.
+        for x in [0.5, 1.0, 2.0] {
+            assert!(matches!(
+                GenGamma::try_fit(&[x, x, x]),
+                Err(FitError::NonConvergent(_))
+            ));
+            let fitted = GenGamma::fit(&[x, x, x]);
+            assert!(fitted.a.is_nan() && fitted.c.is_nan());
+        }
+        with_stats_runtime_mode(RuntimeMode::Hardened, || {
+            with_hardened_stats_caps(2, 2, || {
+                assert!(matches!(
+                    GenGamma::try_fit(&[0.5, 1.0, 2.0]),
+                    Err(FitError::ResourceExhausted { .. })
+                ));
+            });
+        });
     }
 
     #[test]
