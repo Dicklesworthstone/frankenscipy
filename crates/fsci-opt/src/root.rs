@@ -3068,6 +3068,18 @@ where
         calls.set(calls.get() + 1);
         func(x)
     };
+    let initial = counted(x0);
+    if initial.len() >= x0.len() && initial.iter().all(|&value| value == 0.0) {
+        return Ok(MultivariateRootResult {
+            x: x0.to_vec(),
+            fun: initial,
+            // status: all residuals vanish at the initial point.
+            converged: true,
+            message: String::from("All residuals are zero at the initial point."),
+            iterations: 0,
+            function_calls: calls.get(),
+        });
+    }
     let mut perturbed = Vec::new();
     let fit = lm_iterations(
         |x| {
@@ -3089,6 +3101,7 @@ where
             max_nfev: Some(maxiter.saturating_add(1)),
             ..LeastSquaresOptions::default()
         },
+        Some(initial),
     )?;
     Ok(MultivariateRootResult {
         x: fit.x,
@@ -5313,6 +5326,29 @@ mod tests {
             .expect("scaled linear fit");
         assert!(fit.converged, "{fit:?}");
         assert!((fit.x[0] - 2.0).abs() < 1e-8);
+    }
+
+    #[test]
+    fn lm_root_accepts_exact_roots_at_both_budget_boundaries() {
+        let initial = lm_root(
+            |x| {
+                assert_eq!(x[0], f64::MAX);
+                vec![0.0, 0.0]
+            },
+            &[f64::MAX],
+            1e-12,
+            1,
+        )
+        .expect("no Jacobian is needed at a zero residual");
+        assert!(initial.converged);
+        assert_eq!(initial.function_calls, 1);
+        assert_eq!(initial.iterations, 0);
+
+        let final_trial = lm_root(|x| vec![x[0] - 1.0], &[0.0], 1e-12, 1)
+            .expect("one Newton step solves the equation");
+        assert!(final_trial.converged, "{final_trial:?}");
+        assert_eq!(final_trial.fun, vec![0.0]);
+        assert_eq!(final_trial.iterations, 1);
     }
 
     #[test]

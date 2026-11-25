@@ -1170,6 +1170,7 @@ where
         |x, r, jac| lm_jacobian_into(&residuals, x, r, &options, jac, &mut x_perturbed),
         x0,
         &options,
+        None,
     )
 }
 
@@ -1181,13 +1182,17 @@ pub(super) fn lm_iterations(
     mut jacobian: impl FnMut(&[f64], &[f64], &mut Vec<Vec<f64>>) -> Result<(), OptError>,
     x0: &[f64],
     options: &LeastSquaresOptions,
+    initial_residual: Option<Vec<f64>>,
 ) -> Result<LeastSquaresResult, OptError> {
     let n = x0.len();
     let mut scaling = LmScaling::new(options.x_scale.as_ref(), n)?;
     let max_nfev = options.max_nfev.unwrap_or(100 * n);
 
     let mut x = x0.to_vec();
-    let mut r = residuals(&x)?;
+    let mut r = match initial_residual {
+        Some(values) => values,
+        None => residuals(&x)?,
+    };
     let m = r.len();
     let mut nfev = 1usize;
     let mut njev = 0usize;
@@ -1379,12 +1384,22 @@ pub(super) fn lm_iterations(
         }
 
         if nfev >= max_nfev {
+            // An accepted final trial has already produced its residual and
+            // Jacobian. Check its stationarity before returning budget exhaustion.
+            let (status, message) = if max_cosine <= options.gtol {
+                (
+                    1,
+                    String::from("residual is orthogonal to the Jacobian columns (gtol)"),
+                )
+            } else {
+                (0, format!("max function evaluations exceeded ({max_nfev})"))
+            };
             return Ok(lm_result(
                 x,
                 r,
                 cost,
-                0,
-                format!("max function evaluations exceeded ({max_nfev})"),
+                status,
+                message,
                 nfev,
                 njev,
                 nit,
