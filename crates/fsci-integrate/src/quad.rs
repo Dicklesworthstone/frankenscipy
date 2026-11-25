@@ -2835,29 +2835,25 @@ fn initial_cubature_regions(
         .collect::<Vec<_>>();
 
     for point in &options.points {
-        for ((axis_breakpoints, &coordinate), &transform) in breakpoints
+        for (((axis_breakpoints, &coordinate), &transform), &(start, end)) in breakpoints
             .iter_mut()
             .zip(point.iter())
             .zip(transforms.iter())
+            .zip(ranges)
         {
             let Some(mapped) = transform.inverse(coordinate) else {
                 continue;
             };
-            let start = axis_breakpoints[0];
-            let Some(&end) = axis_breakpoints.last() else {
-                continue;
-            };
+            // Appended points are not domain endpoints. Always test against
+            // the original range, independently of the caller's point order.
             if is_strictly_between(mapped, start, end) {
                 axis_breakpoints.push(mapped);
             }
         }
     }
 
-    for axis_breakpoints in &mut breakpoints {
-        let Some(&end) = axis_breakpoints.last() else {
-            continue;
-        };
-        let ascending = axis_breakpoints[0] <= end;
+    for (axis_breakpoints, &(start, end)) in breakpoints.iter_mut().zip(ranges) {
+        let ascending = start <= end;
         axis_breakpoints.sort_by(|left, right| {
             if ascending {
                 left.total_cmp(right)
@@ -2865,7 +2861,9 @@ fn initial_cubature_regions(
                 right.total_cmp(left)
             }
         });
-        axis_breakpoints.dedup_by(|left, right| cubature_breakpoints_equal(*left, *right));
+        // Every distinct representable boundary carries an interval, however
+        // small. Tolerance-based deduplication can erase the entire integral.
+        axis_breakpoints.dedup_by(|left, right| *left == *right);
     }
 
     let mut regions = Vec::new();
@@ -2898,10 +2896,6 @@ fn is_strictly_between(value: f64, start: f64, end: f64) -> bool {
     let low = start.min(end);
     let high = start.max(end);
     value > low && value < high
-}
-
-fn cubature_breakpoints_equal(left: f64, right: f64) -> bool {
-    (left - right).abs() <= f64::EPSILON * (1.0 + left.abs().max(right.abs()))
 }
 
 /// A 1-D Kronrod rule on [-1, 1] with its embedded Gauss rule: `gauss[i]` is the Gauss weight
@@ -6891,6 +6885,105 @@ mod tests {
         assert_eq!(result.estimate, vec![42.0, -7.0]);
         assert_eq!(result.error, vec![0.0, 0.0]);
         assert_eq!(result.neval, 1);
+    }
+
+    #[test]
+    fn cubature_preserves_small_nonzero_domains() {
+        for width in [1e-20, 1e-100, 1e-200] {
+            for reverse in [false, true] {
+                let (a, b, expected) = if reverse {
+                    (width, 0.0, -1.0)
+                } else {
+                    (0.0, width, 1.0)
+                };
+                let result = cubature_scalar(
+                    |_| 1.0 / width,
+                    &[a],
+                    &[b],
+                    CubatureOptions {
+                        max_subdivisions: 0,
+                        ..CubatureOptions::default()
+                    },
+                )
+                .expect("a small nonzero interval still has a nonzero integral");
+                assert_eq!(result.status, CubatureStatus::Converged);
+                assert!(
+                    (result.estimate - expected).abs() < 5e-14,
+                    "width={width}, reverse={reverse}: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cubature_singularity_points_are_order_independent() {
+        let boundaries = [0.0, 0.25, 0.5, 0.625, 1.0];
+        for reverse in [false, true] {
+            for points in [
+                vec![vec![0.25], vec![0.625], vec![0.5]],
+                vec![vec![0.625], vec![0.5], vec![0.25], vec![0.5]],
+                vec![vec![0.5], vec![0.25], vec![0.625]],
+            ] {
+                let (a, b) = if reverse { (1.0, 0.0) } else { (0.0, 1.0) };
+                let result = cubature(
+                    |x| {
+                        assert!(
+                            !boundaries.contains(&x[0]),
+                            "sampled an excluded point or region boundary: {x:?}"
+                        );
+                        vec![2.0, x[0]]
+                    },
+                    &[a],
+                    &[b],
+                    CubatureOptions {
+                        points,
+                        max_subdivisions: 0,
+                        ..CubatureOptions::default()
+                    },
+                )
+                .expect("all singularity points must split the initial domain");
+                let sign = if reverse { -1.0 } else { 1.0 };
+                assert_eq!(result.status, CubatureStatus::Converged);
+                assert!((result.estimate[0] - 2.0 * sign).abs() < 1e-13);
+                assert!((result.estimate[1] - 0.5 * sign).abs() < 1e-13);
+                assert_eq!(result.regions.len(), boundaries.len() - 1);
+                for (i, region) in result.regions.iter().enumerate() {
+                    let (lo, hi) = if reverse {
+                        (boundaries[4 - i], boundaries[3 - i])
+                    } else {
+                        (boundaries[i], boundaries[i + 1])
+                    };
+                    assert_eq!(region.a, vec![lo]);
+                    assert_eq!(region.b, vec![hi]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cubature_keeps_distinct_nearby_breakpoints() {
+        let middle = 0.5_f64;
+        let next = middle.next_up();
+        let ranges = [(0.0, 1.0), (1.0, 0.0)];
+        let regions = initial_cubature_regions(
+            &ranges,
+            &[BoundTransform::Finite; 2],
+            &CubatureOptions {
+                points: vec![vec![middle, middle], vec![next, next]],
+                ..CubatureOptions::default()
+            },
+        );
+        assert_eq!(regions.len(), 9);
+        assert!(
+            regions
+                .iter()
+                .any(|(a, b)| a == &[middle, next] && b == &[next, middle])
+        );
+        let volume: f64 = regions
+            .iter()
+            .map(|(a, b)| (b[0] - a[0]) * (b[1] - a[1]))
+            .sum();
+        assert!((volume + 1.0).abs() < 1e-15);
     }
 
     #[test]
