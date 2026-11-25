@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
-//! Live SciPy differential coverage for `scipy.signal.resample`.
+//! Live SciPy differential coverage for `scipy.signal.resample` and default
+//! SOS-based `scipy.signal.decimate`, including narrow-band decimation and
+//! both axes of multi-channel inputs.
 //!
 //! Resolves [frankenscipy-t8e99]. fsci_signal::resample uses FFT
 //! domain resampling. 1e-10 abs.
@@ -12,7 +14,7 @@ use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_conformance::{ArmCounts, CompareLedger};
-use fsci_signal::resample;
+use fsci_signal::{decimate, decimate_axis_2d, resample};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-006";
@@ -148,6 +150,13 @@ for case in q["points"]:
         points.append({"case_id": cid, "values": None})
 print(json.dumps({"points": points}))
 "#;
+    run_scipy_or_skip(query, script)
+}
+
+fn run_scipy_or_skip<Q: Serialize, R: serde::de::DeserializeOwned>(
+    query: &Q,
+    script: &str,
+) -> Option<R> {
     let query_json = serde_json::to_string(query).expect("serialize resample query");
     let mut child = match fsci_conformance::scipy_oracle_command()
         .arg("-c")
@@ -266,4 +275,116 @@ fn diff_signal_resample() {
         max_overall
     );
     ledger.finish(query.points.len());
+}
+
+#[test]
+fn diff_signal_decimate_sos() {
+    #[derive(Serialize)]
+    struct DecimateQuery {
+        samples: Vec<Vec<f64>>,
+        factors: Vec<usize>,
+    }
+
+    let x: Vec<f64> = (0..2000)
+        .map(|i| (i as f64 * 0.003).sin() + 0.1 * (i as f64 * 0.6).cos())
+        .collect();
+    let shifted: Vec<f64> = x.iter().map(|&value| -2.0 * value + 0.25).collect();
+    let query = DecimateQuery {
+        samples: vec![x, shifted],
+        factors: vec![2, 8, 13, 20, 50, 100],
+    };
+    // Send identical f64 inputs to both implementations, so this test measures
+    // the filter and its boundary treatment rather than two libm sine curves.
+    // Large q exposes the unstable degree-8 BA route; q=2 and q=8 also guard
+    // ordinary decimation. An affine second channel exercises DC gain and the
+    // axis-zero transpose independently of the first channel.
+    let script = r#"
+import json
+import sys
+import numpy as np
+from scipy.signal import decimate
+
+query = json.load(sys.stdin)
+x = np.asarray(query["samples"], dtype=float)
+points = []
+for q in query["factors"]:
+    for arm, data, axis in [("vector", x[0], -1), ("rows", x, -1),
+                            ("columns", x.T, 0)]:
+        values = decimate(data, q, axis=axis)
+        assert np.all(np.isfinite(values)), (q, arm)
+        points.append({"case_id": f"q={q}/{arm}",
+                       "values": values.ravel().tolist()})
+print(json.dumps({"points": points}, allow_nan=False))
+"#;
+    let Some(oracle): Option<OracleResult> = run_scipy_or_skip(&query, script) else {
+        return;
+    };
+    assert_eq!(oracle.points.len(), query.factors.len() * 3);
+    let pmap: HashMap<_, _> = oracle
+        .points
+        .into_iter()
+        .map(|point| (point.case_id.clone(), point))
+        .collect();
+    assert_eq!(pmap.len(), query.factors.len() * 3);
+    let columns: Vec<Vec<f64>> = (0..query.samples[0].len())
+        .map(|i| query.samples.iter().map(|row| row[i]).collect())
+        .collect();
+    let mut ledger = CompareLedger::new("diff_signal_decimate_sos", &["vector", "rows", "columns"]);
+    let mut diffs = Vec::new();
+    let mut max_overall = 0.0_f64;
+    let start = Instant::now();
+    for &q in &query.factors {
+        let outputs = [
+            ("vector", decimate(&query.samples[0], q)),
+            (
+                "rows",
+                decimate_axis_2d(&query.samples, q, -1)
+                    .map(|values| values.into_iter().flatten().collect()),
+            ),
+            (
+                "columns",
+                decimate_axis_2d(&columns, q, 0)
+                    .map(|values| values.into_iter().flatten().collect()),
+            ),
+        ];
+        for (arm, result) in outputs {
+            let case_id = format!("q={q}/{arm}");
+            let reference = pmap.get(&case_id).expect("oracle case exists");
+            let values = result.ok();
+            let Some((expected, actual)) = ledger.slices(
+                arm,
+                &case_id,
+                reference.values.as_deref(),
+                values.as_deref(),
+            ) else {
+                continue;
+            };
+            let abs_diff = actual
+                .iter()
+                .zip(expected)
+                .map(|(&actual, &expected)| (actual - expected).abs())
+                .fold(0.0_f64, f64::max);
+            max_overall = max_overall.max(abs_diff);
+            let pass = abs_diff <= ABS_TOL;
+            ledger.compared(arm, &case_id, pass);
+            eprintln!("decimate {case_id}: max_abs_error={abs_diff:.6e}");
+            diffs.push(CaseDiff {
+                case_id,
+                abs_diff,
+                pass,
+            });
+        }
+    }
+    emit_log(&DiffLog {
+        test_id: "diff_signal_decimate_sos".into(),
+        category: "scipy.signal.decimate".into(),
+        case_count: diffs.len(),
+        compared: ledger.counts().clone(),
+        max_abs_diff: max_overall,
+        pass: diffs.iter().all(|case| case.pass),
+        timestamp_ms: timestamp_ms(),
+        duration_ns: start.elapsed().as_nanos(),
+        cases: diffs,
+    });
+    ledger.finish(query.factors.len());
 }

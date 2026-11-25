@@ -20276,7 +20276,10 @@ pub fn minimum_phase(h: &[f64]) -> Result<Vec<f64>, SignalError> {
 ///
 /// Matches `scipy.signal.decimate(x, q)` with its default IIR filter:
 /// an order-8 Chebyshev type-I lowpass with 0.05 dB passband ripple and
-/// cutoff `0.8/q`, applied zero-phase, then every `q`-th sample is kept.
+/// cutoff `0.8/q`, applied zero-phase in second-order sections, then every
+/// `q`-th sample is kept. Keeping the filter in pole/zero form until its
+/// biquad sections are formed avoids the ill-conditioned degree-8 polynomial
+/// that can amplify rounding errors at large downsampling factors.
 ///
 /// # Arguments
 /// * `x` — Input signal.
@@ -20296,17 +20299,41 @@ pub fn decimate(x: &[f64], q: usize) -> Result<Vec<f64>, SignalError> {
         });
     }
 
-    // scipy.signal.decimate default: cheby1(8, 0.05, 0.8/q) anti-alias
-    // filter (a fixed order 8 — not reduced for small q — and cutoff
-    // 0.8/q rather than 1/q), applied zero-phase via filtfilt.
-    let cutoff = 0.8 / q as f64;
-    let ba = cheby1(8, 0.05, &[cutoff], FilterType::Lowpass)?;
-
-    let filtered = filtfilt(&ba.b, &ba.a, x)?;
+    let sos = decimate_sos(q)?;
+    let filtered = sosfiltfilt(&sos, x)?;
 
     // Downsample.
     let output: Vec<f64> = filtered.iter().step_by(q).copied().collect();
     Ok(output)
+}
+
+/// SciPy's default decimation filter, designed without a transfer-function
+/// polynomial or its cancellation-prone DC normalization. Converting rounded
+/// degree-8 coefficients back to SOS cannot recover the original poles.
+fn decimate_sos(q: usize) -> Result<Vec<SosSection>, SignalError> {
+    let (_, poles, gain) = cheb1ap(8, 0.05)?;
+    let (poles_re, poles_im) = poles.into_iter().unzip();
+    let prototype = ZpkCoeffs {
+        zeros_re: Vec::new(),
+        zeros_im: Vec::new(),
+        poles_re,
+        poles_im,
+        gain,
+    };
+    let analog = lowpass_zpk(&prototype, prewarp_digital_frequency(0.8 / q as f64));
+    let mut digital = bilinear_zpk_internal(&analog);
+    // All zeros are -1, so only the pole pairing/order matters. Put the least
+    // resonant sections first (and the gain in that first section), matching
+    // SciPy's ordering and limiting intermediate amplification in the cascade.
+    let mut poles: Vec<_> = digital
+        .poles_re
+        .iter()
+        .copied()
+        .zip(digital.poles_im.iter().copied())
+        .collect();
+    poles.sort_by(|a, b| a.0.hypot(a.1).total_cmp(&b.0.hypot(b.1)));
+    (digital.poles_re, digital.poles_im) = poles.into_iter().unzip();
+    Ok(zpk2sos(&digital))
 }
 
 /// Decimate (anti-alias + downsample by `q`) along one axis of a rectangular 2-D
@@ -20315,7 +20342,7 @@ pub fn decimate(x: &[f64], q: usize) -> Result<Vec<f64>, SignalError> {
 /// Matches `scipy.signal.decimate(x, q, axis)` with the default IIR
 /// (`cheby1(8, 0.05, 0.8/q)`) zero-phase filter. Each line is decimated
 /// independently — BIT-IDENTICAL to per-line 1-D `decimate`. Reuses the parallel
-/// `filtfilt_axis_2d` (filter built ONCE, applied across lines on all cores), then
+/// `sosfiltfilt_axis_2d` (filter built ONCE, applied across lines on all cores), then
 /// subsamples: scipy serial-loops the per-line zero-phase recurrence, so the fan-out
 /// wins big (the same multi-channel-filter lever as `filtfilt_axis_2d`). For
 /// `axis=-1`/`1` each row shrinks to `ceil(cols/q)`; for `axis=0` the row count
@@ -20332,12 +20359,11 @@ pub fn decimate_axis_2d(
         return Err(SignalError::InvalidArgument("q must be >= 2".to_string()));
     }
     // Same anti-alias filter as the 1-D path, built once and shared across lines.
-    let cutoff = 0.8 / q as f64;
-    let ba = cheby1(8, 0.05, &[cutoff], FilterType::Lowpass)?;
+    let sos = decimate_sos(q)?;
     match axis {
         -1 | 1 => {
             // Zero-phase filter each row in parallel, then subsample each row.
-            let filtered = filtfilt_axis_2d(&ba.b, &ba.a, x, -1)?;
+            let filtered = sosfiltfilt_axis_2d(&sos, x, -1)?;
             Ok(filtered
                 .into_iter()
                 .map(|row| row.into_iter().step_by(q).collect())
@@ -20345,7 +20371,7 @@ pub fn decimate_axis_2d(
         }
         0 => {
             // Zero-phase filter down each column in parallel, then subsample rows.
-            let filtered = filtfilt_axis_2d(&ba.b, &ba.a, x, 0)?;
+            let filtered = sosfiltfilt_axis_2d(&sos, x, 0)?;
             Ok(filtered.into_iter().step_by(q).collect())
         }
         other => Err(SignalError::InvalidArgument(format!(
@@ -28936,6 +28962,67 @@ mod tests {
             .iter(),
         ) {
             assert!((got - want).abs() < 1e-7, "decimate q=3: {got} != {want}");
+        }
+    }
+
+    #[test]
+    fn decimate_large_factor_matches_scipy_sos_reference() {
+        // scipy.signal.decimate(sin(arange(2000)*.003)
+        //     + .1*cos(arange(2000)*.6), 100), captured with SciPy 1.17.1
+        // and NumPy 2.4.3.
+        // A degree-8 BA filter is already numerically unstable at this cutoff;
+        // ordinary q=2/3 cases do not expose the pole/normalization damage.
+        let x: Vec<f64> = (0..2000)
+            .map(|i| (i as f64 * 0.003).sin() + 0.1 * (i as f64 * 0.6).cos())
+            .collect();
+        let expected = [
+            0.12539938353357724,
+            0.2661545468527805,
+            0.5710290779125148,
+            0.7717792340092635,
+            0.9273306264289506,
+            0.9934556304309464,
+            0.9661713780175347,
+            0.8633444933764414,
+            0.67011833997829,
+            0.4275271643650044,
+            0.14033321829928344,
+            -0.15893051178156894,
+            -0.43710631736172023,
+            -0.6882847505235734,
+            -0.8628446772043382,
+            -0.9717369765810743,
+            -0.9953019317206069,
+            -0.8960835289595066,
+            -0.8164984039744715,
+            -0.8037399668141341,
+        ];
+        let actual = decimate(&x, 100).expect("narrow-band decimation");
+        assert_eq!(actual.len(), expected.len());
+        for (i, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                got.is_finite() && (got - want).abs() <= 1e-10,
+                "q=100 sample {i}: {got} != {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn decimate_preserves_chebyshev_dc_gain_at_large_factors() {
+        // An even-order Chebyshev-I filter has DC amplitude 10^(-rp/20).
+        // The forward/backward pass squares it. Steady-state initialization
+        // must preserve that value everywhere, including both padded edges.
+        let x = vec![1.0; 2000];
+        let expected = 10.0_f64.powf(-0.05 / 10.0);
+        for q in [2, 8, 13, 20, 50, 100] {
+            let result = decimate(&x, q).expect("constant decimation");
+            assert_eq!(result.len(), x.len().div_ceil(q));
+            for (i, &value) in result.iter().enumerate() {
+                assert!(
+                    value.is_finite() && (value - expected).abs() <= 1e-10,
+                    "q={q} sample {i}: {value} != {expected}"
+                );
+            }
         }
     }
 
