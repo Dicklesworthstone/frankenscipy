@@ -5,8 +5,9 @@
 //! batched variants.
 
 use fsci_runtime::RuntimeMode;
+use std::borrow::Cow;
 use std::ops::ControlFlow;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::FiniteDiffMethod;
 use crate::lsq_matrix::LeastSquaresMatrix;
@@ -566,6 +567,16 @@ pub enum CurveFitSigma {
     Covariance(Vec<Vec<f64>>),
 }
 
+/// How [`curve_fit`] handles missing observations in `xdata` or `ydata`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CurveFitNanPolicy {
+    /// Reject NaN observations before evaluating the model.
+    Raise,
+    /// Drop an observation when either its x or y value is NaN. Infinities
+    /// are retained, as in SciPy; use `check_finite` to reject them explicitly.
+    Omit,
+}
+
 /// Options for `curve_fit`.
 #[derive(Debug, Clone, Default)]
 pub struct CurveFitOptions {
@@ -579,9 +590,161 @@ pub struct CurveFitOptions {
     /// If true, return covariance in the units of `sigma`. Otherwise multiply
     /// it by the weighted residual variance `2 * cost / (m - n)`.
     pub absolute_sigma: bool,
+    /// Missing-observation policy. `None` performs no omission. `Omit` applies
+    /// the same row selection to x/y, standard deviations, both covariance
+    /// axes, analytic Jacobians and `jac_sparsity`. Jacobian callbacks and
+    /// sparsity patterns describe the original observation grid; the fitter
+    /// selects their retained rows. Covariance uses the retained sample count.
+    /// A batch may have a different missing-data mask in each y row.
+    /// Custom loss and iteration callbacks receive only retained residuals.
+    pub nan_policy: Option<CurveFitNanPolicy>,
+    /// Check x/y for NaNs and infinities before fitting. `None` means true
+    /// when `nan_policy` is absent, false when it is explicit, matching SciPy.
+    /// Explicit true rejects NaNs before an `Omit` policy can remove them.
+    /// Model residuals and retained Jacobian entries must still be finite.
+    pub check_finite: Option<bool>,
 }
 
-/// Prepared measurement-error transform, shared by every fit in a batch.
+struct FitObservations<'a> {
+    x: Cow<'a, [f64]>,
+    y: Cow<'a, [f64]>,
+    retained: Option<Vec<usize>>,
+}
+
+impl<'a> FitObservations<'a> {
+    fn new(x: &'a [f64], y: &'a [f64], options: &CurveFitOptions) -> Result<Self, OptError> {
+        if x.len() != y.len() {
+            return Err(OptError::InvalidArgument {
+                detail: format!(
+                    "xdata and ydata must have same length (got {} and {})",
+                    x.len(),
+                    y.len()
+                ),
+            });
+        }
+        if x.is_empty() {
+            return Err(OptError::InvalidArgument {
+                detail: String::from("xdata must not be empty"),
+            });
+        }
+        if options.check_finite.unwrap_or(options.nan_policy.is_none())
+            && x.iter().chain(y).any(|value| !value.is_finite())
+        {
+            return Err(OptError::NonFiniteInput {
+                detail: String::from("xdata and ydata must not contain NaN or Inf"),
+            });
+        }
+        let has_nan = x.iter().chain(y).any(|value| value.is_nan());
+        if has_nan && options.nan_policy == Some(CurveFitNanPolicy::Raise) {
+            return Err(OptError::NonFiniteInput {
+                detail: String::from("nan_policy='raise' rejects NaNs in xdata or ydata"),
+            });
+        }
+        if has_nan && options.nan_policy == Some(CurveFitNanPolicy::Omit) {
+            let retained: Vec<usize> = x
+                .iter()
+                .zip(y)
+                .enumerate()
+                .filter_map(|(i, (x, y))| (!x.is_nan() && !y.is_nan()).then_some(i))
+                .collect();
+            if retained.is_empty() {
+                return Err(OptError::InvalidArgument {
+                    detail: String::from("no observations remain after omitting NaNs"),
+                });
+            }
+            return Ok(Self {
+                x: Cow::Owned(retained.iter().map(|&i| x[i]).collect()),
+                y: Cow::Owned(retained.iter().map(|&i| y[i]).collect()),
+                retained: Some(retained),
+            });
+        }
+        Ok(Self {
+            x: Cow::Borrowed(x),
+            y: Cow::Borrowed(y),
+            retained: None,
+        })
+    }
+}
+
+/// A batch reuses its latest covariance factorization for the same mask. Keeping
+/// only one cached factor bounds storage when every observation row has a distinct
+/// missing-data pattern; active workers retain their own Arc while solving.
+/// Mask before Cholesky: a principal submatrix of sigma describes the retained
+/// observations; selecting rows from its full Cholesky factor does not.
+struct FitWhiteningCache {
+    sigma: Option<CurveFitSigma>,
+    observations: usize,
+    factor: Mutex<Option<(Vec<usize>, Arc<FitWhitening>)>>,
+}
+
+impl FitWhiteningCache {
+    fn new(sigma: Option<CurveFitSigma>, observations: usize) -> Self {
+        Self {
+            sigma,
+            observations,
+            factor: Mutex::new(None),
+        }
+    }
+
+    fn get(&self, retained: Option<&[usize]>) -> Result<Arc<FitWhitening>, OptError> {
+        let key = retained.unwrap_or(&[]);
+        let mut cached = self.factor.lock().map_err(|_| OptError::InvalidArgument {
+            detail: String::from("curve-fit covariance preparation was interrupted"),
+        })?;
+        if let Some((mask, factor)) = cached.as_ref()
+            && mask == key
+        {
+            return Ok(Arc::clone(factor));
+        }
+        let factor = Arc::new(match retained {
+            None => FitWhitening::new(self.sigma.as_ref(), self.observations)?,
+            Some(retained) => {
+                let sigma = match self.sigma.as_ref() {
+                    None => None,
+                    Some(CurveFitSigma::Scalar(value)) => Some(CurveFitSigma::Scalar(*value)),
+                    Some(CurveFitSigma::StandardDeviations(values)) => {
+                        if values.len() != 1 && values.len() != self.observations {
+                            return Err(OptError::InvalidArgument {
+                                detail: format!(
+                                    "sigma must contain one or {} standard deviations before omission",
+                                    self.observations
+                                ),
+                            });
+                        }
+                        Some(CurveFitSigma::StandardDeviations(if values.len() == 1 {
+                            values.clone()
+                        } else {
+                            retained.iter().map(|&i| values[i]).collect()
+                        }))
+                    }
+                    Some(CurveFitSigma::Covariance(matrix)) => {
+                        if matrix.len() != self.observations
+                            || matrix.iter().any(|row| row.len() != self.observations)
+                        {
+                            return Err(OptError::InvalidArgument {
+                                detail: format!(
+                                    "sigma covariance must have shape ({0}, {0}) before omission",
+                                    self.observations
+                                ),
+                            });
+                        }
+                        Some(CurveFitSigma::Covariance(
+                            retained
+                                .iter()
+                                .map(|&i| retained.iter().map(|&j| matrix[i][j]).collect())
+                                .collect(),
+                        ))
+                    }
+                };
+                FitWhitening::new(sigma.as_ref(), retained.len())?
+            }
+        });
+        *cached = Some((key.to_vec(), Arc::clone(&factor)));
+        Ok(factor)
+    }
+}
+
+/// Prepared measurement-error transform, shared by fits using the same mask.
 /// Factorizing an `m × m` covariance is O(m³), so it must not be repeated for
 /// each residual/Jacobian evaluation or each independent batch member.
 enum FitWhitening {
@@ -1855,42 +2018,34 @@ pub fn curve_fit<F>(
     f: F,
     xdata: &[f64],
     ydata: &[f64],
-    options: CurveFitOptions,
+    mut options: CurveFitOptions,
 ) -> Result<CurveFitResult, OptError>
 where
     F: Fn(f64, &[f64]) -> f64 + Sync,
 {
-    let whitening = Arc::new(FitWhitening::new(options.sigma.as_ref(), xdata.len())?);
+    let whitening = FitWhiteningCache::new(options.sigma.take(), xdata.len());
     curve_fit_impl(&f, xdata, ydata, None, options, &whitening)
 }
 
-/// Shared scalar/batched and bounded/unbounded curve fitting. `whitening` has
-/// already been validated and factored exactly once for this observation grid.
+/// Shared scalar/batched and bounded/unbounded curve fitting. Select observations
+/// before preparing their measurement-error transform, then use that transform
+/// consistently for residuals and analytic/numerical Jacobians.
 fn curve_fit_impl<F>(
     f: &F,
     xdata: &[f64],
     ydata: &[f64],
     bounds: Option<(&[f64], &[f64])>,
     options: CurveFitOptions,
-    whitening: &Arc<FitWhitening>,
+    whitening: &FitWhiteningCache,
 ) -> Result<CurveFitResult, OptError>
 where
     F: Fn(f64, &[f64]) -> f64 + Sync,
 {
-    if xdata.len() != ydata.len() {
-        return Err(OptError::InvalidArgument {
-            detail: format!(
-                "xdata and ydata must have same length (got {} and {})",
-                xdata.len(),
-                ydata.len()
-            ),
-        });
-    }
-    if xdata.is_empty() {
-        return Err(OptError::InvalidArgument {
-            detail: String::from("xdata must not be empty"),
-        });
-    }
+    let original_observations = xdata.len();
+    let observations = FitObservations::new(xdata, ydata, &options)?;
+    let xdata = observations.x.as_ref();
+    let ydata = observations.y.as_ref();
+    let whitening = whitening.get(observations.retained.as_deref())?;
 
     let p0 = options.p0.ok_or_else(|| OptError::InvalidArgument {
         detail: String::from("p0 (initial parameter guess) is required"),
@@ -1944,35 +2099,94 @@ where
     if ls_options.jac.is_none()
         && let Some(pattern) = &ls_options.jac_sparsity
     {
+        let selected;
+        let pattern = if let Some(retained) = &observations.retained {
+            if pattern.shape != Shape2D::new(original_observations, n_params) {
+                return Err(OptError::InvalidArgument {
+                    detail: String::from(
+                        "jac_sparsity must describe the original observation grid",
+                    ),
+                });
+            }
+            selected = JacobianSparsity::from_rows(
+                retained
+                    .iter()
+                    .map(|&r| pattern.indices[pattern.indptr[r]..pattern.indptr[r + 1]].to_vec())
+                    .collect(),
+                n_params,
+            )?;
+            &selected
+        } else {
+            pattern
+        };
         ls_options.jac_sparsity = Some(whitening.sparsity(pattern)?);
     }
-    if !matches!(whitening.as_ref(), FitWhitening::Identity)
+    if (observations.retained.is_some() || !matches!(whitening.as_ref(), FitWhitening::Identity))
         && let Some(jacobian) = ls_options.jac.take()
     {
-        let whitening = Arc::clone(whitening);
-        let observations = xdata.len();
+        let whitening = Arc::clone(&whitening);
+        let retained = observations.retained.clone();
         ls_options.jac = Some(LeastSquaresJacobian {
             callback: Arc::new(move |params| {
                 let matrix = (jacobian.callback)(params)?;
-                // Leave malformed matrices intact for LeastSquaresJacobian::evaluate
-                // to report its normal shape error, before indexing any row here.
+                // Validate the original grid before selecting rows. Nonfinite
+                // values in dropped rows are harmless; retained values are checked
+                // by LeastSquaresJacobian::evaluate after selection and whitening.
                 let valid_shape = match &matrix {
                     LeastSquaresMatrix::Dense(rows) => {
-                        rows.len() == observations
+                        rows.len() == original_observations
                             && rows.iter().all(|row| row.len() == params.len())
                     }
                     LeastSquaresMatrix::Sparse(csr) => {
-                        csr.shape() == Shape2D::new(observations, params.len())
+                        csr.shape() == Shape2D::new(original_observations, params.len())
                     }
                     LeastSquaresMatrix::Operator(operator) => {
-                        operator.shape() == Shape2D::new(observations, params.len())
+                        operator.shape() == Shape2D::new(original_observations, params.len())
                     }
                 };
-                if valid_shape {
-                    whitening.jacobian_matrix(matrix)
-                } else {
-                    Ok(matrix)
+                if !valid_shape {
+                    return Err(OptError::InvalidArgument {
+                        detail: format!(
+                            "Jacobian must have shape ({original_observations}, {}) before omission",
+                            params.len()
+                        ),
+                    });
                 }
+                let matrix = if let Some(retained) = &retained {
+                    match matrix {
+                        LeastSquaresMatrix::Dense(rows) => LeastSquaresMatrix::Dense(
+                            retained.iter().map(|&r| rows[r].clone()).collect(),
+                        ),
+                        LeastSquaresMatrix::Sparse(csr) => {
+                            let mut data = Vec::new();
+                            let mut indices = Vec::new();
+                            let mut indptr = vec![0];
+                            for &r in retained {
+                                let range = csr.indptr()[r]..csr.indptr()[r + 1];
+                                data.extend_from_slice(&csr.data()[range.clone()]);
+                                indices.extend_from_slice(&csr.indices()[range]);
+                                indptr.push(data.len());
+                            }
+                            LeastSquaresMatrix::Sparse(CsrMatrix::from_components(
+                                Shape2D::new(retained.len(), params.len()),
+                                data,
+                                indices,
+                                indptr,
+                                false,
+                            )?)
+                        }
+                        LeastSquaresMatrix::Operator(_) => {
+                            return Err(OptError::InvalidArgument {
+                                detail: String::from(
+                                    "curve_fit requires explicit Jacobian entries",
+                                ),
+                            });
+                        }
+                    }
+                } else {
+                    matrix
+                };
+                whitening.jacobian_matrix(matrix)
             }),
             matrix_free: false,
         });
@@ -2071,12 +2285,12 @@ pub fn curve_fit_bounded<F>(
     ydata: &[f64],
     lower: &[f64],
     upper: &[f64],
-    options: CurveFitOptions,
+    mut options: CurveFitOptions,
 ) -> Result<CurveFitResult, OptError>
 where
     F: Fn(f64, &[f64]) -> f64 + Sync,
 {
-    let whitening = Arc::new(FitWhitening::new(options.sigma.as_ref(), xdata.len())?);
+    let whitening = FitWhiteningCache::new(options.sigma.take(), xdata.len());
     curve_fit_impl(&f, xdata, ydata, Some((lower, upper)), options, &whitening)
 }
 
@@ -2092,7 +2306,7 @@ pub fn curve_fit_many<F>(
     f: F,
     xdata: &[f64],
     ydata_rows: &[Vec<f64>],
-    options: CurveFitOptions,
+    mut options: CurveFitOptions,
 ) -> Result<Vec<Vec<f64>>, OptError>
 where
     F: Fn(f64, &[f64]) -> f64 + Sync,
@@ -2102,7 +2316,7 @@ where
         return Ok(Vec::new());
     }
     let f_ref = &f;
-    let whitening = Arc::new(FitWhitening::new(options.sigma.as_ref(), xdata.len())?);
+    let whitening = FitWhiteningCache::new(options.sigma.take(), xdata.len());
     // The factored transform is shared. Do not also copy an O(m²) covariance
     // input into every worker's per-fit options.
     let fit_options = CurveFitOptions {
@@ -2224,7 +2438,7 @@ pub fn curve_fit_bounded_many<F>(
     ydata_rows: &[Vec<f64>],
     lower: &[f64],
     upper: &[f64],
-    options: CurveFitOptions,
+    mut options: CurveFitOptions,
 ) -> Result<Vec<Vec<f64>>, OptError>
 where
     F: Fn(f64, &[f64]) -> f64 + Sync,
@@ -2234,7 +2448,7 @@ where
         return Ok(Vec::new());
     }
     let f_ref = &f;
-    let whitening = Arc::new(FitWhitening::new(options.sigma.as_ref(), xdata.len())?);
+    let whitening = FitWhiteningCache::new(options.sigma.take(), xdata.len());
     let fit_options = CurveFitOptions {
         sigma: None,
         ..options
@@ -3301,6 +3515,7 @@ mod tests {
                         xtol: 1e-12,
                         ..LeastSquaresOptions::default()
                     },
+                    ..CurveFitOptions::default()
                 },
             )
             .unwrap();

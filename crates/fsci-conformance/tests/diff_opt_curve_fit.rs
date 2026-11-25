@@ -19,8 +19,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{
-    CurveFitOptions, LeastSquaresJacobian, LeastSquaresMethod, LeastSquaresOptions, curve_fit,
-    curve_fit_bounded,
+    CurveFitNanPolicy, CurveFitOptions, CurveFitSigma, LeastSquaresJacobian, LeastSquaresMethod,
+    LeastSquaresOptions, curve_fit, curve_fit_bounded,
 };
 use serde::{Deserialize, Serialize};
 
@@ -507,4 +507,216 @@ print(json.dumps(out))
         compared, 16,
         "every method/entrypoint/variance/rank arm must run"
     );
+}
+
+#[derive(Serialize)]
+struct MissingDataCase {
+    case_id: String,
+    method: &'static str,
+    bounded: bool,
+    analytic: bool,
+    absolute_sigma: bool,
+    correlated: bool,
+}
+
+#[derive(Deserialize)]
+struct MissingDataOracle {
+    case_id: String,
+    popt: Option<Vec<f64>>,
+    pcov: Option<Vec<Vec<f64>>>,
+    cost: Option<f64>,
+    error: Option<String>,
+}
+
+#[test]
+fn diff_opt_curve_fit_missing_observations() {
+    let mut cases = Vec::new();
+    for method in ["lm", "trf", "dogbox"] {
+        for bounded in [false, true] {
+            if method == "lm" && bounded {
+                continue;
+            }
+            for analytic in [false, true] {
+                for absolute_sigma in [false, true] {
+                    for correlated in [false, true] {
+                        cases.push(MissingDataCase {
+                            case_id: format!("{method}_bounded{bounded}_analytic{analytic}_absolute{absolute_sigma}_correlated{correlated}"),
+                            method,
+                            bounded,
+                            analytic,
+                            absolute_sigma,
+                            correlated,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    let script = r#"
+import json
+import sys
+import numpy as np
+from scipy.optimize import curve_fit
+
+out = []
+for case in json.load(sys.stdin):
+    x = np.array([0., np.nan, 2., 3., 4., 5.])
+    y = np.array([1.1, 100., 4.7, np.nan, 9.2, 10.8])
+    deviations = np.array([.2, .3, .5, .8, 1.3, 2.])
+    if case["correlated"]:
+        sigma = deviations[:, None] * deviations[None, :] * .4**np.abs(np.subtract.outer(np.arange(6), np.arange(6)))
+    else:
+        sigma = deviations
+    def model(x, a, b):
+        return a*x+b
+    def jac(x, a, b):
+        return np.column_stack((x, np.ones_like(x)))
+    options = dict(p0=[1., 1.], method=case["method"], nan_policy="omit",
+                   sigma=sigma, absolute_sigma=case["absolute_sigma"],
+                   ftol=1e-12, xtol=1e-12, gtol=1e-12)
+    if case["analytic"]:
+        options["jac"] = jac
+    if case["bounded"]:
+        options["bounds"] = ([0., -5.], [1.5, 10.])
+    try:
+        popt, pcov = curve_fit(model, x, y, **options)
+        keep = ~(np.isnan(x) | np.isnan(y))
+        residual = model(x[keep], *popt) - y[keep]
+        if case["correlated"]:
+            residual = np.linalg.solve(np.linalg.cholesky(sigma[np.ix_(keep, keep)]), residual)
+        else:
+            residual = residual / sigma[keep]
+        out.append(dict(case_id=case["case_id"], popt=popt.tolist(), pcov=pcov.tolist(),
+                        cost=float(.5*np.dot(residual, residual)), error=None))
+    except Exception as error:
+        out.append(dict(case_id=case["case_id"], popt=None, pcov=None, cost=None, error=str(error)))
+print(json.dumps(out, allow_nan=False))
+"#;
+    let Some(oracle): Option<Vec<MissingDataOracle>> = run_scipy_or_skip(&cases, script) else {
+        return;
+    };
+    assert_eq!(oracle.len(), cases.len());
+    let mut ledger = CompareLedger::new(
+        "diff_opt_curve_fit_missing_observations",
+        &["lm", "trf", "dogbox"],
+    );
+    let xdata = [0.0, f64::NAN, 2.0, 3.0, 4.0, 5.0];
+    let ydata = [1.1, 100.0, 4.7, f64::NAN, 9.2, 10.8];
+    let deviations = [0.2, 0.3, 0.5, 0.8, 1.3, 2.0];
+    let mut compared = 0;
+    for (case, expected) in cases.iter().zip(&oracle) {
+        assert_eq!(case.case_id, expected.case_id);
+        assert!(
+            expected.error.is_none(),
+            "{}: {:?}",
+            case.case_id,
+            expected.error
+        );
+        let method = match case.method {
+            "lm" => LeastSquaresMethod::Lm,
+            "trf" => LeastSquaresMethod::Trf,
+            _ => LeastSquaresMethod::Dogbox,
+        };
+        let sigma = if case.correlated {
+            CurveFitSigma::Covariance(
+                (0_usize..6)
+                    .map(|i| {
+                        (0_usize..6)
+                            .map(|j| {
+                                deviations[i] * deviations[j] * 0.4_f64.powi(i.abs_diff(j) as i32)
+                            })
+                            .collect()
+                    })
+                    .collect(),
+            )
+        } else {
+            CurveFitSigma::StandardDeviations(deviations.to_vec())
+        };
+        let options = CurveFitOptions {
+            p0: Some(vec![1.0, 1.0]),
+            sigma: Some(sigma),
+            absolute_sigma: case.absolute_sigma,
+            nan_policy: Some(CurveFitNanPolicy::Omit),
+            ls_options: LeastSquaresOptions {
+                method: Some(method),
+                jac: case.analytic.then(|| {
+                    LeastSquaresJacobian::new(move |_| {
+                        xdata.iter().map(|&x| vec![x, 1.0]).collect()
+                    })
+                }),
+                ftol: 1e-12,
+                xtol: 1e-12,
+                gtol: 1e-12,
+                ..LeastSquaresOptions::default()
+            },
+            ..CurveFitOptions::default()
+        };
+        let fit = if case.bounded {
+            curve_fit_bounded(
+                |x, p| p[0] * x + p[1],
+                &xdata,
+                &ydata,
+                &[0.0, -5.0],
+                &[1.5, 10.0],
+                options,
+            )
+        } else {
+            curve_fit(|x, p| p[0] * x + p[1], &xdata, &ydata, options)
+        }
+        .unwrap_or_else(|error| panic!("{}: {error}", case.case_id));
+        let want_parameters = expected.popt.as_deref().expect("oracle parameters");
+        let want_covariance = expected.pcov.as_ref().expect("oracle covariance");
+        assert_eq!(fit.popt.len(), want_parameters.len());
+        assert_eq!(fit.pcov.len(), want_covariance.len());
+        assert!(
+            fit.pcov
+                .iter()
+                .zip(want_covariance)
+                .all(|(row, expected)| row.len() == expected.len())
+        );
+        assert!(
+            fit.popt
+                .iter()
+                .chain(fit.pcov.iter().flatten())
+                .all(|value| value.is_finite())
+        );
+        assert!(
+            want_parameters
+                .iter()
+                .chain(want_covariance.iter().flatten())
+                .all(|value| value.is_finite())
+        );
+        assert_eq!(fit.ls_result.fun.len(), 4);
+        let parameter_error = fit
+            .popt
+            .iter()
+            .zip(want_parameters)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        let covariance_error = fit
+            .pcov
+            .iter()
+            .flatten()
+            .zip(want_covariance.iter().flatten())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        let cost_error = (fit.ls_result.cost - expected.cost.expect("oracle cost")).abs();
+        let pass = parameter_error < 1e-7 && covariance_error < 1e-7 && cost_error < 1e-9;
+        ledger.compared(case.method, &case.case_id, pass);
+        assert!(
+            pass,
+            "{}: parameter error {parameter_error:e}, covariance error {covariance_error:e}, cost error {cost_error:e}",
+            case.case_id
+        );
+        if case.bounded {
+            assert!((fit.popt[0] - 1.5).abs() < 1e-10);
+            assert_eq!(fit.ls_result.active_mask[0], 1);
+        }
+        compared += 1;
+    }
+    assert_eq!(
+        compared, 40,
+        "every missing-data method/weight/Jacobian/covariance arm must compare"
+    );
+    ledger.finish(8);
 }

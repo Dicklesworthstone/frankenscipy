@@ -45,11 +45,11 @@ pub use chandrupatla::{
     FindRootStatus, find_minimum, find_root,
 };
 pub use curvefit::{
-    CurveFitOptions, CurveFitResult, CurveFitSigma, JacobianSparsity, LeastSquaresCallback,
-    LeastSquaresIteration, LeastSquaresJacobian, LeastSquaresLoss, LeastSquaresMethod,
-    LeastSquaresOptions, LeastSquaresResult, LeastsqResult, curve_fit, curve_fit_bounded,
-    curve_fit_bounded_many, curve_fit_many, least_squares, least_squares_bounded,
-    least_squares_many, leastsq,
+    CurveFitNanPolicy, CurveFitOptions, CurveFitResult, CurveFitSigma, JacobianSparsity,
+    LeastSquaresCallback, LeastSquaresIteration, LeastSquaresJacobian, LeastSquaresLoss,
+    LeastSquaresMethod, LeastSquaresOptions, LeastSquaresResult, LeastsqResult, curve_fit,
+    curve_fit_bounded, curve_fit_bounded_many, curve_fit_many, least_squares,
+    least_squares_bounded, least_squares_many, leastsq,
 };
 pub use linear_lsq::{
     LinearLeastSquaresOptions, LinearLeastSquaresResult, lsq_linear_with_options,
@@ -99,8 +99,7 @@ pub use root::{
     MultivariateRootMethod, MultivariateRootOptions, MultivariateRootResult, NewtonKrylovOptions,
     RootResult, RootResults, anderson, bisect, brenth, brentq, brentq_many, broyden1, broyden2,
     df_sane, fsolve, halley, lm_root, newton, newton_krylov, newton_krylov_with_options,
-    newton_many, newton_scalar, ridder, root, root_many, root_scalar, secant, secant_many,
-    toms748,
+    newton_many, newton_scalar, ridder, root, root_many, root_scalar, secant, secant_many, toms748,
 };
 pub use types::{
     Bound, Bounds, Constraint, ConstraintFn, ConstraintJacFn, ConstraintOrigin, ConstraintType,

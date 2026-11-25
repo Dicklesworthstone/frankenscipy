@@ -22,6 +22,7 @@ on:
       - "crates/fsci-conformance/tests/diff_integrate.rs"
       - "crates/fsci-conformance/tests/diff_integrate_monte_carlo_qmc_quad.rs"
       - "crates/fsci-conformance/tests/diff_linalg_matrix_functions.rs"
+      - "crates/fsci-conformance/tests/diff_opt_curve_fit.rs"
       - ".github/workflows/numerical-regressions.yml"
   workflow_dispatch:
 
@@ -76,6 +77,8 @@ jobs:
           case "$LANE" in
             least-squares)
               cargo test --locked -p fsci-opt --lib curvefit::tests -- --nocapture
+              cargo test --locked -p fsci-opt --test weighted_curve_fit -- --nocapture
+              cargo test --locked -p fsci-conformance --no-default-features --test diff_opt_curve_fit -- --nocapture
               cargo test --locked -p fsci-opt --lib trf_lsmr::tests -- --nocapture
               cargo test --locked -p fsci-opt --lib newton_krylov -- --nocapture
               cargo test --locked -p fsci-opt --lib nk_gmres -- --nocapture

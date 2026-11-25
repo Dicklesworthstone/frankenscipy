@@ -7,9 +7,9 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use fsci_opt::{
-    CurveFitOptions, CurveFitSigma, JacobianSparsity, LeastSquaresJacobian, LeastSquaresMethod,
-    LeastSquaresOptions, LossKind, OptError, curve_fit, curve_fit_bounded, curve_fit_bounded_many,
-    curve_fit_many,
+    CurveFitNanPolicy, CurveFitOptions, CurveFitSigma, JacobianSparsity, LeastSquaresJacobian,
+    LeastSquaresMethod, LeastSquaresOptions, LossKind, OptError, curve_fit, curve_fit_bounded,
+    curve_fit_bounded_many, curve_fit_many,
 };
 use fsci_sparse::{CsrMatrix, Shape2D};
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,403 @@ fn correlated_covariance() -> Vec<Vec<f64>> {
         vec![1.0, 1.0, 0.0],
         vec![0.0, 0.0, 9.0],
     ]
+}
+
+#[test]
+fn nan_omission_preserves_weighted_estimates_and_sample_count() {
+    // Keep rows 0, 2, 4. Ignoring x NaNs, dropping only y NaNs, or using the
+    // original sample count for relative covariance each gives a wrong result.
+    let xdata = [0.0, f64::NAN, 2.0, 3.0, 4.0, 5.0];
+    let ydata = [1.0, 500.0, 2.0, f64::NAN, 10.0, f64::NAN];
+    let mut covariance = vec![vec![0.1; 6]; 6];
+    for i in 0..6 {
+        covariance[i][i] = 5.0;
+    }
+    let retained_covariance = correlated_covariance();
+    for (i, &r) in [0, 2, 4].iter().enumerate() {
+        for (j, &c) in [0, 2, 4].iter().enumerate() {
+            covariance[r][c] = retained_covariance[i][j];
+        }
+    }
+    for method in METHODS {
+        for analytic in [false, true] {
+            for absolute_sigma in [false, true] {
+                for (sigma, mean, variance) in [
+                    (CurveFitSigma::Scalar(2.0), 13.0 / 3.0, 4.0 / 3.0),
+                    (
+                        CurveFitSigma::StandardDeviations(vec![2.0]),
+                        13.0 / 3.0,
+                        4.0 / 3.0,
+                    ),
+                    (
+                        CurveFitSigma::StandardDeviations(vec![
+                            1.0,
+                            f64::NAN,
+                            1.0,
+                            0.0,
+                            4.0,
+                            f64::INFINITY,
+                        ]),
+                        58.0 / 33.0,
+                        16.0 / 33.0,
+                    ),
+                    (CurveFitSigma::Covariance(covariance.clone()), 2.8, 0.9),
+                ] {
+                    let result = curve_fit(
+                        |_, p| p[0],
+                        &xdata,
+                        &ydata,
+                        CurveFitOptions {
+                            p0: Some(vec![0.0]),
+                            sigma: Some(sigma),
+                            absolute_sigma,
+                            nan_policy: Some(CurveFitNanPolicy::Omit),
+                            ls_options: LeastSquaresOptions {
+                                method: Some(method),
+                                jac: analytic.then(|| {
+                                    LeastSquaresJacobian::new(|_| {
+                                        vec![
+                                            vec![1.0],
+                                            vec![f64::NAN],
+                                            vec![1.0],
+                                            vec![f64::NAN],
+                                            vec![1.0],
+                                            vec![f64::NAN],
+                                        ]
+                                    })
+                                }),
+                                gtol: 1e-12,
+                                xtol: 1e-12,
+                                ftol: 1e-12,
+                                ..LeastSquaresOptions::default()
+                            },
+                            ..CurveFitOptions::default()
+                        },
+                    )
+                    .expect("fit after paired omission");
+                    assert!(
+                        (result.popt[0] - mean).abs() < 1e-7,
+                        "{method:?}: {result:?}"
+                    );
+                    assert_eq!(result.ls_result.fun.len(), 3);
+                    let expected_variance = if absolute_sigma {
+                        variance
+                    } else {
+                        variance * result.ls_result.cost // 2*cost/(3 - 1)
+                    };
+                    assert!((result.pcov[0][0] - expected_variance).abs() < 1e-6);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn nan_omission_selects_sparse_jacobians_and_numerical_sparsity() {
+    let xdata = [0.0, f64::NAN, 2.0, 3.0, 4.0, 5.0];
+    let ydata = [1.0, 500.0, 5.2, f64::NAN, 8.9, 11.1];
+    let retained = [0, 2, 4, 5];
+    let pattern = JacobianSparsity::from_rows(vec![vec![0, 1]; 6], 2).unwrap();
+    let callback = LeastSquaresJacobian::new_sparse(move |_| {
+        CsrMatrix::from_components(
+            Shape2D::new(6, 2),
+            xdata.into_iter().flat_map(|x| [x, 1.0]).collect(),
+            (0..6).flat_map(|_| [0, 1]).collect(),
+            (0..=6).map(|i| 2 * i).collect(),
+            true,
+        )
+        .unwrap()
+    });
+    let covariance: Vec<Vec<f64>> = (0_i32..6)
+        .map(|i| (0_i32..6).map(|j| 0.3_f64.powi((i - j).abs())).collect())
+        .collect();
+    let cases = [
+        (
+            CurveFitSigma::StandardDeviations(vec![1.0; 6]),
+            CurveFitSigma::Scalar(1.0),
+        ),
+        (
+            CurveFitSigma::Covariance(covariance.clone()),
+            CurveFitSigma::Covariance(
+                retained
+                    .iter()
+                    .map(|&i| retained.iter().map(|&j| covariance[i][j]).collect())
+                    .collect(),
+            ),
+        ),
+    ];
+    for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+        for (sigma, selected_sigma) in &cases {
+            let options = CurveFitOptions {
+                p0: Some(vec![1.0, 1.0]),
+                sigma: Some(sigma.clone()),
+                absolute_sigma: true,
+                nan_policy: Some(CurveFitNanPolicy::Omit),
+                ls_options: LeastSquaresOptions {
+                    method: Some(method),
+                    gtol: 1e-12,
+                    xtol: 1e-12,
+                    ftol: 1e-12,
+                    ..LeastSquaresOptions::default()
+                },
+                ..CurveFitOptions::default()
+            };
+            let model = |x: f64, p: &[f64]| p[0] * x + p[1];
+            let explicit = curve_fit(
+                model,
+                &retained.iter().map(|&i| xdata[i]).collect::<Vec<_>>(),
+                &retained.iter().map(|&i| ydata[i]).collect::<Vec<_>>(),
+                CurveFitOptions {
+                    sigma: Some(selected_sigma.clone()),
+                    ..options.clone()
+                },
+            )
+            .unwrap();
+            for analytic in [false, true] {
+                let mut selected_options = options.clone();
+                selected_options.ls_options.jac = analytic.then(|| callback.clone());
+                selected_options.ls_options.jac_sparsity = (!analytic).then(|| pattern.clone());
+                let selected = curve_fit(model, &xdata, &ydata, selected_options).unwrap();
+                for (&got, &want) in selected.popt.iter().zip(&explicit.popt) {
+                    assert!((got - want).abs() < 1e-7, "{method:?}: {selected:?}");
+                }
+                for (&got, &want) in selected
+                    .pcov
+                    .iter()
+                    .flatten()
+                    .zip(explicit.pcov.iter().flatten())
+                {
+                    assert!((got - want).abs() < 1e-7);
+                }
+                assert_eq!(selected.ls_result.fun.len(), 4);
+                assert_eq!(
+                    selected.ls_result.jac.is_sparse(),
+                    !analytic || matches!(sigma, CurveFitSigma::StandardDeviations(_))
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn nan_policies_validate_inputs_without_silently_dropping_infinities() {
+    let base = CurveFitOptions {
+        p0: Some(vec![0.0]),
+        ..CurveFitOptions::default()
+    };
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let model = |_: f64, _: &[f64]| -> f64 { panic!("validate before model evaluation") };
+        assert!(matches!(
+            curve_fit(model, &[0.0, bad, 2.0], &[1.0, 2.0, 3.0], base.clone()),
+            Err(OptError::NonFiniteInput { .. })
+        ));
+        assert!(matches!(
+            curve_fit(model, &[0.0, 1.0, 2.0], &[1.0, bad, 3.0], base.clone()),
+            Err(OptError::NonFiniteInput { .. })
+        ));
+    }
+    for nan_policy in [CurveFitNanPolicy::Raise, CurveFitNanPolicy::Omit] {
+        let options = CurveFitOptions {
+            nan_policy: Some(nan_policy),
+            ..base.clone()
+        };
+        // An explicit NaN policy disables the default finite-input check, as
+        // in SciPy. Infinity is still an observation, not missing data.
+        let fit = curve_fit(
+            |_, p| p[0],
+            &[0.0, f64::INFINITY, 2.0],
+            &[1.0, 20.0, 3.0],
+            options.clone(),
+        )
+        .unwrap();
+        assert!((fit.popt[0] - 8.0).abs() < 1e-6);
+        assert_eq!(fit.ls_result.fun.len(), 3);
+        assert!(
+            curve_fit(
+                |_, p| p[0],
+                &[0.0, 1.0, 2.0],
+                &[1.0, f64::INFINITY, 3.0],
+                options.clone()
+            )
+            .is_err()
+        );
+        assert!(
+            curve_fit(
+                |_, p| p[0],
+                &[0.0, f64::NAN, 2.0],
+                &[1.0, 2.0, 3.0],
+                CurveFitOptions {
+                    check_finite: Some(true),
+                    ..options
+                }
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        curve_fit(
+            |_, p| p[0],
+            &[f64::NAN],
+            &[1.0],
+            CurveFitOptions {
+                nan_policy: Some(CurveFitNanPolicy::Raise),
+                ..base.clone()
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        curve_fit(
+            |_, p| p[0],
+            &[f64::NAN],
+            &[1.0],
+            CurveFitOptions {
+                nan_policy: Some(CurveFitNanPolicy::Omit),
+                ..base.clone()
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        curve_fit(
+            |_, p| p[0],
+            &[0.0, f64::NAN],
+            &[1.0],
+            CurveFitOptions {
+                nan_policy: Some(CurveFitNanPolicy::Omit),
+                ..base.clone()
+            }
+        )
+        .is_err()
+    );
+    // Disabling the finite check is explicit; model-independent NaNs in x
+    // remain present when no omission policy was requested.
+    let fit = curve_fit(
+        |_, p| p[0],
+        &[0.0, f64::NAN, 2.0],
+        &[1.0, 20.0, 3.0],
+        CurveFitOptions {
+            check_finite: Some(false),
+            ..base
+        },
+    )
+    .unwrap();
+    assert!((fit.popt[0] - 8.0).abs() < 1e-6);
+}
+
+#[test]
+fn nan_omission_validates_original_weight_and_jacobian_shapes() {
+    let xdata = [0.0, 1.0, 2.0];
+    let ydata = [1.0, f64::NAN, 3.0];
+    let base = CurveFitOptions {
+        p0: Some(vec![0.0]),
+        nan_policy: Some(CurveFitNanPolicy::Omit),
+        ..CurveFitOptions::default()
+    };
+    for sigma in [
+        CurveFitSigma::StandardDeviations(vec![1.0, 2.0]),
+        CurveFitSigma::Covariance(vec![vec![1.0, 0.0], vec![0.0, 1.0]]),
+        CurveFitSigma::Covariance(vec![vec![1.0, 0.0, 0.0], vec![], vec![0.0, 0.0, 1.0]]),
+    ] {
+        assert!(
+            curve_fit(
+                |_, _| panic!("invalid original sigma shape"),
+                &xdata,
+                &ydata,
+                CurveFitOptions {
+                    sigma: Some(sigma),
+                    ..base.clone()
+                }
+            )
+            .is_err()
+        );
+    }
+    // A callback with the already-filtered number of rows is ambiguous and
+    // must not be mistaken for the documented original-grid Jacobian.
+    assert!(
+        curve_fit(
+            |_, p| p[0],
+            &xdata,
+            &ydata,
+            CurveFitOptions {
+                ls_options: LeastSquaresOptions {
+                    jac: Some(LeastSquaresJacobian::new(|_| vec![vec![1.0]; 2])),
+                    ..LeastSquaresOptions::default()
+                },
+                ..base.clone()
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        curve_fit(
+            |_, p| p[0],
+            &xdata,
+            &ydata,
+            CurveFitOptions {
+                ls_options: LeastSquaresOptions {
+                    method: Some(LeastSquaresMethod::Trf),
+                    jac_sparsity: Some(JacobianSparsity::from_rows(vec![vec![0]; 2], 1).unwrap()),
+                    ..LeastSquaresOptions::default()
+                },
+                ..base
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn nan_omission_batches_apply_each_rows_mask_with_active_bounds() {
+    let xdata = [0.0, f64::NAN, 2.0, 3.0, 4.0, 5.0];
+    let rows: Vec<Vec<f64>> = (0..12)
+        .map(|i| {
+            let mut row = vec![1.0, 500.0, 2.0, 4.0, 10.0 + i as f64, 7.0];
+            row[if i % 2 == 0 { 3 } else { 5 }] = f64::NAN;
+            row
+        })
+        .collect();
+    let covariance: Vec<Vec<f64>> = (0_i32..6)
+        .map(|i| (0_i32..6).map(|j| 0.5_f64.powi((i - j).abs())).collect())
+        .collect();
+    for sigma in [
+        CurveFitSigma::StandardDeviations(vec![1.0; 6]),
+        CurveFitSigma::Covariance(covariance),
+    ] {
+        let options = CurveFitOptions {
+            p0: Some(vec![1.0]),
+            sigma: Some(sigma),
+            nan_policy: Some(CurveFitNanPolicy::Omit),
+            ls_options: LeastSquaresOptions {
+                method: Some(LeastSquaresMethod::Trf),
+                jac: Some(LeastSquaresJacobian::new(|_| vec![vec![1.0]; 6])),
+                ..LeastSquaresOptions::default()
+            },
+            ..CurveFitOptions::default()
+        };
+        for bounded in [false, true] {
+            let batch = if bounded {
+                curve_fit_bounded_many(|_, p| p[0], &xdata, &rows, &[0.0], &[1.5], options.clone())
+            } else {
+                curve_fit_many(|_, p| p[0], &xdata, &rows, options.clone())
+            }
+            .unwrap();
+            for (row, parameters) in rows.iter().zip(batch) {
+                let fit = if bounded {
+                    curve_fit_bounded(|_, p| p[0], &xdata, row, &[0.0], &[1.5], options.clone())
+                } else {
+                    curve_fit(|_, p| p[0], &xdata, row, options.clone())
+                }
+                .unwrap();
+                assert_eq!(parameters[0].to_bits(), fit.popt[0].to_bits());
+                assert_eq!(fit.ls_result.fun.len(), 4);
+                if bounded {
+                    assert!((fit.popt[0] - 1.5).abs() < 1e-7);
+                    assert_eq!(fit.ls_result.active_mask, [1]);
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -62,6 +459,7 @@ fn sparse_curve_fit_preserves_whitening_and_covariance() {
                     ftol: 1e-12,
                     ..LeastSquaresOptions::default()
                 },
+                ..CurveFitOptions::default()
             };
             let model = |x: f64, p: &[f64]| p[x as usize];
             let dense = curve_fit(model, &xdata, &ydata, options.clone()).unwrap();
@@ -113,6 +511,7 @@ fn constant_options(
             ftol: 1e-12,
             ..LeastSquaresOptions::default()
         },
+        ..CurveFitOptions::default()
     }
 }
 
@@ -696,6 +1095,7 @@ fn diff_opt_curve_fit_measurement_uncertainty() {
                 diff_step: case.diff_step,
                 ..LeastSquaresOptions::default()
             },
+            ..CurveFitOptions::default()
         };
         let model = |x: f64, p: &[f64]| {
             if robust {
