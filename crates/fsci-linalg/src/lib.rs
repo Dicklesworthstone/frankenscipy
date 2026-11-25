@@ -12338,11 +12338,14 @@ fn matrix_one_norm(m: &DMatrix<f64>) -> f64 {
 ///
 /// Matches `scipy.linalg.logm(A)`.
 ///
-/// Computes logm via eigendecomposition: if A = V D V^{-1}, then
-/// logm(A) = V diag(log(d_i)) V^{-1}.
+/// Exactly symmetric positive-definite matrices use an eigendecomposition. General
+/// matrices use the Schur form and inverse scaling and squaring, including all terms
+/// required by repeated eigenvalues and non-diagonalizable Jordan blocks.
+/// Exactly singular inputs follow SciPy's triangular-diagonal regularization to `1e-20`.
 ///
-/// Requires all eigenvalues to be positive real: the result type is real, so a logarithm
-/// SciPy returns as COMPLEX (a negative real eigenvalue) cannot be represented here. Use
+/// A genuinely complex principal logarithm is returned as a matrix of NaNs because
+/// this API's result type is real. Real logarithms with complex-conjugate eigenvalues
+/// are supported. Use
 /// [`complex::logm_real`], which returns SciPy's real-or-complex result
 /// (`logm(diag(-1, 1)) = diag(iπ, 0)`) by SciPy's algorithm, or [`complex::logm`] for complex
 /// input.
@@ -12361,16 +12364,13 @@ pub fn logm(a: &[Vec<f64>], options: DecompOptions) -> Result<Vec<Vec<f64>>, Lin
     let matrix = dmatrix_from_rows(a)?;
     let n = rows;
 
-    // Check if the matrix is symmetric
-    let is_symmetric = (0..n).all(|i| {
-        (0..n).all(|j| {
-            (matrix[(i, j)] - matrix[(j, i)]).abs() < 1e-12 * matrix[(i, j)].abs().max(1.0)
-        })
-    });
+    // The symmetric solver reads only one triangle. An approximate comparison
+    // silently changes A, and an absolute floor loses entire small matrices.
+    let is_symmetric = (0..n).all(|i| (0..i).all(|j| matrix[(i, j)] == matrix[(j, i)]));
 
     if !is_symmetric {
         // Non-symmetric: use general Schur-based path
-        return logm_general(&matrix, n, options);
+        return logm_general(a, options);
     }
 
     // Symmetric matrix: use eigendecomposition (symmetric_eigen is safe here)
@@ -12388,7 +12388,7 @@ pub fn logm(a: &[Vec<f64>], options: DecompOptions) -> Result<Vec<Vec<f64>>, Lin
                 warning: Some(format!("non-positive eigenvalue {ev} at index {i}")),
                 error: None,
             });
-            return logm_general(&matrix, n, options);
+            return logm_general(a, options);
         }
     }
 
@@ -12649,24 +12649,14 @@ pub fn funm_with_error(
     Ok((rows_from_dmatrix(&f), err))
 }
 
-/// General logm for non-symmetric matrices. A real spectrum (no 2×2 Schur
-/// blocks) uses the real scalar Parlett recurrence, which carries the Jordan
-/// first-derivative limit for repeated eigenvalues; a complex spectrum uses the
-/// complex Schur–Parlett evaluator, which (unlike the old real-diagonal scalar
-/// path) is correct across the 2×2 blocks.
-fn logm_general(
-    matrix: &DMatrix<f64>,
-    n: usize,
-    options: DecompOptions,
-) -> Result<Vec<Vec<f64>>, LinalgError> {
-    let schur = bounded_schur(matrix.clone())?;
-    let (q, t) = schur.unpack();
-
-    let has_complex_block = (0..n.saturating_sub(1)).any(|i| t[(i + 1, i)].abs() > 1e-300);
-    let result = if has_complex_block {
-        schur_parlett_complex(&q, &t, n, |z| z.ln())
-    } else {
-        logm_real_triangular(&q, &t, n)
+/// General logarithm through the shared Schur / inverse-scaling-and-squaring
+/// kernel. A scalar Parlett recurrence with only a first-derivative fallback
+/// cannot compute higher superdiagonals of a repeated-eigenvalue block.
+fn logm_general(a: &[Vec<f64>], options: DecompOptions) -> Result<Vec<Vec<f64>>, LinalgError> {
+    let n = a.len();
+    let result = match complex::logm_real(a, options)? {
+        complex::MaybeComplexMatrix::Real(result) => result,
+        complex::MaybeComplexMatrix::Complex(_) => vec![vec![f64::NAN; n]; n],
     };
 
     emit_trace(LinalgTrace {
@@ -12678,66 +12668,21 @@ fn logm_general(
         error: None,
     });
 
-    Ok(rows_from_dmatrix(&result))
-}
-
-/// Real scalar Parlett recurrence for `log` of an upper-triangular real Schur
-/// factor with an all-real spectrum (no 2×2 blocks). Repeated diagonal entries
-/// fall back to the Jordan first-derivative limit `f[i,j] ≈ n[i,j] / λ`.
-fn logm_real_triangular(q: &DMatrix<f64>, t: &DMatrix<f64>, n: usize) -> DMatrix<f64> {
-    let mut log_t = DMatrix::<f64>::zeros(n, n);
-    for i in 0..n {
-        log_t[(i, i)] = if t[(i, i)] > 0.0 {
-            t[(i, i)].ln()
-        } else {
-            f64::NAN
-        };
-    }
-
-    for j in 1..n {
-        for i in (0..j).rev() {
-            let tii = t[(i, i)];
-            let tjj = t[(j, j)];
-            let di = log_t[(i, i)];
-            let dj = log_t[(j, j)];
-            let mut correction = 0.0;
-            for k in (i + 1)..j {
-                correction += t[(i, k)] * log_t[(k, j)] - log_t[(i, k)] * t[(k, j)];
-            }
-            let eigen_gap = tjj - tii;
-            if eigen_gap.abs() > f64::EPSILON * tii.abs().max(tjj.abs()).max(1.0) {
-                let numerator = t[(i, j)] * (dj - di) + correction;
-                let val = numerator / eigen_gap;
-                log_t[(i, j)] = if val.is_finite() { val } else { f64::NAN };
-            } else {
-                let mut jordan_sum = t[(i, j)];
-                for k in (i + 1)..j {
-                    jordan_sum += t[(i, k)] * log_t[(k, j)] - log_t[(i, k)] * t[(k, j)];
-                }
-                if tii.abs() > f64::EPSILON {
-                    let val = jordan_sum / tii;
-                    log_t[(i, j)] = if val.is_finite() { val } else { f64::NAN };
-                } else {
-                    log_t[(i, j)] = f64::NAN;
-                }
-            }
-        }
-    }
-
-    q * log_t * q.transpose()
+    Ok(result)
 }
 
 /// Matrix square root: the real `X` with `X·X = A` that `scipy.linalg.sqrtm(A)` returns when
 /// no eigenvalue of `A` lies on the negative real axis.
 ///
-/// Symmetric input (to 1e-12 relative) uses the eigendecomposition `A = V·diag(d)·Vᵀ`,
+/// Exactly symmetric input uses the eigendecomposition `A = V·diag(d)·Vᵀ`,
 /// `X = V·diag(√d)·Vᵀ`. Any other input uses the real Schur form `A = Q·T·Qᵀ` and the
-/// Björck–Hammarling recurrence for `√T`, or the complex Schur–Parlett evaluator when `T` has
-/// 2×2 blocks (complex-conjugate eigenvalue pairs). SciPy uses the blocked Schur method of
+/// Björck–Hammarling recurrence after converting any 2×2 Schur blocks to complex
+/// triangular form. SciPy uses the blocked Schur method of
 /// Deadman–Higham–Ralha, so results can differ in the last digits.
 ///
 /// Where SciPy returns a COMPLEX square root (a negative eigenvalue), this returns NaN: the
-/// whole matrix on the symmetric path, the affected entries on the Schur path. Use
+/// whole matrix. A singular block without a primary square root produces non-finite
+/// entries. Use
 /// [`complex::sqrtm_real`], which returns SciPy's real-or-complex result
 /// (`sqrtm(diag(-4, 1)) = diag(2i, 1)`), or [`complex::sqrtm`] for complex input.
 pub fn sqrtm(a: &[Vec<f64>], options: DecompOptions) -> Result<Vec<Vec<f64>>, LinalgError> {
@@ -12755,51 +12700,15 @@ pub fn sqrtm(a: &[Vec<f64>], options: DecompOptions) -> Result<Vec<Vec<f64>>, Li
     let matrix = dmatrix_from_rows(a)?;
     let n = rows;
 
-    // Check symmetry before using symmetric eigendecomposition
-    let is_symmetric = (0..n).all(|i| {
-        (0..n).all(|j| {
-            (matrix[(i, j)] - matrix[(j, i)]).abs() < 1e-12 * matrix[(i, j)].abs().max(1.0)
-        })
-    });
+    let is_symmetric = (0..n).all(|i| (0..i).all(|j| matrix[(i, j)] == matrix[(j, i)]));
 
     if !is_symmetric {
-        // Non-symmetric: sqrtm via Schur decomposition, A = Q T Q^T,
-        // sqrt(A) = Q sqrt(T) Q^T. A complex spectrum (2×2 Schur blocks) needs the
-        // complex Schur–Parlett evaluator — the real-diagonal scalar Parlett below
-        // is wrong across those blocks. An all-real spectrum keeps the real path
-        // (and its negative-eigenvalue NaN behavior).
-        let schur = bounded_schur(matrix.clone())?;
-        let (q, t) = schur.unpack();
-        let has_complex_block = (0..n.saturating_sub(1)).any(|i| t[(i + 1, i)].abs() > 1e-300);
-        let result = if has_complex_block {
-            schur_parlett_complex(&q, &t, n, |z| z.sqrt())
-        } else {
-            let mut sqrt_t = DMatrix::<f64>::zeros(n, n);
-            for i in 0..n {
-                if t[(i, i)] >= -1e-14 {
-                    sqrt_t[(i, i)] = t[(i, i)].max(0.0).sqrt();
-                } else {
-                    sqrt_t[(i, i)] = f64::NAN;
-                }
-            }
-            // Off-diagonal: Parlett recurrence for sqrt
-            for j in 1..n {
-                for i in (0..j).rev() {
-                    let si = sqrt_t[(i, i)];
-                    let sj = sqrt_t[(j, j)];
-                    let mut sum = t[(i, j)];
-                    for k in (i + 1)..j {
-                        sum -= sqrt_t[(i, k)] * sqrt_t[(k, j)];
-                    }
-                    let denom = si + sj;
-                    sqrt_t[(i, j)] = if denom.abs() > 1e-15 {
-                        sum / denom
-                    } else {
-                        0.0
-                    };
-                }
-            }
-            &q * sqrt_t * q.transpose()
+        // Share the triangular square-root recurrence with the complex API.
+        // Its exact-zero denominator check also distinguishes a singular block
+        // with no primary root from a perfectly valid small-scale matrix.
+        let result = match complex::sqrtm_real(a, options)? {
+            complex::MaybeComplexMatrix::Real(result) => result,
+            complex::MaybeComplexMatrix::Complex(_) => vec![vec![f64::NAN; n]; n],
         };
         emit_trace(LinalgTrace {
             operation: "sqrtm",
@@ -12809,7 +12718,7 @@ pub fn sqrtm(a: &[Vec<f64>], options: DecompOptions) -> Result<Vec<Vec<f64>>, Li
             warning: Some("used general (non-symmetric) Schur path".to_string()),
             error: None,
         });
-        return Ok(rows_from_dmatrix(&result));
+        return Ok(result);
     }
 
     // Symmetric path: eigendecomposition is safe here
@@ -12817,13 +12726,13 @@ pub fn sqrtm(a: &[Vec<f64>], options: DecompOptions) -> Result<Vec<Vec<f64>>, Li
     let eigenvalues = &eig.eigenvalues;
 
     // Check eigenvalues are non-negative
-    let all_nonneg = eigenvalues.iter().all(|&ev| ev >= -1e-14);
+    let all_nonneg = eigenvalues.iter().all(|&ev| ev >= 0.0);
 
     if all_nonneg {
         let v = &eig.eigenvectors;
         let mut sqrt_diag = DMatrix::<f64>::zeros(n, n);
         for i in 0..n {
-            sqrt_diag[(i, i)] = eigenvalues[i].max(0.0).sqrt();
+            sqrt_diag[(i, i)] = eigenvalues[i].sqrt();
         }
         let result = v * sqrt_diag * v.transpose();
 
@@ -42509,6 +42418,93 @@ mod tests {
         let result = logm(&a, DecompOptions::default()).expect("logm works");
         let expected = vec![vec![2.0_f64.ln(), 0.5], vec![0.0, 2.0_f64.ln()]];
         assert_close_matrix(&result, &expected, 1e-12, 1e-12);
+    }
+
+    #[test]
+    fn matrix_functions_logm_repeated_eigenvalues_include_higher_powers() {
+        // N^4 = 0, so log(I + N) = N - N^2 / 2 + N^3 / 3 exactly.
+        // A first-derivative-only confluent recurrence loses the last two terms.
+        let jordan = vec![
+            vec![1.0, 1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![0.0, 0.0, 0.0, 1.0],
+        ];
+        let expected = vec![
+            vec![0.0, 1.0, -0.5, 1.0 / 3.0],
+            vec![0.0, 0.0, 1.0, -0.5],
+            vec![0.0, 0.0, 0.0, 1.0],
+            vec![0.0, 0.0, 0.0, 0.0],
+        ];
+        let q = DMatrix::from_row_slice(
+            4,
+            4,
+            &[
+                0.5, 0.5, 0.5, 0.5, 0.5, -0.5, 0.5, -0.5, 0.5, 0.5, -0.5, -0.5, 0.5, -0.5, -0.5,
+                0.5,
+            ],
+        );
+        let dense = rows_from_dmatrix(&(&q * dmatrix_from_rows(&jordan).unwrap() * q.transpose()));
+        let dense_expected =
+            rows_from_dmatrix(&(&q * dmatrix_from_rows(&expected).unwrap() * q.transpose()));
+        for (a, expected) in [(&jordan, &expected), (&dense, &dense_expected)] {
+            let result = logm(a, DecompOptions::default()).expect("Jordan logarithm");
+            assert_close_matrix(&result, expected, 2e-12, 2e-12);
+            let recovered = expm(&result, DecompOptions::default()).unwrap();
+            assert_close_matrix(&recovered, a, 2e-12, 2e-12);
+        }
+    }
+
+    #[test]
+    fn matrix_functions_preserve_scaled_nonsymmetric_inputs() {
+        for scale in [1e-40_f64, 1e-20, 1.0, 1e20, 1e40] {
+            let a = vec![vec![scale, scale], vec![0.0, 4.0 * scale]];
+            let log = logm(&a, DecompOptions::default()).expect("scaled logarithm");
+            let expected_log = vec![
+                vec![scale.ln(), 4.0_f64.ln() / 3.0],
+                vec![0.0, (4.0 * scale).ln()],
+            ];
+            assert_close_matrix(&log, &expected_log, 2e-12, 2e-12);
+            let root = sqrtm(&a, DecompOptions::default()).expect("scaled square root");
+            // Normalize first: an absolute tolerance would accept a zero answer
+            // for the small matrices and miss precisely the original defect.
+            let normalized: Vec<Vec<f64>> = root
+                .iter()
+                .map(|row| row.iter().map(|value| value / scale.sqrt()).collect())
+                .collect();
+            assert_close_matrix(
+                &normalized,
+                &[vec![1.0, 1.0 / 3.0], vec![0.0, 2.0]],
+                2e-12,
+                2e-12,
+            );
+        }
+    }
+
+    #[test]
+    fn matrix_functions_sqrtm_preserves_negative_and_singular_spectra() {
+        for scale in [1e-40_f64, 1.0, 1e40] {
+            let negative = vec![vec![-scale, 0.0], vec![0.0, scale]];
+            let root = sqrtm(&negative, DecompOptions::default()).unwrap();
+            assert!(root[0][0].is_nan(), "negative eigenvalue at scale {scale}");
+        }
+        // A nonzero 2x2 nilpotent Jordan block has no square root. Returning
+        // the zero matrix silently invents a solution of X^2 = A.
+        let singular = vec![vec![0.0, 1.0], vec![0.0, 0.0]];
+        let root = sqrtm(&singular, DecompOptions::default()).unwrap();
+        assert!(root.iter().flatten().any(|value| !value.is_finite()));
+    }
+
+    #[test]
+    fn matrix_functions_logm_regularizes_singular_diagonal() {
+        let result = logm(&[vec![0.0, 0.0], vec![0.0, 4.0]], DecompOptions::default())
+            .expect("SciPy regularizes exactly zero triangular eigenvalues");
+        assert_close_matrix(
+            &result,
+            &[vec![1e-20_f64.ln(), 0.0], vec![0.0, 4.0_f64.ln()]],
+            1e-12,
+            1e-12,
+        );
     }
 
     #[test]

@@ -2297,7 +2297,10 @@ fn sqrtm_triu(t: &DMatrix<C64>) -> DMatrix<C64> {
             let denom = r[(i, i)] + r[(j, j)];
             let num = t[(i, j)] - s;
             r[(i, j)] = if denom != CZERO {
-                num / denom
+                // The textbook complex quotient squares the denominator and
+                // multiplies the numerator by it. Those intermediates can
+                // underflow or overflow even when the square root is finite.
+                zladiv(num, denom)
             } else if num == CZERO {
                 CZERO
             } else {
@@ -2396,7 +2399,7 @@ fn briggs_helper(a: C64, k: u32) -> C64 {
                 a = a.sqrt();
                 r *= CONE + a;
             }
-            z0 / r
+            zladiv(z0, r)
         }
     }
 }
@@ -2406,9 +2409,9 @@ fn fractional_power_superdiag_entry(l1: C64, l2: C64, t12: C64, p: f64) -> C64 {
     if l1 == l2 {
         t12 * p * l1.powf(p - 1.0)
     } else if (l2 - l1).norm() > (l1 + l2).norm() / 2.0 {
-        t12 * (l2.powf(p) - l1.powf(p)) / (l2 - l1)
+        zladiv(t12 * (l2.powf(p) - l1.powf(p)), l2 - l1)
     } else {
-        let z = (l2 - l1) / (l2 + l1);
+        let z = zladiv(l2 - l1, l2 + l1);
         let log_l1 = l1.ln();
         let log_l2 = l2.ln();
         let arctanh_z = z.atanh();
@@ -2419,7 +2422,7 @@ fn fractional_power_superdiag_entry(l1: C64, l2: C64, t12: C64, p: f64) -> C64 {
         } else {
             arctanh_z * p
         };
-        let tmp_c = tmp_b.sinh() * 2.0 / (l2 - l1);
+        let tmp_c = zladiv(tmp_b.sinh() * 2.0, l2 - l1);
         tmp_a * tmp_c
     }
 }
@@ -2427,16 +2430,19 @@ fn fractional_power_superdiag_entry(l1: C64, l2: C64, t12: C64, p: f64) -> C64 {
 /// SciPy `_logm_superdiag_entry` (Higham 2008, Eq. 11.28, modified).
 fn logm_superdiag_entry(l1: C64, l2: C64, t12: C64) -> C64 {
     if l1 == l2 {
-        t12 / l1
+        zladiv(t12, l1)
     } else if (l2 - l1).norm() > (l1 + l2).norm() / 2.0 {
-        t12 * (l2.ln() - l1.ln()) / (l2 - l1)
+        zladiv(t12 * (l2.ln() - l1.ln()), l2 - l1)
     } else {
-        let z = (l2 - l1) / (l2 + l1);
+        let z = zladiv(l2 - l1, l2 + l1);
         let u = unwindk(l2.ln() - l1.ln());
         if u != 0.0 {
-            t12 * 2.0 * (z.atanh() + Complex::new(0.0, std::f64::consts::PI * u)) / (l2 - l1)
+            zladiv(
+                t12 * 2.0 * (z.atanh() + Complex::new(0.0, std::f64::consts::PI * u)),
+                l2 - l1,
+            )
         } else {
-            t12 * 2.0 * z.atanh() / (l2 - l1)
+            zladiv(t12 * 2.0 * z.atanh(), l2 - l1)
         }
     }
 }
@@ -3110,6 +3116,59 @@ mod tests {
             panic!("expected a real result")
         };
         assert_eq!(rr, vec![vec![0.0, f64::INFINITY], vec![0.0, 0.0]]);
+    }
+
+    #[test]
+    fn sqrtm_triangular_extreme_scales() {
+        // For T = [[a, 1], [0, b]], sqrt(T)[0, 1] = 1/(sqrt(a)+sqrt(b)).
+        // Normalize by sqrt(scale): an absolute tolerance would silently accept
+        // a lost off-diagonal at the small scales.
+        for scale in [1e-250_f64, 1e-220, 1.0, 1e220, 1e250] {
+            for (a, b) in [(1.0_f64, 1.0_f64), (1.0, 4.0), (4.0, 9.0)] {
+                let input = to_complex(&[vec![scale * a, scale], vec![0.0, scale * b]]);
+                let result = sqrtm(&input, opts()).unwrap();
+                let expected = [[a.sqrt(), 1.0 / (a.sqrt() + b.sqrt())], [0.0, b.sqrt()]];
+                for i in 0..2 {
+                    for j in 0..2 {
+                        let normalized = result[i][j] / scale.sqrt();
+                        assert!(
+                            is_finite(normalized)
+                                && (normalized - c(expected[i][j], 0.0)).norm() < 5e-14,
+                            "sqrtm scale={scale}, diagonal=({a},{b}), [{i},{j}]={normalized:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn logm_triangular_extreme_scales() {
+        // The divided difference of log is independent of the common scale:
+        // log(scale*T)[0, 1] = (log(b)-log(a))/(b-a), with limit 1/a at a=b.
+        // Equal, separated, and close eigenvalues exercise all three branches
+        // of the superdiagonal correction after inverse scaling and squaring.
+        for scale in [1e-250_f64, 1e-220, 1.0, 1e220, 1e250] {
+            for (a, b) in [(1.0_f64, 1.0_f64), (1.0, 4.0), (4.0, 9.0)] {
+                let input = to_complex(&[vec![scale * a, scale], vec![0.0, scale * b]]);
+                let result = logm(&input, opts()).unwrap();
+                let superdiag = if a == b {
+                    1.0 / a
+                } else {
+                    (b.ln() - a.ln()) / (b - a)
+                };
+                let expected = [[scale.ln() + a.ln(), superdiag], [0.0, scale.ln() + b.ln()]];
+                for i in 0..2 {
+                    for j in 0..2 {
+                        let value = result[i][j];
+                        assert!(
+                            is_finite(value) && (value - c(expected[i][j], 0.0)).norm() < 2e-12,
+                            "logm scale={scale}, diagonal=({a},{b}), [{i},{j}]={value:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -417,6 +417,118 @@ fn diff_linalg_matrix_functions() {
 }
 
 #[test]
+fn diff_linalg_logm_sqrtm_jordan_and_scaling() {
+    let mut points = Vec::new();
+    let mut scales = HashMap::new();
+    for scale in [1e-40_f64, 1e-20, 1.0, 1e20, 1e40] {
+        for (orientation, a) in [
+            ("upper", vec![vec![scale, scale], vec![0.0, 4.0 * scale]]),
+            ("lower", vec![vec![scale, 0.0], vec![scale, 4.0 * scale]]),
+        ] {
+            let case_id = format!("scaled_{orientation}_{scale:e}");
+            scales.insert(case_id.clone(), scale);
+            points.push(PointCase {
+                case_id,
+                a,
+                fns: vec!["logm".into(), "sqrtm".into()],
+            });
+        }
+    }
+    let jordan = vec![
+        vec![1.0, 1.0, 0.0, 0.0],
+        vec![0.0, 1.0, 1.0, 0.0],
+        vec![0.0, 0.0, 1.0, 1.0],
+        vec![0.0, 0.0, 0.0, 1.0],
+    ];
+    // Orthogonal similarity by the 4x4 Hadamard matrix divided by two.
+    // This exercises the Schur path with the same repeated spectrum.
+    let q = [
+        [0.5, 0.5, 0.5, 0.5],
+        [0.5, -0.5, 0.5, -0.5],
+        [0.5, 0.5, -0.5, -0.5],
+        [0.5, -0.5, -0.5, 0.5],
+    ];
+    let dense: Vec<Vec<f64>> = (0..4)
+        .map(|i| {
+            (0..4)
+                .map(|j| {
+                    (0..4)
+                        .map(|k| {
+                            (0..4)
+                                .map(|l| q[i][k] * jordan[k][l] * q[j][l])
+                                .sum::<f64>()
+                        })
+                        .sum()
+                })
+                .collect()
+        })
+        .collect();
+    for (name, a) in [("jordan_4x4", jordan), ("dense_jordan_4x4", dense)] {
+        scales.insert(name.to_string(), 1.0);
+        points.push(PointCase {
+            case_id: name.to_string(),
+            a,
+            fns: vec!["logm".into(), "sqrtm".into()],
+        });
+    }
+    let query = OracleQuery {
+        points,
+        frechet: Vec::new(),
+    };
+    let Some(oracle) = scipy_oracle_or_skip(&query) else {
+        return;
+    };
+    let captured: HashMap<_, _> = oracle
+        .points
+        .into_iter()
+        .filter_map(|arm| {
+            arm.matrix
+                .map(|matrix| ((arm.case_id, arm.fn_name), matrix))
+        })
+        .collect();
+    let mut ledger = CompareLedger::new(
+        "diff_linalg_logm_sqrtm_jordan_and_scaling",
+        &["logm", "sqrtm"],
+    );
+    for case in &query.points {
+        for name in &case.fns {
+            let Some((expected, actual)) = ledger.both(
+                name,
+                &case.case_id,
+                captured.get(&(case.case_id.clone(), name.clone())),
+                dispatch_fn(name, &case.a),
+            ) else {
+                continue;
+            };
+            let normalization = if name == "sqrtm" {
+                scales[&case.case_id].sqrt()
+            } else {
+                1.0
+            };
+            let shape_ok = actual.len() == expected.len()
+                && actual.iter().zip(expected).all(|(a, b)| a.len() == b.len());
+            let pass = shape_ok
+                && actual
+                    .iter()
+                    .flatten()
+                    .zip(expected.iter().flatten())
+                    .all(|(a, b)| {
+                        let a = a / normalization;
+                        let b = b / normalization;
+                        a.is_finite() && b.is_finite() && (a - b).abs() <= 5e-12 * b.abs().max(1.0)
+                    });
+            ledger.compared(name, &case.case_id, pass);
+            assert!(
+                pass,
+                "{} {name}: actual={actual:?}, SciPy={expected:?}",
+                case.case_id
+            );
+        }
+    }
+    ledger.finish(query.points.len());
+}
+
+#[test]
 fn diff_linalg_expm_frechet_direction_scaling() {
     let mut cases = Vec::new();
     for (name, a) in [

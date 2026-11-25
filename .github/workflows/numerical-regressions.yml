@@ -21,6 +21,7 @@ on:
       - "crates/fsci-conformance/tests/diff_stats_truncnorm.rs"
       - "crates/fsci-conformance/tests/diff_integrate.rs"
       - "crates/fsci-conformance/tests/diff_integrate_monte_carlo_qmc_quad.rs"
+      - "crates/fsci-conformance/tests/diff_linalg_matrix_functions.rs"
       - ".github/workflows/numerical-regressions.yml"
   workflow_dispatch:
 
@@ -46,7 +47,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [least-squares, global-optimization, sparse-lsmr, distribution-fit, image-rotation, resampling, fft-capture, casp, quadrature, boundary-value, interpolation, signal-state]
+        lane: [least-squares, global-optimization, sparse-lsmr, distribution-fit, matrix-functions, image-rotation, resampling, fft-capture, casp, quadrature, boundary-value, interpolation, signal-state]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -136,6 +137,12 @@ jobs:
               cargo test --locked -p fsci-stats --lib discrete_likelihood_fits -- --nocapture
               cargo test --locked -p fsci-stats --lib randint_fitted_extreme_signed_intervals -- --nocapture
               cargo test --locked -p fsci-stats --test mle_scipy -- --nocapture
+              ;;
+            matrix-functions)
+              cargo test --locked -p fsci-linalg --lib matrix_functions_ -- --nocapture
+              cargo test --locked -p fsci-linalg --lib logm -- --nocapture
+              cargo test --locked -p fsci-linalg --lib sqrtm -- --nocapture
+              cargo test --locked -p fsci-conformance --no-default-features --test diff_linalg_matrix_functions -- --nocapture
               ;;
             image-rotation)
               cargo test --locked -p fsci-special --lib degree_trig_preserves_scipy_cosine_rounding -- --nocapture
