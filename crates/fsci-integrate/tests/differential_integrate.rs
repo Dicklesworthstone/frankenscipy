@@ -912,6 +912,8 @@ integral('gaussian', lambda x: np.exp(-x*x), -np.inf, np.inf)
 for name, f, a, b, step in [
     ('finite_series', lambda x: x*x, -2., 2., 0.5),
     ('infinite_series', lambda x: 1/(x*x), 1., np.inf, 1.),
+    ('left_series', lambda x: np.exp(x-3.25), -np.inf, 3.25, 0.5),
+    ('bilateral_series', lambda x: np.exp(-(x-0.25)**2), -np.inf, np.inf, 0.75),
 ]:
     result = nsum(f, a, b, step=step, tolerances={'atol': 0., 'rtol': 1e-11})
     print(name, float(result.sum), int(result.success), float(result.error))
@@ -977,11 +979,24 @@ for name, f, a, b, step in [
                 1e-12,
                 10,
             ),
-            "finite_series" | "infinite_series" => {
-                let sum = if fields[0] == "finite_series" {
-                    nsum(|x| x * x, -2.0, 2.0, 0.5, 0.0, 1e-11)
-                } else {
-                    nsum(|x| 1.0 / (x * x), 1.0, f64::INFINITY, 1.0, 0.0, 1e-11)
+            name if name.ends_with("_series") => {
+                let sum = match name {
+                    "finite_series" => nsum(|x| x * x, -2.0, 2.0, 0.5, 0.0, 1e-11),
+                    "infinite_series" => {
+                        nsum(|x| 1.0 / (x * x), 1.0, f64::INFINITY, 1.0, 0.0, 1e-11)
+                    }
+                    "left_series" => {
+                        nsum(|x| (x - 3.25).exp(), f64::NEG_INFINITY, 3.25, 0.5, 0.0, 1e-11)
+                    }
+                    "bilateral_series" => nsum(
+                        |x| (-(x - 0.25).powi(2)).exp(),
+                        f64::NEG_INFINITY,
+                        f64::INFINITY,
+                        0.75,
+                        0.0,
+                        1e-11,
+                    ),
+                    name => panic!("unexpected series: {name}"),
                 };
                 QuadResult {
                     integral: sum.sum,
@@ -1023,7 +1038,7 @@ for name, f, a, b, step in [
         compared += 1;
     }
     assert_eq!(
-        compared, 12,
+        compared, 14,
         "every case must be compared against the live oracle"
     );
 }
