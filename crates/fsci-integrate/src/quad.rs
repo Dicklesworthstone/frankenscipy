@@ -4325,7 +4325,9 @@ pub struct NsumResult {
 /// Evaluate a convergent series `Σ f(n)` for `n = a, a+step, …, b` numerically.
 ///
 /// Matches `scipy.integrate.nsum(f, a, b, step)` for a scalar term function. A
-/// finite range is summed directly. An infinite upper limit is handled by the
+/// finite range is summed directly. A left-infinite range includes the finite
+/// upper endpoint and steps down from it. A bilateral range uses integer
+/// multiples of `step` on either side of zero. Each infinite tail uses the
 /// Euler–Maclaurin formula: the first terms are summed directly and the tail is
 /// replaced by `∫ f dx` (via [`tanhsinh`]) plus the half-term and Bernoulli
 /// derivative corrections. The size of the direct window is grown until the
@@ -4347,9 +4349,11 @@ where
         converged: false,
     };
     if a.is_nan()
+        || b.is_nan()
+        || a == f64::INFINITY
+        || b == f64::NEG_INFINITY
         || !step.is_finite()
         || step <= 0.0
-        || !a.is_finite()
         || !atol.is_finite()
         || !rtol.is_finite()
     {
@@ -4357,6 +4361,35 @@ where
     }
     let atol = if atol > 0.0 { atol } else { 0.0 };
     let rtol = if rtol > 0.0 { rtol } else { 1e-11 };
+
+    if a == f64::NEG_INFINITY {
+        if b.is_finite() {
+            return nsum_right(|x| f(-x), -b, step, atol, rtol);
+        }
+
+        // Sum the two tails independently. Pairing f(x) + f(-x) term by
+        // term could mask failure of either tail through cancellation.
+        let right = nsum_right(&f, 0.0, step, 0.5 * atol, rtol);
+        if !right.sum.is_finite() {
+            return right;
+        }
+        let left = nsum_right(|x| f(-x), step, step, 0.5 * atol, rtol);
+        let sum = right.sum + left.sum;
+        let error = if sum.is_finite() {
+            right.error + left.error
+        } else {
+            f64::INFINITY
+        };
+        return NsumResult {
+            sum,
+            error,
+            nfev: right.nfev + left.nfev,
+            converged: right.converged
+                && left.converged
+                && error.is_finite()
+                && error <= atol + rtol * sum.abs(),
+        };
+    }
 
     // Finite range: direct summation over n = a, a+step, …, ≤ b.
     if b.is_finite() {
@@ -4404,14 +4437,16 @@ where
             converged: sum.is_finite(),
         };
     }
-    if b != f64::INFINITY {
-        return nan; // b is −∞ with a finite ⇒ empty/invalid ordering
-    }
+    nsum_right(f, a, step, atol, rtol)
+}
 
+fn nsum_right<F>(f: F, a: f64, s: f64, atol: f64, rtol: f64) -> NsumResult
+where
+    F: Fn(f64) -> f64,
+{
     // Infinite tail via Euler–Maclaurin with a growing direct window.
     // Σ_{k≥m} f(a+ks) ≈ (1/s)∫_{n_m}^∞ f dx + f(n_m)/2
     //                   − (s/12) f'(n_m) + (s³/720) f'''(n_m)
-    let s = step;
     let mut direct = 0.0;
     let mut nfev = 0usize;
     let mut filled = 0i64; // number of leading terms already in `direct`
@@ -4420,6 +4455,15 @@ where
     let mut m = 8i64;
 
     for _iter in 0..24 {
+        let n_m = a + m as f64 * s;
+        if !n_m.is_finite() || a + s == a {
+            return NsumResult {
+                sum: f64::NAN,
+                error: f64::INFINITY,
+                nfev,
+                converged: false,
+            };
+        }
         // Extend the direct partial sum to the first `m` terms.
         while filled < m {
             direct += f(a + filled as f64 * s);
@@ -4434,11 +4478,21 @@ where
                 };
             }
         }
-        let n_m = a + m as f64 * s;
         let f_nm = f(n_m);
         nfev += 1;
         // Central finite-difference derivatives at n_m.
-        let delta = (1e-3 * n_m.abs()).max(1e-4);
+        // Keep derivative probes inside the summand's domain even when
+        // the first grid point is far from the origin.
+        let span = n_m - a;
+        let delta = (1e-3 * n_m.abs().min(span)).max(1e-4).min(0.25 * span);
+        if delta == 0.0 || !(n_m + 2.0 * delta).is_finite() {
+            return NsumResult {
+                sum: f64::NAN,
+                error: f64::INFINITY,
+                nfev,
+                converged: false,
+            };
+        }
         let fp = f(n_m + delta);
         let fm = f(n_m - delta);
         let fp2 = f(n_m + 2.0 * delta);
@@ -8792,6 +8846,82 @@ mod tests {
         );
         // Invalid step.
         assert!(!nsum(|n| n, 1.0, inf, 0.0, 0.0, 1e-11).converged);
+    }
+
+    #[test]
+    fn nsum_left_infinite_uses_the_finite_endpoint_and_step() {
+        let end = 100_000.25;
+        let calls = std::cell::Cell::new(0);
+        let result = nsum(
+            |x| {
+                calls.set(calls.get() + 1);
+                assert!(x.is_finite() && x <= end);
+                (x - end).exp()
+            },
+            f64::NEG_INFINITY,
+            end,
+            0.5,
+            1e-12,
+            1e-10,
+        );
+        let exact = 1.0 / -(-0.5_f64).exp_m1();
+        assert!(
+            result.converged && (result.sum - exact).abs() < 1e-9,
+            "{result:?}"
+        );
+        assert_eq!(result.nfev, calls.get());
+    }
+
+    #[test]
+    fn nsum_bilateral_geometric_tails_count_zero_once() {
+        let calls = std::cell::Cell::new(0);
+        let result = nsum(
+            |x| {
+                calls.set(calls.get() + 1);
+                if x < 0.0 {
+                    (2.0 * x).exp()
+                } else {
+                    (-x).exp()
+                }
+            },
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            0.5,
+            1e-12,
+            1e-10,
+        );
+        let exact = 1.0 / -(-0.5_f64).exp_m1() + 1.0 / 1.0_f64.exp_m1();
+        assert!(
+            result.converged && (result.sum - exact).abs() < 1e-9,
+            "{result:?}"
+        );
+        assert!(result.error <= 1e-12 + 1e-10 * result.sum.abs());
+        assert_eq!(result.nfev, calls.get());
+    }
+
+    #[test]
+    fn nsum_bilateral_propagates_a_nonfinite_tail() {
+        for invalid_left in [false, true] {
+            let calls = std::cell::Cell::new(0);
+            let result = nsum(
+                |x| {
+                    calls.set(calls.get() + 1);
+                    if (x < 0.0) == invalid_left {
+                        f64::NAN
+                    } else {
+                        0.0
+                    }
+                },
+                f64::NEG_INFINITY,
+                f64::INFINITY,
+                1.0,
+                1e-12,
+                1e-10,
+            );
+            assert!(!result.converged && result.sum.is_nan());
+            assert_eq!(result.error, f64::INFINITY);
+            assert_eq!(result.nfev, calls.get());
+        }
     }
 
     #[test]
