@@ -3043,13 +3043,12 @@ where
     })
 }
 
-/// the Gauss-Newton method; when λ is large, it approaches gradient descent.
+/// Minimize the sum of squared residuals with Levenberg–Marquardt.
 ///
-/// # Arguments
-/// * `func` - Function F(x) whose root is sought
-/// * `x0` - Initial guess
-/// * `tol` - Convergence tolerance on ||F(x)||
-/// * `maxiter` - Maximum iterations
+/// The residual vector must have at least as many entries as there are
+/// parameters and keep its shape throughout the solve. A least-squares
+/// optimum can have nonzero residuals. `tol` controls the relative cost,
+/// parameter and orthogonality tests. `maxiter` bounds trial steps.
 pub fn lm_root<F>(
     func: F,
     x0: &[f64],
@@ -3059,175 +3058,46 @@ pub fn lm_root<F>(
 where
     F: Fn(&[f64]) -> Vec<f64>,
 {
+    use crate::curvefit::{LeastSquaresOptions, finite_diff_jacobian_into, lm_iterations};
+
     validate_multivariate_root_params(x0, tol, maxiter)?;
-    let n = x0.len();
-
-    let eps = 1e-8; // Finite difference step
-    let mut lambda = 1e-3; // Initial damping parameter
-    let lambda_up = 10.0; // Factor to increase lambda on bad step
-    let lambda_down = 0.1; // Factor to decrease lambda on good step
-
-    let mut x = x0.to_vec();
-    let mut fx = evaluate_multivariate_root(&func, &x, n, "lm_root")?;
-    let mut nfev = 1usize;
-
-    for iteration in 0..maxiter {
-        let norm_fx: f64 = fx.iter().map(|v| v * v).sum::<f64>().sqrt();
-        if norm_fx < tol {
-            return Ok(MultivariateRootResult {
-                x,
-                fun: fx,
-                // status: ‖F(x)‖₂ < tol
-                converged: true,
-                message: "lm converged".to_string(),
-                iterations: iteration,
-                function_calls: nfev,
-            });
-        }
-
-        // Compute Jacobian via finite differences
-        let mut jac = vec![vec![0.0; n]; n];
-        for j in 0..n {
-            let h = eps * (1.0 + x[j].abs());
-            let original = x[j];
-            x[j] += h;
-            let fx_plus = evaluate_multivariate_root(&func, &x, n, "lm_root")?;
-            x[j] = original;
-            nfev += 1;
-            for i in 0..n {
-                jac[i][j] = (fx_plus[i] - fx[i]) / h;
+    // Include every model evaluation in the root result, including the
+    // finite-difference probes excluded from least_squares' nfev.
+    let calls = std::cell::Cell::new(0);
+    let counted = |x: &[f64]| {
+        calls.set(calls.get() + 1);
+        func(x)
+    };
+    let mut perturbed = Vec::new();
+    let fit = lm_iterations(
+        |x| {
+            let values = counted(x);
+            if values.iter().any(|value| !value.is_finite()) {
+                return Err(OptError::NonFiniteInput {
+                    detail: String::from("lm_root: function output must contain only finite values"),
+                });
             }
-        }
-
-        // Compute J^T J and J^T F. Single row-outer pass (jac read contiguously,
-        // jtj streamed row-major) mirroring `curvefit::jtj_matrix_into`, exploiting
-        // J^T J symmetry (upper triangle + mirror) to halve the products. BYTE-IDENTICAL
-        // to the naive `for i { for j { for row } }`: `row[i]*row[j] == row[j]*row[i]`
-        // (exact IEEE754 commutativity) and each cell still accumulates rows in ascending
-        // order. Replaces the strided column re-scan (n² cache-missing passes over jac).
-        let mut jtj = vec![vec![0.0; n]; n];
-        let mut jtf = vec![0.0; n];
-        for (row, &fx_value) in jac.iter().zip(fx.iter()) {
-            for i in 0..n {
-                let ri = row[i];
-                for j in i..n {
-                    let v = ri * row[j];
-                    jtj[i][j] += v;
-                    if i != j {
-                        jtj[j][i] += v;
-                    }
-                }
-                jtf[i] += ri * fx_value;
-            }
-        }
-
-        // Try steps with adaptive damping
-        let mut step_accepted = false;
-        for _ in 0..10 {
-            // Build (J^T J + λI)
-            let mut lhs = jtj.clone();
-            for (i, row) in lhs.iter_mut().enumerate().take(n) {
-                row[i] += lambda;
-            }
-
-            // Solve (J^T J + λI) dx = -J^T F
-            let neg_jtf: Vec<f64> = jtf.iter().map(|v| -v).collect();
-            let dx = match solve_lm_system(&lhs, &neg_jtf) {
-                Some(d) => d,
-                None => {
-                    lambda *= lambda_up;
-                    continue;
-                }
-            };
-
-            // Trial step
-            let x_trial: Vec<f64> = x.iter().zip(&dx).map(|(&xi, &di)| xi + di).collect();
-            let fx_trial = evaluate_multivariate_root(&func, &x_trial, n, "lm_root")?;
-            nfev += 1;
-
-            let trial_norm: f64 = fx_trial.iter().map(|v| v * v).sum::<f64>().sqrt();
-
-            if trial_norm < norm_fx {
-                // Good step: accept and decrease damping
-                x = x_trial;
-                fx = fx_trial;
-                lambda *= lambda_down;
-                lambda = lambda.max(1e-10); // Prevent underflow
-                step_accepted = true;
-                break;
-            } else {
-                // Bad step: increase damping and retry
-                lambda *= lambda_up;
-                lambda = lambda.min(1e10); // Prevent overflow
-            }
-        }
-
-        if !step_accepted {
-            // Failed to find an improving step; continue with current x
-            // but give it one more iteration chance
-        }
-    }
-
+            Ok(values)
+        },
+        |x, r, jac| finite_diff_jacobian_into(&counted, x, r, None, jac, &mut perturbed),
+        x0,
+        &LeastSquaresOptions {
+            xtol: tol,
+            ftol: tol,
+            gtol: tol,
+            // The initial evaluation precedes the first trial.
+            max_nfev: Some(maxiter.saturating_add(1)),
+            ..LeastSquaresOptions::default()
+        },
+    )?;
     Ok(MultivariateRootResult {
-        x,
-        fun: fx,
-        converged: false,
-        message: format!("lm failed to converge within {maxiter} iterations"),
-        iterations: maxiter,
-        function_calls: nfev,
+        x: fit.x,
+        fun: fit.fun,
+        converged: fit.success,
+        message: fit.message,
+        iterations: fit.nfev - 1,
+        function_calls: calls.get(),
     })
-}
-
-/// Solve a linear system for LM using Cholesky-like decomposition.
-fn solve_lm_system(a: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
-    let n = b.len();
-    if n == 0 {
-        return Some(vec![]);
-    }
-
-    // Use Gaussian elimination with partial pivoting (same as solve_dense)
-    let mut aug: Vec<Vec<f64>> = a
-        .iter()
-        .zip(b.iter())
-        .map(|(row, &bi)| {
-            let mut r = row.clone();
-            r.push(bi);
-            r
-        })
-        .collect();
-
-    for col in 0..n {
-        // Partial pivoting
-        let max_row = (col..n)
-            .max_by(|&i, &j| aug[i][col].abs().total_cmp(&aug[j][col].abs()))
-            .unwrap_or(col);
-        aug.swap(col, max_row);
-
-        if aug[col][col].abs() < 1e-15 {
-            return None;
-        }
-
-        let pivot = aug[col][col];
-        let pivot_row = aug[col].clone();
-        for row in aug.iter_mut().take(n).skip(col + 1) {
-            let factor = row[col] / pivot;
-            for (entry, pivot_entry) in row[col..=n].iter_mut().zip(pivot_row[col..=n].iter()) {
-                *entry -= factor * *pivot_entry;
-            }
-        }
-    }
-
-    // Back substitution
-    let mut x = vec![0.0; n];
-    for i in (0..n).rev() {
-        let mut sum = aug[i][n];
-        for (entry, x_value) in aug[i][(i + 1)..n].iter().zip(x[(i + 1)..n].iter()) {
-            sum -= *entry * *x_value;
-        }
-        x[i] = sum / aug[i][i];
-    }
-
-    Some(x)
 }
 
 /// Solve a small linear system Ax = b using Gaussian elimination with partial pivoting.
@@ -5381,6 +5251,68 @@ mod tests {
             "x = {}, expected ±sqrt(2)",
             result.x[0]
         );
+    }
+
+    #[test]
+    fn lm_root_fits_rectangular_inconsistent_system_and_counts_serial_calls() {
+        let calls = std::cell::Cell::new(0);
+        let fit = root(
+            |x| {
+                calls.set(calls.get() + 1);
+                vec![x[0] - 1.0, x[0] - 3.0, x[0] - 8.0]
+            },
+            &[0.0],
+            MultivariateRootOptions {
+                method: MultivariateRootMethod::Lm,
+                ..MultivariateRootOptions::default()
+            },
+        )
+        .expect("three observations of one parameter");
+        assert!(fit.converged, "{fit:?}");
+        assert!((fit.x[0] - 4.0).abs() < 1e-8);
+        assert_eq!(
+            fit.fun,
+            vec![fit.x[0] - 1.0, fit.x[0] - 3.0, fit.x[0] - 8.0]
+        );
+        assert_eq!(fit.function_calls, calls.get());
+    }
+
+    #[test]
+    fn lm_root_accepts_nonzero_stationary_residual_at_initial_point() {
+        let fit = lm_root(|x| vec![x[0] - 1.0, x[0] + 1.0], &[0.0], 1e-10, 1)
+            .expect("exactly orthogonal residual");
+        assert!(fit.converged, "{fit:?}");
+        assert_eq!(fit.x, vec![0.0]);
+        assert_eq!(fit.iterations, 0);
+        assert_eq!(fit.function_calls, 2);
+    }
+
+    #[test]
+    fn lm_root_rejects_a_changing_rectangular_residual() {
+        let result = lm_root(
+            |x| {
+                if x[0] == 0.0 {
+                    vec![1.0, 2.0]
+                } else {
+                    vec![1.0]
+                }
+            },
+            &[0.0],
+            1e-10,
+            10,
+        );
+        assert!(matches!(
+            result,
+            Err(crate::OptError::InvalidArgument { .. })
+        ));
+    }
+
+    #[test]
+    fn lm_root_is_invariant_to_tiny_residual_units() {
+        let fit = lm_root(|x| vec![1e-180 * (x[0] - 2.0)], &[0.0], 1e-10, 100)
+            .expect("scaled linear fit");
+        assert!(fit.converged, "{fit:?}");
+        assert!((fit.x[0] - 2.0).abs() < 1e-8);
     }
 
     #[test]

@@ -1164,11 +1164,30 @@ where
             detail: String::from("max_nfev must be positive"),
         });
     }
+    let mut x_perturbed = Vec::new();
+    lm_iterations(
+        |x| Ok(residuals(x)),
+        |x, r, jac| lm_jacobian_into(&residuals, x, r, &options, jac, &mut x_perturbed),
+        x0,
+        &options,
+    )
+}
+
+/// Shared QR trust-region iteration. The caller supplies the Jacobian so the
+/// root interface can retain serial callbacks and least_squares can evaluate
+/// independent difference columns in parallel.
+pub(super) fn lm_iterations(
+    residuals: impl Fn(&[f64]) -> Result<Vec<f64>, OptError>,
+    mut jacobian: impl FnMut(&[f64], &[f64], &mut Vec<Vec<f64>>) -> Result<(), OptError>,
+    x0: &[f64],
+    options: &LeastSquaresOptions,
+) -> Result<LeastSquaresResult, OptError> {
+    let n = x0.len();
     let mut scaling = LmScaling::new(options.x_scale.as_ref(), n)?;
     let max_nfev = options.max_nfev.unwrap_or(100 * n);
 
     let mut x = x0.to_vec();
-    let mut r = residuals(&x);
+    let mut r = residuals(&x)?;
     let m = r.len();
     let mut nfev = 1usize;
     let mut njev = 0usize;
@@ -1199,8 +1218,7 @@ where
         });
     }
     let mut jac = Vec::new();
-    let mut x_perturbed = x.clone();
-    lm_jacobian_into(&residuals, &x, &r, &options, &mut jac, &mut x_perturbed)?;
+    jacobian(&x, &r, &mut jac)?;
     njev += 1;
     scaling.update(&jac)?;
     let mut scaled_jac = scaling.jacobian(&jac)?;
@@ -1264,7 +1282,7 @@ where
         // Trial step
         let physical_step = scaling.physical_step(&scratch.step);
         let x_new: Vec<f64> = x.iter().zip(&physical_step).map(|(a, b)| a + b).collect();
-        let r_new = residuals(&x_new);
+        let r_new = residuals(&x_new)?;
         nfev += 1;
         if r_new.len() != m {
             return Err(OptError::InvalidArgument {
@@ -1317,7 +1335,7 @@ where
             r = r_new;
             cost = cost_new;
             residual_norm = trial_norm;
-            lm_jacobian_into(&residuals, &x, &r, &options, &mut jac, &mut x_perturbed)?;
+            jacobian(&x, &r, &mut jac)?;
             njev += 1;
             scaling.update(&jac)?;
             scaled_jac = scaling.jacobian(&jac)?;
@@ -2645,7 +2663,7 @@ fn lm_difference_points(x: &[f64], rel_step: Option<f64>) -> Result<Vec<(f64, f6
 }
 
 /// Compute finite-difference Jacobian into fixed-shape scratch.
-fn finite_diff_jacobian_into<F>(
+pub(super) fn finite_diff_jacobian_into<F>(
     residuals: &F,
     x: &[f64],
     r0: &[f64],
