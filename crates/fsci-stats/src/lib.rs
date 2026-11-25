@@ -31426,59 +31426,10 @@ impl ContinuousDistribution for GenNorm {
         m4 / (m2 * m2) - 3.0
     }
 
+    /// Maximum likelihood for the shape at fixed location zero and scale one.
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        if data.len() < 2 {
-            return Err(FitError::InsufficientData {
-                required: 2,
-                actual: data.len(),
-            });
-        }
-        for &x in data {
-            if !x.is_finite() {
-                return Err(FitError::UnsupportedData(format!(
-                    "GenNorm data contains non-finite value: {x}"
-                )));
-            }
-        }
-        // Method-of-moments: standardized variance is
-        //   Var(β) = Γ(3/β) / Γ(1/β)
-        // monotone-decreasing in β. β=1 → Var=2 (Laplace);
-        // β=2 → Var=1 (standard normal); β→∞ → Var → 1/3 (uniform).
-        // Sample variance about 0 is the natural moment (the distribution
-        // is centered at 0).
-        let n = data.len() as f64;
-        let m2_about_zero: f64 = data.iter().map(|x| x * x).sum::<f64>() / n;
-        if !m2_about_zero.is_finite() || m2_about_zero <= 0.0 {
-            return Err(FitError::NonConvergent(format!(
-                "GenNorm MoM: sample E[x²] {m2_about_zero} non-positive"
-            )));
-        }
-        let var_of = |beta: f64| -> f64 { ln_gamma(3.0 / beta).exp() / ln_gamma(1.0 / beta).exp() };
-        // Bracket. β=0.1 gives huge variance; β=50 gives variance ~ 1/3.
-        let mut lo = 0.1_f64;
-        let mut hi = 50.0_f64;
-        let v_lo = var_of(lo);
-        let v_hi = var_of(hi);
-        // var is monotone-decreasing in β, so v_lo ≥ target ≥ v_hi.
-        if !(v_hi <= m2_about_zero && m2_about_zero <= v_lo) {
-            return Err(FitError::NonConvergent(format!(
-                "GenNorm MoM bracket failed: var({lo})={v_lo}, var({hi})={v_hi}, target={m2_about_zero}"
-            )));
-        }
-        for _ in 0..200 {
-            let mid = 0.5 * (lo + hi);
-            let v_mid = var_of(mid);
-            if (v_mid - m2_about_zero).abs() < 1.0e-12 || (hi - lo) < lo * 1.0e-12 + 1.0e-15 {
-                return Ok(Self { beta: mid });
-            }
-            if v_mid > m2_about_zero {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
         Ok(Self {
-            beta: 0.5 * (lo + hi),
+            beta: mle::gennorm_shape_mle(data, false)?,
         })
     }
 }
@@ -31644,60 +31595,10 @@ impl ContinuousDistribution for HalfGenNorm {
         mu4 / (var * var) - 3.0
     }
 
+    /// Maximum likelihood for the shape at fixed location zero and scale one.
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
-        if data.len() < 2 {
-            return Err(FitError::InsufficientData {
-                required: 2,
-                actual: data.len(),
-            });
-        }
-        let mut sum = 0.0_f64;
-        let mut count = 0usize;
-        for &x in data {
-            if !x.is_finite() {
-                return Err(FitError::UnsupportedData(format!(
-                    "HalfGenNorm data contains non-finite value: {x}"
-                )));
-            }
-            if x < 0.0 {
-                return Err(FitError::UnsupportedData(format!(
-                    "HalfGenNorm support is [0, ∞); got {x}"
-                )));
-            }
-            sum += x;
-            count += 1;
-        }
-        let mean = sum / count as f64;
-        if mean <= 0.0 || !mean.is_finite() {
-            return Err(FitError::NonConvergent(format!(
-                "HalfGenNorm MoM: sample mean {mean} non-positive"
-            )));
-        }
-        // Mean(β) = Γ(2/β) / Γ(1/β), monotone-decreasing in β.
-        let mean_of = |beta: f64| ln_gamma(2.0 / beta).exp() / ln_gamma(1.0 / beta).exp();
-        let mut lo = 0.1_f64;
-        let mut hi = 50.0_f64;
-        let m_lo = mean_of(lo);
-        let m_hi = mean_of(hi);
-        if !(m_hi <= mean && mean <= m_lo) {
-            return Err(FitError::NonConvergent(format!(
-                "HalfGenNorm MoM bracket failed: mean({lo})={m_lo}, mean({hi})={m_hi}, target={mean}"
-            )));
-        }
-        for _ in 0..200 {
-            let mid = 0.5 * (lo + hi);
-            let m_mid = mean_of(mid);
-            if (m_mid - mean).abs() < 1.0e-12 || (hi - lo) < lo * 1.0e-12 + 1.0e-15 {
-                return Ok(Self { beta: mid });
-            }
-            if m_mid > mean {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
         Ok(Self {
-            beta: 0.5 * (lo + hi),
+            beta: mle::gennorm_shape_mle(data, true)?,
         })
     }
 }
@@ -104014,21 +103915,26 @@ mod tests {
     }
 
     #[test]
-    fn halfgennorm_fit_metamorphic_mean_recovery() {
+    fn halfgennorm_fit_solves_likelihood_score() {
         let data = [0.5_f64, 1.0, 1.5, 0.7, 1.2, 0.3, 0.8];
-        let m: f64 = data.iter().sum::<f64>() / data.len() as f64;
         let fitted = HalfGenNorm::try_fit(&data).expect("fit");
-        let recovered = fitted.mean();
-        assert!(
-            (recovered - m).abs() < 1.0e-6,
-            "MoM mean recovery: sample {m}, fitted {recovered}"
-        );
+        let beta = fitted.beta;
+        let weighted_log: f64 = data.iter().map(|x| x.powf(beta) * x.ln()).sum();
+        let score = fsci_special::digamma_scalar(1.0 + beta.recip())
+            - beta * beta * weighted_log / data.len() as f64;
+        assert!(score.abs() < 1.0e-10, "HalfGenNorm MLE score: {score}");
+        let old_moment_fit = HalfGenNorm::new(1.126_963_458_571_275_6);
+        let improvement: f64 = data
+            .iter()
+            .map(|&x| fitted.logpdf(x) - old_moment_fit.logpdf(x))
+            .sum();
+        assert!(improvement > 0.4, "likelihood improvement: {improvement}");
     }
 
     #[test]
     fn halfgennorm_fit_recovers_synthetic_shape() {
         // Synthesize n=2000 samples from HalfGenNorm(β=2.0). Population
-        // mean is Γ(1)/Γ(0.5) = 1/√π ≈ 0.564. MoM bisection on mean
+        // mean is Γ(1)/Γ(0.5) = 1/√π ≈ 0.564. Maximum likelihood
         // recovers β within 5%.
         let true_beta = 2.0;
         let dist = HalfGenNorm::new(true_beta);
@@ -104060,23 +103966,29 @@ mod tests {
     }
 
     #[test]
-    fn gennorm_fit_metamorphic_var_recovery() {
-        // After fitting, the fitted distribution's variance must match the
-        // sample variance about 0 to bisection precision.
+    fn gennorm_fit_solves_likelihood_score() {
         let data = [-0.5_f64, 0.0, 0.5, -1.0, 1.0, 0.3, -0.7, 0.8, -0.4];
-        let n = data.len() as f64;
-        let m2: f64 = data.iter().map(|x| x * x).sum::<f64>() / n;
         let fitted = GenNorm::try_fit(&data).expect("fit");
-        let recovered = fitted.var();
-        assert!(
-            (recovered - m2).abs() < 1.0e-6,
-            "MoM var recovery: sample E[x²] {m2}, fitted var {recovered}"
-        );
+        let beta = fitted.beta;
+        let weighted_log: f64 = data
+            .iter()
+            .filter(|&&x| x != 0.0)
+            .map(|x| x.abs().powf(beta) * x.abs().ln())
+            .sum();
+        let score = fsci_special::digamma_scalar(1.0 + beta.recip())
+            - beta * beta * weighted_log / data.len() as f64;
+        assert!(score.abs() < 1.0e-10, "GenNorm MLE score: {score}");
+        let old_moment_fit = GenNorm::new(2.362_139_243_050_265);
+        let improvement: f64 = data
+            .iter()
+            .map(|&x| fitted.logpdf(x) - old_moment_fit.logpdf(x))
+            .sum();
+        assert!(improvement > 0.7, "likelihood improvement: {improvement}");
     }
 
     #[test]
-    fn gennorm_fit_synthetic_recovery_unit_variance() {
-        // β=2 corresponds to the standard normal with var=1. Synthesizing
+    fn gennorm_fit_synthetic_recovery_fixed_scale() {
+        // β=2 corresponds to a centered normal with var=1/2. Synthesizing
         // n=2000 from GenNorm(2.0) and fitting should give β ≈ 2.
         let true_beta = 2.0;
         let dist = GenNorm::new(true_beta);
@@ -104102,9 +104014,12 @@ mod tests {
     }
 
     #[test]
-    fn gennorm_fit_rejects_zero_data() {
-        let err = GenNorm::try_fit(&[0.0, 0.0]).expect_err("zero variance must be rejected");
-        assert!(matches!(err, FitError::NonConvergent(_)));
+    fn gennorm_fit_accepts_identifiable_zero_data() {
+        // Shape remains identifiable because the scale is fixed: at x=0 the
+        // density is maximized where digamma(1 + 1/beta) vanishes.
+        let fitted = GenNorm::try_fit(&[0.0, 0.0]).expect("finite zero-sample MLE");
+        assert!(fitted.beta > 2.0 && fitted.beta < 2.3);
+        assert!(fsci_special::digamma_scalar(1.0 + fitted.beta.recip()).abs() < 1.0e-12);
     }
 
     #[test]

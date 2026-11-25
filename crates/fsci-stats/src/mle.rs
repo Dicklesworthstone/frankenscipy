@@ -1946,6 +1946,152 @@ fn log_minus_digamma(a: f64) -> f64 {
     }
 }
 
+/// Fixed-location, unit-scale shape MLE shared by generalized normals and
+/// their upper halves. Folding changes the log likelihood by n*log(2), so
+/// both families must estimate exactly the same shape from absolute values.
+pub(crate) fn gennorm_shape_mle(data: &[f64], half: bool) -> Result<f64, FitError> {
+    let family = if half { "HalfGenNorm" } else { "GenNorm" };
+    validate_shape_sample(data, 2, family)?;
+    if half && data.iter().any(|&x| x < 0.0) {
+        return Err(FitError::UnsupportedData(
+            "HalfGenNorm MLE requires nonnegative observations".into(),
+        ));
+    }
+
+    let logs: Vec<f64> = data.iter().map(|x| x.abs().ln()).collect();
+    let mut starts = vec![0.25, 1.0, 2.0, 8.0];
+    let largest_log = logs.iter().copied().fold(0.0_f64, f64::max);
+    if largest_log > 0.0 {
+        starts.push(largest_log.recip());
+    }
+    let closest_log = logs
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite() && *value < 0.0)
+        .map(|value| -value)
+        .fold(f64::INFINITY, f64::min);
+    if closest_log.is_finite() {
+        starts.push(closest_log.recip());
+    }
+
+    let mut best: Option<(f64, f64)> = None;
+    for initial in starts {
+        // Positive parameters have no artificial shape ceiling. Sample-based
+        // starts reach very heavy tails and observations close to |x|=1.
+        // Like fit_mle itself, this search does not certify a global maximum.
+        let fitted = fit_mle(
+            data,
+            &[MleParameter::Positive(initial)],
+            |p| Some(crate::GenNorm { beta: p[0] }),
+            MleOptions::default(),
+        );
+        let center = fitted.map_or(initial, |result| result.distribution.beta);
+
+        // A flat floating-point likelihood can satisfy the simplex stopping
+        // rule before the shape score vanishes. Bracket and polish the actual
+        // score instead of reporting that plateau as a successful estimate.
+        let mut lower = center;
+        let mut upper = center;
+        let mut lower_score = gennorm_shape_score(&logs, lower);
+        let mut upper_score = lower_score;
+        for _ in 0..128 {
+            if lower_score <= 0.0 && upper_score >= 0.0 {
+                break;
+            }
+            if lower_score > 0.0 {
+                lower *= 0.5;
+                lower_score = gennorm_shape_score(&logs, lower);
+            }
+            if upper_score < 0.0 {
+                upper *= 2.0;
+                upper_score = gennorm_shape_score(&logs, upper);
+            }
+            if lower <= 0.0 || !upper.is_finite() {
+                break;
+            }
+        }
+        if lower <= 0.0
+            || !upper.is_finite()
+            || lower_score.is_nan()
+            || upper_score.is_nan()
+            || lower_score > 0.0
+            || upper_score < 0.0
+        {
+            continue;
+        }
+        for _ in 0..100 {
+            let middle = lower + 0.5 * (upper - lower);
+            if middle == lower || middle == upper {
+                break;
+            }
+            if gennorm_shape_score(&logs, middle) < 0.0 {
+                lower = middle;
+            } else {
+                upper = middle;
+            }
+        }
+        let beta = lower + 0.5 * (upper - lower);
+        let score = gennorm_shape_score(&logs, beta);
+        let score_scale = 1.0 + fsci_special::digamma_scalar(1.0 + beta.recip()).abs();
+        if !score.is_finite() || score.abs() > 1.0e-8 * score_scale {
+            continue;
+        }
+        // Gamma's recurrence cancels log(beta) analytically. Omitting the
+        // shape-independent log(2) also preserves sub-ULP differences between
+        // large finite shapes and the uniform limit.
+        let nll = gennorm_shape_log_normalizer(beta)
+            + compensated_mean(logs.iter().map(|&value| (beta * value).exp()), data.len());
+        if nll.is_finite() && best.is_none_or(|(_, previous)| nll < previous) {
+            best = Some((beta, nll));
+        }
+    }
+    best.map(|(beta, _)| beta).ok_or_else(|| {
+        FitError::NonConvergent(format!(
+            "{family} shape likelihood did not converge to a finite stationary maximum"
+        ))
+    })
+}
+
+/// beta^2 times the derivative of the mean negative log likelihood.
+/// Zero observations contribute zero, including when beta*log(0) is infinite.
+fn gennorm_shape_score(logs: &[f64], beta: f64) -> f64 {
+    let statistic = compensated_mean(
+        logs.iter().map(|&value| {
+            if value == f64::NEG_INFINITY || value == 0.0 {
+                return 0.0;
+            }
+            let power = beta * value;
+            if power == f64::NEG_INFINITY {
+                0.0
+            } else {
+                beta * (power * power.exp())
+            }
+        }),
+        logs.len(),
+    );
+    statistic - fsci_special::digamma_scalar(1.0 + beta.recip())
+}
+
+/// log Gamma(1+1/beta), retaining its small negative value when adding
+/// 1/beta to one rounds away. The series has error O((1/beta)^7).
+fn gennorm_shape_log_normalizer(beta: f64) -> f64 {
+    let inverse = beta.recip();
+    if inverse >= 1.0e-3 {
+        return crate::ln_gamma(1.0 + inverse);
+    }
+    inverse
+        * (-0.577_215_664_901_532_9
+            + inverse
+                * (0.822_467_033_424_113_2
+                    + inverse
+                        * (-0.400_685_634_386_531_43
+                            + inverse
+                                * (0.270_580_808_427_784_54
+                                    + inverse
+                                        * (-0.207_385_551_028_673_98
+                                            + inverse * 0.169_557_176_997_408_2)))))
+}
+
 /// Shared shape score for Gamma and standardized Nakagami likelihoods.
 /// The strict bounds 1/(2a) < log(a)-psi(a) < 1/a bracket the unique root
 /// without an arbitrary upper shape limit or an unconstrained Newton step.

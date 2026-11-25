@@ -18,8 +18,8 @@ use fsci_stats::{
     with_hardened_stats_caps, with_stats_runtime_mode,
 };
 use fsci_stats::{
-    Cauchy, DoubleGamma, Erlang, ExponNorm, FoldedNormal, LaplaceAsymmetric, NoncentralChiSquared,
-    SkewNorm,
+    Cauchy, DoubleGamma, Erlang, ExponNorm, FoldedNormal, GenNorm, HalfGenNorm, LaplaceAsymmetric,
+    NoncentralChiSquared, SkewNorm,
 };
 use rand::{SeedableRng, rngs::StdRng};
 
@@ -63,6 +63,8 @@ cases = [
     ('skewnorm', stats.skewnorm, [(-5.0,), (0.0,), (4.0,)]),
     ('erlang', stats.erlang, [(1,), (4,), (30,)]),
     ('ncx2', stats.ncx2, [(1.0, 0.5), (5.0, 2.0), (100.0, 200.0)]),
+    ('gennorm', stats.gennorm, [(0.3,), (2.0,), (20.0,)]),
+    ('halfgennorm', stats.halfgennorm, [(0.3,), (2.0,), (20.0,)]),
 ]
 for family_index, (name, dist, shapes) in enumerate(cases):
     for case_index, shape in enumerate(shapes):
@@ -3490,6 +3492,14 @@ fn mle_matches_live_scipy_on_seeded_fits() {
         let two_positive = [MleParameter::Positive(1.0), MleParameter::Positive(1.0)];
         let options = MleOptions::default();
         let (actual, nll) = match family {
+            "gennorm" => {
+                let fitted = GenNorm::try_fit(&data).unwrap();
+                (vec![fitted.beta], likelihood(&fitted, &data))
+            }
+            "halfgennorm" => {
+                let fitted = HalfGenNorm::try_fit(&data).unwrap();
+                (vec![fitted.beta], likelihood(&fitted, &data))
+            }
             "ncx2" => {
                 let fitted = NoncentralChiSquared::try_fit(&data).unwrap();
                 (vec![fitted.df, fitted.nc], likelihood(&fitted, &data))
@@ -3678,10 +3688,10 @@ fn mle_matches_live_scipy_on_seeded_fits() {
         compared += 1;
     }
     assert_eq!(
-        compared, 87,
+        compared, 93,
         "every seeded case must produce a real comparison"
     );
-    eprintln!("MLE compared cases = {compared}; families = 29; samples per case = 2000");
+    eprintln!("MLE compared cases = {compared}; families = 31; samples per case = 2000");
 }
 
 #[test]
@@ -4903,6 +4913,145 @@ fn closed_form_shape_fits_reject_undefined_limits_and_honor_caps() {
             ));
             assert!(Gompertz::try_fit(&[0.1, 0.2]).is_ok());
             assert!(GenLogistic::try_fit(&[0.1, 0.2]).is_ok());
+        });
+    });
+}
+
+fn generalized_normal_likelihood_score(data: &[f64], beta: f64) -> f64 {
+    // Differentiate the published density, evaluating powers directly rather
+    // than using the fitter's log-space likelihood or optimizer coordinates.
+    let weighted_log: f64 = data
+        .iter()
+        .filter(|&&x| x != 0.0)
+        .map(|x| x.abs().powf(beta) * x.abs().ln())
+        .sum();
+    fsci_special::digamma_scalar(1.0 + beta.recip())
+        - beta * beta * weighted_log / data.len() as f64
+}
+
+#[test]
+fn generalized_normal_mle_uses_likelihood_for_both_families() {
+    let data = [-0.5_f64, 0.0, 0.5, -1.0, 1.0, 0.3, -0.7, 0.8, -0.4];
+    let folded = data.map(f64::abs);
+    for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+        with_stats_runtime_mode(mode, || {
+            let fitted = GenNorm::try_fit(&data).unwrap();
+            let half = HalfGenNorm::try_fit(&folded).unwrap();
+            assert_eq!(fitted.beta.to_bits(), half.beta.to_bits());
+            assert_eq!(fitted, GenNorm::fit(&data));
+            assert_eq!(half, HalfGenNorm::fit(&folded));
+            assert!(generalized_normal_likelihood_score(&data, fitted.beta).abs() < 1.0e-10);
+            // The former estimators matched the second moment and folded
+            // mean, respectively; both have appreciably worse likelihood.
+            let old_full = GenNorm::new(2.362_139_243_050_265);
+            let old_half = HalfGenNorm::new(1.891_807_245_086_320_1);
+            assert!(likelihood(&old_full, &data) - likelihood(&fitted, &data) > 0.7);
+            assert!(likelihood(&old_half, &folded) - likelihood(&half, &folded) > 1.0);
+            for factor in [0.9, 1.1] {
+                assert!(
+                    likelihood(&GenNorm::new(factor * fitted.beta), &data)
+                        > likelihood(&fitted, &data)
+                );
+            }
+        });
+    }
+}
+
+#[test]
+fn generalized_normal_mle_handles_shape_extremes_and_zero_samples() {
+    for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+        with_stats_runtime_mode(mode, || {
+            // At zero, the shape remains identifiable with scale fixed.
+            // The score is digamma(1+1/beta)=0, with beta between 2 and 2.3.
+            for data in [vec![0.0, 0.0], vec![0.0, 0.0, 1.0, 1.0]] {
+                let fitted = GenNorm::try_fit(&data).unwrap();
+                let half = HalfGenNorm::try_fit(&data).unwrap();
+                assert!(fitted.beta > 2.0 && fitted.beta < 2.3);
+                assert_eq!(fitted.beta.to_bits(), half.beta.to_bits());
+                assert!(generalized_normal_likelihood_score(&data, fitted.beta).abs() < 1.0e-12);
+            }
+
+            // These data have a poor local optimum near beta=2.18 and a
+            // much better one near 19026. A single ordinary starting value
+            // does not suffice, and the old beta<=50 bracket excludes it.
+            let near_unit = [0.999, 0.9991, 0.9992, 0.9993, 0.9994];
+            let fitted = GenNorm::try_fit(&near_unit).unwrap();
+            assert!(fitted.beta > 18_000.0 && fitted.beta < 20_000.0);
+            assert!(generalized_normal_likelihood_score(&near_unit, fitted.beta).abs() < 1.0e-9);
+            assert!(
+                likelihood(&fitted, &near_unit) < near_unit.len() as f64 * std::f64::consts::LN_2
+            );
+            let half = HalfGenNorm::try_fit(&near_unit).unwrap();
+            assert_eq!(fitted.beta.to_bits(), half.beta.to_bits());
+            assert!(likelihood(&half, &near_unit) < 0.0);
+
+            // Large finite data need shapes below the old beta>=0.1 cutoff.
+            // The still larger sample below overflows empirical moments.
+            let large = [1.0e20, 1.0e22, 1.0e24, 1.0e26];
+            let fitted = GenNorm::try_fit(&large).unwrap();
+            assert!(fitted.beta > 0.05 && fitted.beta < 0.06);
+            assert!(likelihood(&fitted, &large).is_finite());
+            assert!(generalized_normal_likelihood_score(&large, fitted.beta).abs() < 1.0e-9);
+            let extreme = [1.0e300, 1.0e308];
+            let fitted = GenNorm::try_fit(&extreme).unwrap();
+            assert!(fitted.beta > 0.0 && fitted.beta < 0.01);
+            assert!(likelihood(&fitted, &extreme).is_finite());
+            assert!(generalized_normal_likelihood_score(&extreme, fitted.beta).abs() < 1.0e-8);
+
+            // Even 1+1/beta rounds to 1 here. The likelihood's finite-shape
+            // advantage survives only when its log-Gamma term is retained.
+            let adjacent = [
+                f64::from_bits(1.0_f64.to_bits() - 1),
+                f64::from_bits(1.0_f64.to_bits() - 2),
+            ];
+            let fitted = GenNorm::try_fit(&adjacent).unwrap();
+            assert!(fitted.beta > 1.0e17 && fitted.beta < 1.0e18);
+            assert!(generalized_normal_likelihood_score(&adjacent, fitted.beta).abs() < 1.0e-8);
+        });
+    }
+}
+
+#[test]
+fn generalized_normal_mle_rejects_invalid_data_and_honors_caps() {
+    for data in [vec![], vec![1.0]] {
+        assert!(matches!(
+            GenNorm::try_fit(&data),
+            Err(FitError::InsufficientData { .. })
+        ));
+        assert!(matches!(
+            HalfGenNorm::try_fit(&data),
+            Err(FitError::InsufficientData { .. })
+        ));
+    }
+    for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(matches!(
+            GenNorm::try_fit(&[0.5, invalid]),
+            Err(FitError::UnsupportedData(_))
+        ));
+        assert!(matches!(
+            HalfGenNorm::try_fit(&[0.5, invalid]),
+            Err(FitError::UnsupportedData(_))
+        ));
+    }
+    assert!(matches!(
+        HalfGenNorm::try_fit(&[0.5, -0.1]),
+        Err(FitError::UnsupportedData(_))
+    ));
+    assert!(GenNorm::try_fit(&[0.5, -0.1]).is_ok());
+    with_stats_runtime_mode(RuntimeMode::Hardened, || {
+        with_hardened_stats_caps(2, 2, || {
+            for data in [[0.1, 0.5, 1.0], [0.0, 0.0, 0.0]] {
+                assert!(matches!(
+                    GenNorm::try_fit(&data),
+                    Err(FitError::ResourceExhausted { .. })
+                ));
+                assert!(matches!(
+                    HalfGenNorm::try_fit(&data),
+                    Err(FitError::ResourceExhausted { .. })
+                ));
+            }
+            assert!(GenNorm::try_fit(&[0.0, 0.0]).is_ok());
+            assert!(HalfGenNorm::try_fit(&[0.0, 0.0]).is_ok());
         });
     });
 }
