@@ -170,6 +170,8 @@ jobs:
               cargo test --locked -p fsci-stats --test permutation_scipy -- --nocapture
               ;;
             signal-state)
+              cargo test --locked -p fsci-signal --lib frequency_response -- --nocapture
+              cargo test --locked -p fsci-signal --lib dbode -- --nocapture
               cargo test --locked -p fsci-signal --lib decimate -- --nocapture
               cargo test --locked -p fsci-conformance --no-default-features --test diff_signal_resample -- --nocapture
               cargo test --locked -p fsci-signal --lib short_time::tests -- --nocapture

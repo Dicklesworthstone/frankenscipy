@@ -6985,10 +6985,14 @@ pub fn magnitude_response(b: &[f64], a: &[f64], n_freqs: usize) -> (Vec<f64>, Ve
 
         let h_mag2 = br * br + bi * bi;
         let a_mag2 = ar * ar + ai * ai;
-        let mag = if a_mag2 > 1e-30 {
-            (h_mag2 / a_mag2).sqrt()
+        let ratio = h_mag2 / a_mag2;
+        let mag = if h_mag2.is_normal() && a_mag2.is_normal() && ratio.is_normal() {
+            ratio.sqrt()
+        } else if ar == 0.0 && ai == 0.0 {
+            f64::INFINITY
         } else {
-            0.0
+            let (re, im) = complex_div(br, bi, ar, ai);
+            complex_magnitude(re, im)
         };
         (w, mag)
     });
@@ -7013,21 +7017,13 @@ pub static MAGNITUDE_RESPONSE_FORCE_SERIAL: std::sync::atomic::AtomicBool =
 ///
 /// Returns `(frequencies, 20 · log10(|H(e^{jω})|))` — the dB-scaled
 /// counterpart of [`magnitude_response`]. Frequencies where `|H| = 0`
-/// (or numerically below `1e-30`) are mapped to `f64::NEG_INFINITY`.
+/// are mapped to `f64::NEG_INFINITY`; every positive finite gain has a finite
+/// decibel value.
 ///
 /// Resolves [frankenscipy-o8x6j].
 pub fn magnitude_response_db(b: &[f64], a: &[f64], n_freqs: usize) -> (Vec<f64>, Vec<f64>) {
     let (freqs, mags) = magnitude_response(b, a, n_freqs);
-    let mags_db: Vec<f64> = mags
-        .iter()
-        .map(|&m| {
-            if m > 1e-30 {
-                20.0 * m.log10()
-            } else {
-                f64::NEG_INFINITY
-            }
-        })
-        .collect();
+    let mags_db: Vec<f64> = mags.iter().map(|&m| 20.0 * m.log10()).collect();
     (freqs, mags_db)
 }
 
@@ -9137,7 +9133,100 @@ fn complex_div(ar: f64, ai: f64, br: f64, bi: f64) -> (f64, f64) {
 
 fn complex_div_complex(ar: f64, ai: f64, br: f64, bi: f64) -> (f64, f64) {
     let denom = br * br + bi * bi;
-    ((ar * br + ai * bi) / denom, (ai * br - ar * bi) / denom)
+    let products = [ar * br, ai * bi, ai * br, ar * bi];
+    let num_re = products[0] + products[1];
+    let num_im = products[2] - products[3];
+    let product_in_range = |product: f64, lhs: f64, rhs: f64| {
+        product.is_normal() || (product == 0.0 && (lhs == 0.0 || rhs == 0.0))
+    };
+    // Preserve the usual arithmetic, including the serial/parallel response bits.
+    // A finite quotient can still have overflowing or underflowing products.
+    if (denom.is_normal()
+        && num_re.is_finite()
+        && num_im.is_finite()
+        && product_in_range(products[0], ar, br)
+        && product_in_range(products[1], ai, bi)
+        && product_in_range(products[2], ai, br)
+        && product_in_range(products[3], ar, bi))
+        || ![ar, ai, br, bi].iter().all(|value| value.is_finite())
+        || (br == 0.0 && bi == 0.0)
+    {
+        return (num_re / denom, num_im / denom);
+    }
+    if bi == 0.0 {
+        return (ar / br, ai / br);
+    }
+    if br == 0.0 {
+        return (ai / bi, -ar / bi);
+    }
+
+    // Keep each product as a bounded significand and a separate binary exponent.
+    // Scaling the entire numerator or denominator by its largest component can
+    // erase a small component that the final quotient would make representable.
+    fn power_of_two(exponent: i32) -> f64 {
+        if exponent < -1074 {
+            0.0
+        } else if exponent < -1022 {
+            f64::from_bits(1_u64 << (exponent + 1074))
+        } else {
+            f64::from_bits(((exponent + 1023) as u64) << 52)
+        }
+    }
+    fn product_parts(lhs: f64, rhs: f64) -> (f64, i32) {
+        let parts = |value: f64| {
+            let exponent_bits = ((value.to_bits() >> 52) & 0x7ff).max(1);
+            let scale = f64::from_bits(exponent_bits << 52);
+            (value / scale, exponent_bits as i32 - 1023)
+        };
+        let (lm, le) = parts(lhs);
+        let (rm, re) = parts(rhs);
+        (lm * rm, le + re)
+    }
+    fn product_sum(a: f64, b: f64, c: f64, d: f64) -> (f64, i32) {
+        let (x, xe) = product_parts(a, b);
+        let (y, ye) = product_parts(c, d);
+        if x == 0.0 {
+            return (y, ye);
+        }
+        if y == 0.0 {
+            return (x, xe);
+        }
+        let exponent = xe.max(ye);
+        (
+            x * power_of_two(xe - exponent) + y * power_of_two(ye - exponent),
+            exponent,
+        )
+    }
+    fn rescale(mut value: f64, mut exponent: i32) -> f64 {
+        // Intermediate scaling stays normal whenever the final result is
+        // representable; the last multiplication performs subnormal rounding.
+        while exponent > 1023 {
+            value *= power_of_two(512);
+            exponent -= 512;
+        }
+        while exponent < -1022 {
+            value *= power_of_two(-512);
+            exponent += 512;
+        }
+        value * power_of_two(exponent)
+    }
+
+    let (den, den_exp) = product_sum(br, br, bi, bi);
+    let (re, re_exp) = product_sum(ar, br, ai, bi);
+    let (im, im_exp) = product_sum(ai, br, -ar, bi);
+    (
+        rescale(re / den, re_exp - den_exp),
+        rescale(im / den, im_exp - den_exp),
+    )
+}
+
+fn complex_magnitude(re: f64, im: f64) -> f64 {
+    let squared = re * re + im * im;
+    if squared.is_normal() || !re.is_finite() || !im.is_finite() {
+        squared.sqrt()
+    } else {
+        re.hypot(im)
+    }
 }
 
 fn complex_sqrt(re: f64, im: f64) -> (f64, f64) {
@@ -11640,9 +11729,15 @@ pub fn freqz_with_whole(
     // FFTs vs O(n_coeffs) Horner/point); below that, Horner + the parallel sweep below is
     // faster (an order-8 filter at n=500k was 3× slower on the FFT path).
     let nfft_bits = 64 - (2 * n).max(1).leading_zeros() as usize; // ≈ log2(nfft)
-    let fft_responses = if b.len() + a.len() >= 2 * nfft_bits && b.len() + a.len() >= 16 && n >= 64
+    let nfft = if whole { n } else { 2 * n };
+    // Padding must never truncate a high-degree numerator or denominator.
+    // A shorter frequency grid still evaluates every coefficient via Horner.
+    let fft_responses = if b.len() <= nfft
+        && a.len() <= nfft
+        && b.len() + a.len() >= 2 * nfft_bits
+        && b.len() + a.len() >= 16
+        && n >= 64
     {
-        let nfft = if whole { n } else { 2 * n };
         let opts = fsci_fft::FftOptions::default();
         let pad = |c: &[f64]| -> Vec<fsci_fft::Complex64> {
             let mut v: Vec<fsci_fft::Complex64> = c.iter().map(|&x| (x, 0.0)).collect();
@@ -11679,13 +11774,11 @@ pub fn freqz_with_whole(
         };
 
         // H = B / A (complex division)
-        let denom = a_re * a_re + a_im * a_im;
-        if denom < 1e-30 {
+        if a_re == 0.0 && a_im == 0.0 {
             (omega, f64::INFINITY, 0.0)
         } else {
-            let h_re = (b_re * a_re + b_im * a_im) / denom;
-            let h_im = (b_im * a_re - b_re * a_im) / denom;
-            (omega, (h_re * h_re + h_im * h_im).sqrt(), h_im.atan2(h_re))
+            let (h_re, h_im) = complex_div(b_re, b_im, a_re, a_im);
+            (omega, complex_magnitude(h_re, h_im), h_im.atan2(h_re))
         }
     };
 
@@ -11800,13 +11893,11 @@ pub fn freqz_zpk_with_whole(
             den_im = new_im;
         }
 
-        let denom_mag_sq = den_re * den_re + den_im * den_im;
-        if denom_mag_sq < 1e-30 {
+        if den_re == 0.0 && den_im == 0.0 {
             (omega, f64::INFINITY, 0.0)
         } else {
-            let h_re = (num_re * den_re + num_im * den_im) / denom_mag_sq;
-            let h_im = (num_im * den_re - num_re * den_im) / denom_mag_sq;
-            (omega, (h_re * h_re + h_im * h_im).sqrt(), h_im.atan2(h_re))
+            let (h_re, h_im) = complex_div(num_re, num_im, den_re, den_im);
+            (omega, complex_magnitude(h_re, h_im), h_im.atan2(h_re))
         }
     };
 
@@ -11854,15 +11945,13 @@ pub fn freqz_sos(sos: &[SosSection], n_freqs: Option<usize>) -> Result<FreqzResu
             let (b_re, b_im) = eval_poly_on_unit_circle(sec_b, omega);
             let (a_re, a_im) = eval_poly_on_unit_circle(sec_a, omega);
 
-            let denom = a_re * a_re + a_im * a_im;
-            if denom < 1e-30 {
+            if a_re == 0.0 && a_im == 0.0 {
                 total_re = f64::INFINITY;
                 total_im = 0.0;
                 break;
             }
 
-            let h_re = (b_re * a_re + b_im * a_im) / denom;
-            let h_im = (b_im * a_re - b_re * a_im) / denom;
+            let (h_re, h_im) = complex_div(b_re, b_im, a_re, a_im);
 
             // Complex multiply: total *= h
             let new_re = total_re * h_re - total_im * h_im;
@@ -11871,7 +11960,7 @@ pub fn freqz_sos(sos: &[SosSection], n_freqs: Option<usize>) -> Result<FreqzResu
             total_im = new_im;
         }
 
-        let mag = (total_re * total_re + total_im * total_im).sqrt();
+        let mag = complex_magnitude(total_re, total_im);
         (omega, mag, total_im.atan2(total_re))
     };
 
@@ -11932,15 +12021,13 @@ pub fn sosfreqz_with_whole(
             let (b_re, b_im) = eval_poly_on_unit_circle(sec_b, omega);
             let (a_re, a_im) = eval_poly_on_unit_circle(sec_a, omega);
 
-            let denom = a_re * a_re + a_im * a_im;
-            if denom < 1e-30 {
+            if a_re == 0.0 && a_im == 0.0 {
                 total_re = f64::INFINITY;
                 total_im = 0.0;
                 break;
             }
 
-            let h_re = (b_re * a_re + b_im * a_im) / denom;
-            let h_im = (b_im * a_re - b_re * a_im) / denom;
+            let (h_re, h_im) = complex_div(b_re, b_im, a_re, a_im);
 
             let new_re = total_re * h_re - total_im * h_im;
             let new_im = total_re * h_im + total_im * h_re;
@@ -11948,7 +12035,7 @@ pub fn sosfreqz_with_whole(
             total_im = new_im;
         }
 
-        let mag = (total_re * total_re + total_im * total_im).sqrt();
+        let mag = complex_magnitude(total_re, total_im);
         (omega, mag, total_im.atan2(total_re))
     };
 
@@ -12014,13 +12101,11 @@ pub fn freqs_zpk(zpk: &ZpkCoeffs, w: &[f64]) -> Result<FreqzResult, SignalError>
         for (&pr, &pi) in zpk.poles_re.iter().zip(zpk.poles_im.iter()) {
             den = cmul(den, (-pr, omega - pi));
         }
-        let dd = den.0 * den.0 + den.1 * den.1;
-        if dd < 1e-300 {
+        if den.0 == 0.0 && den.1 == 0.0 {
             (omega, f64::INFINITY, 0.0)
         } else {
-            let h_re = (num.0 * den.0 + num.1 * den.1) / dd;
-            let h_im = (num.1 * den.0 - num.0 * den.1) / dd;
-            (omega, (h_re * h_re + h_im * h_im).sqrt(), h_im.atan2(h_re))
+            let (h_re, h_im) = complex_div(num.0, num.1, den.0, den.1);
+            (omega, complex_magnitude(h_re, h_im), h_im.atan2(h_re))
         }
     }))
 }
@@ -12144,13 +12229,11 @@ pub fn freqs(b: &[f64], a: &[f64], w: &[f64]) -> Result<FreqzResult, SignalError
         let (b_re, b_im) = eval_analog_poly(b, omega);
         let (a_re, a_im) = eval_analog_poly(a, omega);
 
-        let denom = a_re * a_re + a_im * a_im;
-        if denom < 1e-30 {
+        if a_re == 0.0 && a_im == 0.0 {
             (omega, f64::INFINITY, 0.0)
         } else {
-            let h_re = (b_re * a_re + b_im * a_im) / denom;
-            let h_im = (b_im * a_re - b_re * a_im) / denom;
-            (omega, (h_re * h_re + h_im * h_im).sqrt(), h_im.atan2(h_re))
+            let (h_re, h_im) = complex_div(b_re, b_im, a_re, a_im);
+            (omega, complex_magnitude(h_re, h_im), h_im.atan2(h_re))
         }
     }))
 }
@@ -12235,8 +12318,7 @@ pub fn bode(num: &[f64], den: &[f64], w: &[f64]) -> Result<BodeTriplet, SignalEr
         let omega = w[i];
         let (br, bi) = eval_analog_poly(num, omega);
         let (ar, ai) = eval_analog_poly(den, omega);
-        let denom = ar * ar + ai * ai;
-        ((br * ar + bi * ai) / denom, (bi * ar - br * ai) / denom)
+        complex_div(br, bi, ar, ai)
     });
     Ok(bode_from_complex(&h, w))
 }
@@ -12245,19 +12327,22 @@ pub fn bode(num: &[f64], den: &[f64], w: &[f64]) -> Result<BodeTriplet, SignalEr
 /// `scipy.signal.dbode((num, den, dt), w)` for the explicit-frequency case.
 ///
 /// `H(z) = num(z)/den(z)` is evaluated at `z = e^{jω}` for each `ω` in `w`,
-/// where `w` is in radians/sample. As in scipy, the sample time `dt` is system
-/// metadata and does not affect the explicit-frequency response (kept in the
-/// signature for parity with the `(num, den, dt)` system tuple). Returns
-/// `(w, mag_dB, phase_deg)` as in [`bode`].
+/// where the input `w` is in radians/sample. Returns
+/// `(w / dt, mag_dB, phase_deg)`, with output frequencies in radians per unit
+/// time, as in `scipy.signal.dbode`. The sample time changes the reported
+/// frequency units, not the response values.
 pub fn dbode(num: &[f64], den: &[f64], dt: f64, w: &[f64]) -> Result<BodeTriplet, SignalError> {
-    let _ = dt; // unused for explicit-frequency response (matches scipy)
     if num.is_empty() || den.is_empty() {
         return Err(SignalError::InvalidArgument(
             "num and den must be non-empty".to_string(),
         ));
     }
     let h = dfreqresp(num, den, dt, w)?.1;
-    Ok(bode_from_complex(&h, w))
+    let (mut frequencies, magnitude, phase) = bode_from_complex(&h, w);
+    for frequency in &mut frequencies {
+        *frequency /= dt;
+    }
+    Ok((frequencies, magnitude, phase))
 }
 
 /// Complex frequency response of a discrete-time transfer function, matching
@@ -12296,8 +12381,7 @@ pub fn dfreqresp(
         let (zre, zim) = (omega.cos(), omega.sin());
         let (br, bi) = eval_poly_complex(num, zre, zim);
         let (ar, ai) = eval_poly_complex(den, zre, zim);
-        let denom = ar * ar + ai * ai;
-        ((br * ar + bi * ai) / denom, (bi * ar - br * ai) / denom)
+        complex_div(br, bi, ar, ai)
     });
     Ok((w.to_vec(), h))
 }
@@ -27314,6 +27398,410 @@ mod tests {
         for (i, &mag) in result.h_mag.iter().enumerate() {
             assert_close(mag, 1.0, 1e-12, &format!("unity mag at bin {i}"));
         }
+    }
+
+    #[test]
+    fn complex_frequency_response_division_keeps_representable_components() {
+        let tiny = f64::from_bits(1);
+        let cases = [
+            ((f64::MAX, f64::MAX, f64::MAX, f64::MAX), (1.0, 0.0)),
+            ((tiny, tiny, tiny, tiny), (1.0, 0.0)),
+            ((f64::MAX, f64::MAX, 1.0, 1.0), (f64::MAX, 0.0)),
+            ((1e-300, 1e-300, 1e-100, 1e-100), (1e-200, 0.0)),
+            // The imaginary quotient is representable even though normalizing
+            // both denominator components by 1e100 would erase its imaginary part.
+            ((1e300, 0.0, 1e100, 1e-300), (1e200, -1e-200)),
+        ];
+        for ((ar, ai, br, bi), (expected_re, expected_im)) in cases {
+            let (re, im) = complex_div(ar, ai, br, bi);
+            for (actual, expected) in [(re, expected_re), (im, expected_im)] {
+                if expected == 0.0 {
+                    assert_eq!(actual, expected);
+                } else {
+                    assert!(
+                        (actual / expected - 1.0).abs() < 4e-15,
+                        "({ar}+{ai}j)/({br}+{bi}j): {actual} vs {expected}"
+                    );
+                }
+            }
+        }
+
+        // Keep established rounding for ordinary filter-design and response work.
+        for (ar, ai, br, bi) in [(0.5, 0.2, 1.0, -0.4), (3.0, -5.0, -2.0, 7.0)] {
+            let den = br * br + bi * bi;
+            let expected = ((ar * br + ai * bi) / den, (ai * br - ar * bi) / den);
+            let actual = complex_div(ar, ai, br, bi);
+            assert_eq!(actual.0.to_bits(), expected.0.to_bits());
+            assert_eq!(actual.1.to_bits(), expected.1.to_bits());
+        }
+    }
+
+    #[test]
+    fn frequency_response_is_invariant_to_common_coefficient_scale() {
+        let b = [0.5, 0.25, 0.125];
+        let a = [1.0, -0.4, 0.2];
+        let w = [0.0, 0.1, 0.5, 1.0, 2.0];
+        let responses = |b: &[f64], a: &[f64]| {
+            let sos = [[b[0], b[1], b[2], a[0], a[1], a[2]]];
+            [
+                freqz(b, a, Some(8)).unwrap(),
+                freqz_with_whole(b, a, Some(8), true).unwrap(),
+                freqz_sos(&sos, Some(8)).unwrap(),
+                sosfreqz_with_whole(&sos, Some(8), true).unwrap(),
+                freqs(b, a, &w).unwrap(),
+            ]
+        };
+        let expected = responses(&b, &a);
+        let expected_linear = magnitude_response(&b, &a, 8);
+        let expected_db = magnitude_response_db(&b, &a, 8);
+        for scale in [1e-20, 1e-200, 1e200, -1e200] {
+            let scaled_b = b.map(|value| value * scale);
+            let scaled_a = a.map(|value| value * scale);
+            for (actual, reference) in responses(&scaled_b, &scaled_a).iter().zip(&expected) {
+                assert_eq!(actual.w, reference.w);
+                for (actual, reference) in actual.h_mag.iter().zip(&reference.h_mag) {
+                    assert!((actual / reference - 1.0).abs() < 2e-14);
+                }
+                for (actual, reference) in actual.h_phase.iter().zip(&reference.h_phase) {
+                    assert!((actual - reference).abs() < 2e-14);
+                }
+            }
+            let linear = magnitude_response(&scaled_b, &scaled_a, 8);
+            let decibels = magnitude_response_db(&scaled_b, &scaled_a, 8);
+            assert_eq!(linear.0, expected_linear.0);
+            assert_eq!(decibels.0, expected_db.0);
+            for (actual, reference) in linear.1.iter().zip(&expected_linear.1) {
+                assert!((actual / reference - 1.0).abs() < 2e-14);
+            }
+            for (actual, reference) in decibels.1.iter().zip(&expected_db.1) {
+                assert!((actual - reference).abs() < 2e-12);
+            }
+        }
+
+        // Padding selects freqz's FFT path without changing the transfer function.
+        let expected_fft = freqz(&b, &a, Some(64)).unwrap();
+        for scale in [1e-200, 1e200] {
+            let mut scaled_b = b.map(|value| value * scale).to_vec();
+            let mut scaled_a = a.map(|value| value * scale).to_vec();
+            scaled_b.resize(32, 0.0);
+            scaled_a.resize(32, 0.0);
+            let actual = freqz(&scaled_b, &scaled_a, Some(64)).unwrap();
+            for (actual, reference) in actual.h_mag.iter().zip(&expected_fft.h_mag) {
+                assert!((actual / reference - 1.0).abs() < 2e-13);
+            }
+            for (actual, reference) in actual.h_phase.iter().zip(&expected_fft.h_phase) {
+                assert!((actual - reference).abs() < 2e-13);
+            }
+        }
+    }
+
+    #[test]
+    fn frequency_response_keeps_coefficients_beyond_the_fft_grid() {
+        let n = 64;
+        for whole in [false, true] {
+            let nfft = if whole { n } else { 2 * n };
+            // z^-nfft is unity on this grid, even though its coefficient lies
+            // beyond the end of the FFT buffer. Truncation would erase the filter.
+            let mut delayed = vec![0.0; nfft + 1];
+            delayed[nfft] = 1.0;
+            let response = freqz_with_whole(&delayed, &[1.0], Some(n), whole).unwrap();
+            for (magnitude, phase) in response.h_mag.iter().zip(&response.h_phase) {
+                assert!((magnitude - 1.0).abs() < 2e-13);
+                assert!(phase.abs() < 2e-13);
+            }
+
+            // A(z) = 1 - 0.5 z^-nfft is 0.5 on the same grid; omitting the final
+            // denominator coefficient would incorrectly halve the response.
+            delayed[nfft] = -0.5;
+            delayed[0] = 1.0;
+            let response = freqz_with_whole(&[1.0], &delayed, Some(n), whole).unwrap();
+            for (magnitude, phase) in response.h_mag.iter().zip(&response.h_phase) {
+                assert!((magnitude - 2.0).abs() < 4e-13);
+                assert!(phase.abs() < 2e-13);
+            }
+        }
+    }
+
+    #[test]
+    fn frequency_response_preserves_extreme_finite_gain_and_distinguishes_poles() {
+        let w = [0.0, 1.0, 2.0];
+        for gain in [
+            1e200,
+            1e-200,
+            f64::MAX / 2.0,
+            f64::MIN_POSITIVE,
+            f64::from_bits(1),
+        ] {
+            let sos = [[gain, 0.0, 0.0, 1.0, 0.0, 0.0]];
+            for result in [
+                freqz(&[gain], &[1.0], Some(8)).unwrap(),
+                freqz_with_whole(&[gain], &[1.0], Some(8), true).unwrap(),
+                sosfreqz(&sos, Some(8)).unwrap(),
+                sosfreqz_with_whole(&sos, Some(8), true).unwrap(),
+                freqs(&[gain], &[1.0], &w).unwrap(),
+            ] {
+                for actual in result.h_mag {
+                    assert!((actual / gain - 1.0).abs() < 4e-15, "{actual} vs {gain}");
+                }
+            }
+            for actual in magnitude_response(&[gain], &[1.0], 8).1 {
+                assert!((actual / gain - 1.0).abs() < 4e-15);
+            }
+            for actual in magnitude_response_db(&[gain], &[1.0], 8).1 {
+                assert!((actual - 20.0 * gain.log10()).abs() < 2e-12);
+            }
+        }
+
+        let mut zpk = ZpkCoeffs {
+            zeros_re: vec![],
+            zeros_im: vec![],
+            poles_re: vec![1.0 - 1e-16],
+            poles_im: vec![0.0],
+            gain: 1.0,
+        };
+        let digital = freqz_zpk(&zpk, Some(8)).unwrap();
+        assert_eq!(digital.h_mag[0], 1.0 / (1.0 - zpk.poles_re[0]));
+        for pole in [-1e-200, -1e200] {
+            zpk.poles_re[0] = pole;
+            let analog = freqs_zpk(&zpk, &[0.0]).unwrap();
+            assert!((analog.h_mag[0] * -pole - 1.0).abs() < 4e-15);
+        }
+
+        // Preserve the existing exact-pole convention; only finite nonzero
+        // denominators stop being mistaken for poles because of their scale.
+        for response in [
+            freqz(&[1.0], &[0.0], Some(8)).unwrap(),
+            freqs(&[1.0], &[0.0], &w).unwrap(),
+        ] {
+            assert!(response.h_mag.iter().all(|value| *value == f64::INFINITY));
+            assert!(response.h_phase.iter().all(|value| *value == 0.0));
+        }
+        assert!(
+            magnitude_response(&[1.0], &[0.0], 8)
+                .1
+                .iter()
+                .all(|value| *value == f64::INFINITY)
+        );
+        assert!(
+            magnitude_response(&[0.0], &[1.0], 8)
+                .1
+                .iter()
+                .all(|value| *value == 0.0)
+        );
+        assert!(
+            magnitude_response_db(&[0.0], &[1.0], 8)
+                .1
+                .iter()
+                .all(|value| *value == f64::NEG_INFINITY)
+        );
+    }
+
+    #[test]
+    fn dbode_reports_physical_frequency_with_scipy_sample_time_semantics() {
+        let w = [0.1, 0.5, 1.0, 2.0];
+        let b = [1.0, 0.5];
+        let a = [1.0, -0.3, 0.1];
+        let reference = dbode(&b, &a, 1.0, &w).unwrap();
+        for dt in [0.25, 2.0, 8.0] {
+            let (frequency, magnitude, phase) = dbode(&b, &a, dt, &w).unwrap();
+            assert_eq!(frequency, w.map(|value| value / dt));
+            assert_eq!(magnitude, reference.1);
+            assert_eq!(phase, reference.2);
+            assert_eq!(dfreqresp(&b, &a, dt, &w).unwrap().0, w);
+        }
+        for (dt, expected) in [
+            (0.0, [f64::INFINITY; 4]),
+            (-1.0, [-0.1, -0.5, -1.0, -2.0]),
+            (f64::INFINITY, [0.0; 4]),
+            (f64::NAN, [f64::NAN; 4]),
+        ] {
+            let (frequency, magnitude, phase) = dbode(&b, &a, dt, &w).unwrap();
+            for (actual, expected) in frequency.iter().zip(&expected) {
+                assert!(actual == expected || (actual.is_nan() && expected.is_nan()));
+            }
+            assert_eq!(magnitude, reference.1);
+            assert_eq!(phase, reference.2);
+        }
+    }
+
+    #[test]
+    fn frequency_response_matches_live_scipy_across_coefficient_scales() {
+        use std::process::Command;
+
+        let required = std::env::var("FSCI_REQUIRE_SCIPY_ORACLE").as_deref() == Ok("1");
+        let python = std::env::var("FSCI_PYTHON").unwrap_or_else(|_| "python3".into());
+        let available = Command::new(&python)
+            .args(["-c", "import scipy; import numpy"])
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !available {
+            assert!(!required, "required SciPy oracle unavailable via {python}");
+            eprintln!("SKIP frequency response: missing SciPy; compared cases = 0");
+            return;
+        }
+        fn flatten(a: &[f64], b: &[f64], c: &[f64]) -> Vec<f64> {
+            a.iter()
+                .zip(b)
+                .zip(c)
+                .flat_map(|((&a, &b), &c)| [a, b, c])
+                .collect()
+        }
+        fn response_values(response: FreqzResult) -> Vec<f64> {
+            flatten(&response.w, &response.h_mag, &response.h_phase)
+        }
+        fn bode_values((w, magnitude, phase): BodeTriplet) -> Vec<f64> {
+            flatten(&w, &magnitude, &phase)
+        }
+
+        let w = [0.0, 0.1, 0.5, 1.0, 2.0];
+        let mut actual = Vec::new();
+        for scale in [1.0, 1e-20, 1e-200, 1e200] {
+            let b = [0.5, 0.25, 0.125].map(|value| value * scale);
+            let a = [1.0, -0.4, 0.2].map(|value| value * scale);
+            let sos = [[b[0], b[1], b[2], a[0], a[1], a[2]]];
+            for whole in [false, true] {
+                actual.push((
+                    "freqz",
+                    response_values(freqz_with_whole(&b, &a, Some(8), whole).unwrap()),
+                ));
+            }
+            let (frequency, magnitude) = magnitude_response(&b, &a, 8);
+            actual.push((
+                "magnitude_response",
+                flatten(&frequency, &magnitude, &[0.0; 8]),
+            ));
+            let (frequency, magnitude) = magnitude_response_db(&b, &a, 8);
+            actual.push((
+                "magnitude_response_db",
+                flatten(&frequency, &magnitude, &[0.0; 8]),
+            ));
+            actual.push(("freqs", response_values(freqs(&b, &a, &w).unwrap())));
+            for whole in [false, true] {
+                actual.push((
+                    "sosfreqz",
+                    response_values(sosfreqz_with_whole(&sos, Some(8), whole).unwrap()),
+                ));
+            }
+            actual.push(("bode", bode_values(bode(&b, &a, &w).unwrap())));
+            let (frequency, response) = dfreqresp(&b, &a, 2.0, &w).unwrap();
+            actual.push((
+                "dfreqresp",
+                frequency
+                    .iter()
+                    .zip(&response)
+                    .flat_map(|(&w, &(re, im))| [w, re, im])
+                    .collect(),
+            ));
+            for dt in [0.25, 2.0, 8.0, 0.0, -1.0, f64::INFINITY, f64::NAN] {
+                actual.push(("dbode", bode_values(dbode(&b, &a, dt, &w).unwrap())));
+            }
+        }
+        for whole in [false, true] {
+            let nfft = if whole { 64 } else { 128 };
+            let mut delayed = vec![0.0; nfft + 1];
+            delayed[nfft] = 1.0;
+            actual.push((
+                "freqz_long_numerator",
+                response_values(freqz_with_whole(&delayed, &[1.0], Some(64), whole).unwrap()),
+            ));
+            delayed[nfft] = -0.5;
+            delayed[0] = 1.0;
+            actual.push((
+                "freqz_long_denominator",
+                response_values(freqz_with_whole(&[1.0], &delayed, Some(64), whole).unwrap()),
+            ));
+        }
+        assert_eq!(actual.len(), 68);
+        let script = r#"
+import os
+import numpy as np
+import scipy
+from scipy import signal
+if os.environ.get("FSCI_REQUIRE_SCIPY_ORACLE") == "1":
+    assert (scipy.__version__, np.__version__) == ("1.17.1", "2.4.3")
+print("VERSIONS", scipy.__version__, np.__version__)
+def emit(name, x, y, z, allow_nonfinite_frequency=False):
+    values = np.column_stack((x, y, z)).ravel()
+    assert np.isfinite(y).all() and np.isfinite(z).all(), name
+    assert allow_nonfinite_frequency or np.isfinite(x).all(), name
+    print(name, *[format(float(value), ".17g") for value in values])
+def response(name, result):
+    w, h = result
+    emit(name, w, np.abs(h), np.angle(h))
+w = np.array([0., .1, .5, 1., 2.])
+for scale in [1., 1e-20, 1e-200, 1e200]:
+    b = np.array([.5, .25, .125])*scale
+    a = np.array([1., -.4, .2])*scale
+    for whole in [False, True]:
+        response("freqz", signal.freqz(b, a, worN=8, whole=whole))
+    wf, hf = signal.freqz(b, a, worN=8)
+    emit("magnitude_response", wf, np.abs(hf), np.zeros_like(wf))
+    emit("magnitude_response_db", wf, 20*np.log10(np.abs(hf)), np.zeros_like(wf))
+    response("freqs", signal.freqs(b, a, worN=w))
+    # SciPy requires unit a0 in SOS; explicit normalization represents the
+    # same section as FrankenSciPy's supported nonunit-a0 SOS input.
+    sos = np.concatenate((b/a[0], a/a[0]))[None, :]
+    for whole in [False, True]:
+        response("sosfreqz", signal.sosfreqz(sos, worN=8, whole=whole))
+    emit("bode", *signal.bode((b, a), w=w))
+    wf, hf = signal.dfreqresp((b, a, 2.), w=w)
+    emit("dfreqresp", wf, hf.real, hf.imag)
+    for dt in [.25, 2., 8., 0., -1., np.inf, np.nan]:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            emit("dbode", *signal.dbode((b, a, dt), w=w), allow_nonfinite_frequency=True)
+for whole in [False, True]:
+    nfft = 64 if whole else 128
+    delayed = np.zeros(nfft + 1)
+    delayed[-1] = 1.
+    response("freqz_long_numerator", signal.freqz(delayed, [1.], worN=64, whole=whole))
+    delayed[-1] = -.5
+    delayed[0] = 1.
+    response("freqz_long_denominator", signal.freqz([1.], delayed, worN=64, whole=whole))
+"#;
+        let output = Command::new(&python)
+            .args(["-c", script])
+            .output()
+            .expect("launch frequency-response SciPy oracle");
+        assert!(
+            output.status.success(),
+            "SciPy frequency-response oracle failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output_text = String::from_utf8(output.stdout).unwrap();
+        let mut lines = output_text.lines();
+        let versions: Vec<_> = lines.next().unwrap().split_whitespace().collect();
+        assert_eq!(versions[0], "VERSIONS");
+        if required {
+            assert_eq!(&versions[1..], &["1.17.1", "2.4.3"]);
+        }
+        for (case, (name, actual)) in actual.iter().enumerate() {
+            let mut values = lines
+                .next()
+                .expect("one row per response")
+                .split_whitespace();
+            assert_eq!(values.next(), Some(*name));
+            let expected: Vec<f64> = values.map(|value| value.parse().unwrap()).collect();
+            assert_eq!(actual.len(), expected.len());
+            for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+                if expected.is_nan() {
+                    assert!(actual.is_nan(), "case {case} {name}[{index}]: expected NaN");
+                    continue;
+                }
+                if expected.is_infinite() {
+                    assert_eq!(actual, expected, "case {case} {name}[{index}]");
+                    continue;
+                }
+                assert!(
+                    (actual - expected).abs() <= 2e-12 * expected.abs().max(1.0),
+                    "case {case} {name}[{index}]: {actual:.17e} vs SciPy {expected:.17e}"
+                );
+            }
+        }
+        assert!(lines.next().is_none());
+        eprintln!(
+            "SciPy {} NumPy {}: compared 68 frequency responses",
+            versions[1], versions[2]
+        );
     }
 
     #[test]
