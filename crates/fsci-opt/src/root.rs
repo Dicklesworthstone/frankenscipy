@@ -1820,6 +1820,10 @@ where
                 .zip(&dx)
                 .map(|(&xi, &di)| xi + alpha * di)
                 .collect();
+            if trial.iter().any(|value| !value.is_finite()) {
+                alpha *= 0.5;
+                continue;
+            }
             let ftrial = evaluate_multivariate_root(&func, &trial, n, "fsolve")?;
             nfev += 1;
             let trial_norm = euclidean_norm(&ftrial);
@@ -1844,7 +1848,7 @@ where
                 // s = new_x − x and y = new_fx − fx. Costs O(n^2) and no residual evals.
                 let s: Vec<f64> = new_x.iter().zip(&x).map(|(a, b)| a - b).collect();
                 let sts: f64 = s.iter().map(|v| v * v).sum();
-                if sts > 0.0 {
+                if sts.is_finite() && sts > 0.0 {
                     for i in 0..n {
                         let js_i: f64 = (0..n).map(|k| jac[i][k] * s[k]).sum();
                         let coeff = (new_fx[i] - fx[i] - js_i) / sts;
@@ -1855,7 +1859,8 @@ where
                         }
                     }
                 } else {
-                    jac_valid = false; // degenerate step; rebuild the FD Jacobian next iter
+                    // A degenerate or unrepresentable update requires a fresh Jacobian.
+                    jac_valid = false;
                 }
             }
             x = new_x;
@@ -1869,6 +1874,16 @@ where
                 .zip(&dx)
                 .map(|(&xi, &di)| xi + alpha * di)
                 .collect();
+            if trial.iter().any(|value| !value.is_finite()) {
+                return Ok(MultivariateRootResult {
+                    x,
+                    fun: fx,
+                    converged: false,
+                    message: String::from("fsolve: no finite trial within the line search"),
+                    iterations: iteration + 1,
+                    function_calls: nfev,
+                });
+            }
             let ftrial = evaluate_multivariate_root(&func, &trial, n, "fsolve")?;
             nfev += 1;
             x = trial;
@@ -4476,6 +4491,27 @@ mod tests {
         assert!(result.converged, "{result:?}");
         assert_eq!(result.x, [2.0, 1.0]);
         assert_eq!(result.fun, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn fsolve_never_accepts_an_infinite_coordinate_as_a_root() {
+        // The full Newton trial for a/x doubles x and overflows. Evaluating
+        // the callback at infinity would return zero and manufacture a root.
+        let result = root(
+            |x| {
+                assert!(x[0].is_finite());
+                vec![1e308 / x[0]]
+            },
+            &[0.75 * f64::MAX],
+            MultivariateRootOptions {
+                tol: 1e-12,
+                max_iter: 8,
+                ..MultivariateRootOptions::default()
+            },
+        )
+        .expect("line search retains a finite iterate");
+        assert!(!result.converged, "{result:?}");
+        assert!(result.x[0].is_finite() && result.fun[0] > 0.5);
     }
 
     #[test]
