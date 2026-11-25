@@ -755,11 +755,10 @@ pub fn det(a: &[Vec<C64>], options: DecompOptions) -> Result<C64, LinalgError> {
 
 /// `scipy.linalg.solve(a, b)` on complex input.
 ///
-/// `assume_a` selects the factorization as in SciPy: `PositiveDefinite` uses Cholesky
-/// (`zpotrf`), `UpperTriangular`/`LowerTriangular` and `Diagonal` solve directly, and every
-/// other assumption (general, symmetric, Hermitian) uses LU with partial pivoting. `transposed`
-/// solves `Aᵀ·x = b`. A zero pivot is [`LinalgError::SingularMatrix`]; `rcond < eps` sets the
-/// ill-conditioning warning SciPy emits.
+/// `PositiveDefinite` uses Cholesky, triangular and diagonal systems solve directly,
+/// and the remaining systems use LU with partial pivoting. For symmetric, Hermitian
+/// and positive-definite systems, `lower` selects the stored triangle. SciPy rejects
+/// `transposed` for complex systems. A zero pivot is [`LinalgError::SingularMatrix`].
 ///
 /// # Errors
 /// Shape, finiteness, singularity and (Cholesky) non-positive-definiteness errors.
@@ -798,7 +797,24 @@ pub fn solve(
             warning: None,
         });
     }
-    let am = to_dm(a, n, n);
+    // SciPy handles a scalar system before dispatching on its assumed structure.
+    if n == 1 {
+        if a[0][0] == CZERO {
+            return Err(LinalgError::SingularMatrix);
+        }
+        return Ok(ComplexSolveResult {
+            x: vec![zladiv(b[0], a[0][0])],
+            rcond: 1.0,
+            warning: None,
+        });
+    }
+    let am = match options.assume_a {
+        Some(MatrixAssumption::Symmetric) => symmetric_from_triangle(a, options.lower, false),
+        Some(MatrixAssumption::Hermitian | MatrixAssumption::PositiveDefinite) => {
+            symmetric_from_triangle(a, options.lower, true)
+        }
+        _ => to_dm(a, n, n),
+    };
     match options.assume_a {
         Some(MatrixAssumption::Diagonal) => {
             let mut x = Vec::with_capacity(n);
@@ -1863,13 +1879,19 @@ pub fn eigvals(a: &[Vec<C64>], options: DecompOptions) -> Result<Vec<C64>, Linal
 // Hermitian eigenproblem and SVD
 // ══════════════════════════════════════════════════════════════════════
 
-/// The Hermitian matrix defined by `a`'s lower triangle (SciPy's `eigh(lower=True)` default),
-/// with the diagonal's imaginary parts ignored as LAPACK's `zheevr` ignores them.
-fn hermitian_from_lower(a: &[Vec<C64>], n: usize) -> DMatrix<C64> {
-    DMatrix::from_fn(n, n, |i, j| match i.cmp(&j) {
-        std::cmp::Ordering::Equal => Complex::new(a[i][i].re, 0.0),
-        std::cmp::Ordering::Greater => a[i][j],
-        std::cmp::Ordering::Less => a[j][i].conj(),
+/// Complete the selected triangle as a complex symmetric or Hermitian matrix. LAPACK
+/// treats the diagonal as real in the Hermitian case.
+fn symmetric_from_triangle(a: &[Vec<C64>], lower: bool, hermitian: bool) -> DMatrix<C64> {
+    DMatrix::from_fn(a.len(), a.len(), |i, j| {
+        if i == j && hermitian {
+            Complex::new(a[i][i].re, 0.0)
+        } else if i == j || (i > j) == lower {
+            a[i][j]
+        } else if hermitian {
+            a[j][i].conj()
+        } else {
+            a[j][i]
+        }
     })
 }
 
@@ -1882,7 +1904,7 @@ fn hermitian_eigen(
     if n == 0 {
         return Ok((Vec::new(), DMatrix::from_element(0, 0, CZERO)));
     }
-    let m = hermitian_from_lower(a, n);
+    let m = symmetric_from_triangle(a, true, true);
     let eig = nalgebra::linalg::SymmetricEigen::try_new(m, EPS, 0).ok_or_else(|| {
         LinalgError::ConvergenceFailure {
             detail: "the Hermitian eigenvalue algorithm failed to converge".to_string(),
@@ -2808,6 +2830,59 @@ mod tests {
         for (p, g) in x_pd.iter().zip(&x_gen) {
             assert!((p - g).norm() < 1e-12);
         }
+    }
+
+    #[test]
+    fn structured_solve_uses_only_the_selected_triangle() {
+        let off = c(1.0, 2.0);
+        let unused = c(1e80, -2e80);
+        for assumption in [
+            MatrixAssumption::Symmetric,
+            MatrixAssumption::Hermitian,
+            MatrixAssumption::PositiveDefinite,
+        ] {
+            // Each right-hand side was formed from x = [1+i, 2-i] and x = [0, 1].
+            let symmetric = assumption == MatrixAssumption::Symmetric;
+            let rhs = if symmetric {
+                [c(7.0, 8.0), c(4.0, -2.0)]
+            } else {
+                [c(8.0, 7.0), c(9.0, -4.0)]
+            };
+            let rhs2 = if symmetric { c(3.0, -1.0) } else { c(3.0, 0.0) };
+            for lower in [false, true] {
+                // Hermitian LAPACK routines also ignore the imaginary diagonal.
+                let mut a = vec![vec![c(4.0, 1.0), unused], vec![unused, c(3.0, -1.0)]];
+                if lower {
+                    a[1][0] = if symmetric { off } else { off.conj() };
+                } else {
+                    a[0][1] = off;
+                }
+                let options = SolveOptions {
+                    assume_a: Some(assumption),
+                    lower,
+                    ..SolveOptions::default()
+                };
+                let r = solve(&a, &rhs, options).unwrap();
+                assert!((r.x[0] - c(1.0, 1.0)).norm() < 1e-13);
+                assert!((r.x[1] - c(2.0, -1.0)).norm() < 1e-13);
+                assert!(r.rcond > 0.05 && r.rcond <= 1.0);
+                assert!(r.warning.is_none());
+                let x = solve_matrix(&a, &[vec![rhs[0], off], vec![rhs[1], rhs2]], options)
+                    .unwrap();
+                let expected = [vec![c(1.0, 1.0), CZERO], vec![c(2.0, -1.0), CONE]];
+                assert!(max_abs_diff(&x, &expected) < 1e-13);
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_solve_preserves_complex_diagonal_before_structure_dispatch() {
+        let options = SolveOptions {
+            assume_a: Some(MatrixAssumption::PositiveDefinite),
+            ..SolveOptions::default()
+        };
+        let x = solve(&[vec![c(0.0, 2.0)]], &[c(4.0, 0.0)], options).unwrap();
+        assert_eq!(x.x, vec![c(0.0, -2.0)]);
     }
 
     #[test]
