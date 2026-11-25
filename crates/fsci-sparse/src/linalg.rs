@@ -10220,7 +10220,7 @@ enum KrylovCycleStop {
 /// and `b`. When `A·v_k` is itself zero the floor is zero, and the exact
 /// breakdown `‖w‖ = 0` still trips it.
 fn arnoldi_breakdown_floor(w_norm_before_orthogonalization: f64) -> f64 {
-    f64::EPSILON * 100.0 * w_norm_before_orthogonalization
+    f64::EPSILON * w_norm_before_orthogonalization
 }
 
 /// Apply one modified-Gram-Schmidt projection without re-indexing the jagged
@@ -10357,46 +10357,70 @@ fn givens_rotation(a: f64, b: f64) -> (f64, f64) {
     }
 }
 
-/// Solve the upper triangular system H*y = g, then update x += V*y.
-///
-/// The pivot test is relative to the largest diagonal of the triangular factor
-/// (frankenscipy-4u7vp). An absolute floor here has the same scaling defect as
-/// the Arnoldi breakdown test — see [`arnoldi_breakdown_floor`] — but a nastier
-/// failure: with `A` and `b` scaled down, EVERY pivot falls under a bare
-/// `ε·100`, no division is performed at all, and `y` is returned holding raw
-/// back-substitution numerators. That is not a fallback, it is a wrong answer,
-/// and GMRES then reports it as converged. A pivot that is negligible against
-/// the factor's own scale means `H` is numerically singular in that row, so the
-/// component is dropped instead of divided.
-fn update_solution(x: &mut [f64], v: &[Vec<f64>], h: &[Vec<f64>], g: &[f64], k: usize) {
-    let pivot_floor =
-        f64::EPSILON * 100.0 * (0..k).fold(0.0_f64, |largest, i| largest.max(h[i][i].abs()));
-
-    // Back-substitution: solve H[0..k, 0..k] y = g[0..k]
-    let mut y = vec![0.0; k];
+/// Back substitution on the rotated Hessenberg factor. GMRES retains each
+/// nonzero pivot, as in SciPy. An exact zero at breakdown leaves that
+/// coefficient undetermined; the true residual decides convergence.
+fn gmres_back_substitute(h: &[Vec<f64>], g: &[f64], k: usize) -> Vec<f64> {
+    let mut y = g[..k].to_vec();
     for i in (0..k).rev() {
-        y[i] = g[i];
         for j in (i + 1)..k {
             y[i] -= h[i][j] * y[j];
         }
-        if h[i][i].abs() > pivot_floor {
+        if h[i][i] != 0.0 {
             y[i] /= h[i][i];
         } else {
             y[i] = 0.0;
         }
     }
+    y
+}
 
-    // x += V * y
+/// LGMRES projects onto a possibly dependent augmented basis. When a pivot
+/// is near roundoff, compute the minimum-norm least-squares correction for
+/// the whole factor, retaining couplings to earlier rows.
+fn update_solution(
+    x: &mut [f64],
+    v: &[Vec<f64>],
+    h: &[Vec<f64>],
+    g: &[f64],
+    k: usize,
+) -> SparseResult<()> {
+    let factor_scale = h[..k]
+        .iter()
+        .enumerate()
+        .flat_map(|(i, row)| &row[i..k])
+        .try_fold(0.0_f64, |largest, &entry| {
+            if entry.is_finite() {
+                Ok(largest.max(entry.abs()))
+            } else {
+                Err(SparseError::NonFiniteInput {
+                    message: "LGMRES projected factor is not finite".to_string(),
+                })
+            }
+        })?;
+    ensure_finite(&g[..k])?;
+    if factor_scale == 0.0 {
+        // With a zero image, the minimum-norm correction is zero.
+        return Ok(());
+    }
+    let pivot_floor = f64::EPSILON * factor_scale;
+    let y = if (0..k).any(|i| h[i][i].abs() <= pivot_floor) {
+        let factor = DMatrix::from_fn(k, k, |i, j| if i <= j { h[i][j] } else { 0.0 });
+        small_lstsq(factor, &g[..k]).ok_or_else(|| SparseError::SingularMatrix {
+            message: "LGMRES projected least-squares SVD did not converge".to_string(),
+        })?
+    } else {
+        gmres_back_substitute(h, g, k)
+    };
     for (j, &yj) in y.iter().enumerate() {
         for (i, xi) in x.iter_mut().enumerate() {
             *xi += yj * v[j][i];
         }
     }
+    Ok(())
 }
 
-/// Slab-backed counterpart of [`update_solution`] for GMRES' contiguous
-/// Arnoldi basis. It keeps the same back-substitution and accumulation order;
-/// only the basis-row address calculation differs.
+/// Apply the GMRES correction from the contiguous Arnoldi basis.
 fn update_solution_slab(
     x: &mut [f64],
     basis: &[f64],
@@ -10406,22 +10430,7 @@ fn update_solution_slab(
     k: usize,
 ) {
     debug_assert_eq!(basis.len() % row_width, 0);
-    let pivot_floor =
-        f64::EPSILON * 100.0 * (0..k).fold(0.0_f64, |largest, i| largest.max(h[i][i].abs()));
-
-    let mut y = vec![0.0; k];
-    for i in (0..k).rev() {
-        y[i] = g[i];
-        for j in (i + 1)..k {
-            y[i] -= h[i][j] * y[j];
-        }
-        if h[i][i].abs() > pivot_floor {
-            y[i] /= h[i][i];
-        } else {
-            y[i] = 0.0;
-        }
-    }
-
+    let y = gmres_back_substitute(h, g, k);
     for (j, &yj) in y.iter().enumerate() {
         let row = &basis[j * row_width..(j + 1) * row_width];
         for (xi, &basis_value) in x.iter_mut().zip(row) {
@@ -10912,13 +10921,11 @@ fn lgmres_inner(
     }
 
     // z = V * y (error approximation), where H * y = g. This is exactly
-    // `update_solution` accumulating onto a zero vector; it used to be an
-    // inlined copy, and the copy is how the absolute pivot floor survived here
-    // after being noticed elsewhere (frankenscipy-4u7vp).
+    // the projected least-squares correction accumulated onto a zero vector.
     let mut z = vec![0.0; n];
     // `zs`, not `v`: with augmentation the two differ, and combining the orthonormal
     // basis instead of the directions would solve a different problem entirely.
-    update_solution(&mut z, &zs, &h, &g, k);
+    update_solution(&mut z, &zs, &h, &g, k)?;
 
     Ok((z, k))
 }
@@ -31676,6 +31683,54 @@ mod tests {
     }
 
     #[test]
+    fn gmres_retains_resolved_directions_and_small_nonzero_pivots() {
+        let delta = 2.0_f64.powi(-48);
+        // First matrix: the first Arnoldi column has perpendicular component
+        // delta. Second matrix: the final triangular pivot is -delta.
+        for (rows, expected) in [
+            ([vec![1.0, 0.0], vec![delta, 1.0]], [1.0, -delta]),
+            ([vec![0.0, delta], vec![1.0, 0.0]], [0.0, 1.0 / delta]),
+        ] {
+            let a = crate::DenseLinearOperator::from_rows(&rows).expect("two by two");
+            let b = [1.0, 0.0];
+            let options = IterativeSolveOptions {
+                tol: 1e-16,
+                max_iter: Some(2),
+                ..IterativeSolveOptions::default()
+            };
+            let plain = gmres(&a, &b, None, options).expect("GMRES");
+            let augmented = lgmres(
+                &a,
+                &b,
+                None,
+                LgmresOptions {
+                    tol: options.tol,
+                    max_iter: Some(2),
+                    ..LgmresOptions::default()
+                },
+            )
+            .expect("LGMRES");
+            for result in [plain, augmented] {
+                assert!(result.converged, "{result:?}");
+                assert_eq!(result.iterations, 2);
+                assert_eq!(result.solution, expected);
+                assert_eq!(a.matvec(&result.solution).expect("true product"), b);
+            }
+        }
+    }
+
+    #[test]
+    fn lgmres_projected_rank_loss_uses_the_coupled_minimum_norm_solution() {
+        // R has dependent columns. Setting the second coefficient to zero
+        // gives [1, 0], while minimum norm splits the correction equally.
+        let basis = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let h = vec![vec![1.0, 1.0], vec![0.0, 0.0]];
+        let mut x = vec![0.0; 2];
+        update_solution(&mut x, &basis, &h, &[1.0, 2.0], 2).expect("rank-one factor");
+        assert_close_slice(&x, &[0.5, 0.5], 1e-12);
+    }
+
+    #[test]
     fn gmres_identity_system() {
         let a = identity_csr(4);
         let b = vec![1.0, 2.0, 3.0, 4.0];
@@ -31722,7 +31777,7 @@ mod tests {
         let mut jagged_solution = vec![0.125, -0.25, 0.375, -0.5];
         let mut slab_solution = jagged_solution.clone();
 
-        update_solution(&mut jagged_solution, &basis, &h, &g, 3);
+        update_solution(&mut jagged_solution, &basis, &h, &g, 3).expect("nonsingular factor");
         update_solution_slab(&mut slab_solution, &slab, 4, &h, &g, 3);
 
         for (index, (expected, actual)) in jagged_solution.iter().zip(&slab_solution).enumerate() {
