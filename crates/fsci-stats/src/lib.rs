@@ -3837,12 +3837,12 @@ impl ContinuousDistribution for GeneralizedExponential {
         self.raw_moment(2) - m1 * m1
     }
 
-    fn fit(_data: &[f64]) -> Self {
-        Self {
+    fn fit(data: &[f64]) -> Self {
+        Self::try_fit(data).unwrap_or(Self {
             a: f64::NAN,
             b: f64::NAN,
             c: f64::NAN,
-        }
+        })
     }
 
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
@@ -4494,12 +4494,12 @@ impl ContinuousDistribution for NoncentralF {
         )
     }
 
-    fn fit(_data: &[f64]) -> Self {
-        Self {
+    fn fit(data: &[f64]) -> Self {
+        Self::try_fit(data).unwrap_or(Self {
             dfn: f64::NAN,
             dfd: f64::NAN,
             nc: f64::NAN,
-        }
+        })
     }
 
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
@@ -5632,11 +5632,11 @@ impl ContinuousDistribution for GenGamma {
         ln_gamma(a) - c.abs().ln() + a - (a - 1.0 / c) * digamma(a)
     }
 
-    fn fit(_data: &[f64]) -> Self {
-        Self {
+    fn fit(data: &[f64]) -> Self {
+        Self::try_fit(data).unwrap_or(Self {
             a: f64::NAN,
             c: f64::NAN,
-        }
+        })
     }
 
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
@@ -103599,6 +103599,56 @@ mod tests {
         ));
     }
 
+    fn assert_numerical_fit_entry_points<D, F, const N: usize>(
+        data: &[f64],
+        fitted: &D,
+        parameters: F,
+    ) where
+        D: ContinuousDistribution + Send,
+        F: Fn(&D) -> [f64; N],
+    {
+        let expected = D::try_fit(data).expect("valid sample must fit");
+        let expected_parameters = parameters(&expected);
+        assert!(expected_parameters.iter().all(|p| p.is_finite()));
+        assert_eq!(
+            parameters(fitted).map(f64::to_bits),
+            expected_parameters.map(f64::to_bits),
+            "public fit must return the implemented MLE"
+        );
+
+        // Eight rows reach the threaded batch branch on multicore hosts.
+        // A valid final row also checks ordering when earlier rows fail;
+        // the infallible entry points retain their NaN-parameter error policy.
+        let datasets = vec![
+            Vec::new(),
+            vec![1.0],
+            vec![-1.0, 1.0, 2.0],
+            vec![f64::NAN, 1.0, 2.0],
+            vec![f64::INFINITY, 1.0, 2.0],
+            vec![f64::NEG_INFINITY, 1.0, 2.0],
+            Vec::new(),
+            data.to_vec(),
+        ];
+        let batched = fit_many::<D>(&datasets);
+        assert_eq!(batched.len(), datasets.len());
+        for (index, result) in batched.iter().enumerate() {
+            if index + 1 == datasets.len() {
+                assert_eq!(
+                    parameters(result).map(f64::to_bits),
+                    expected_parameters.map(f64::to_bits),
+                    "public batch fit must retain the MLE and its row position"
+                );
+            } else {
+                assert!(parameters(result).iter().all(|p| p.is_nan()));
+                assert!(
+                    parameters(&fit::<D>(&datasets[index]))
+                        .iter()
+                        .all(|p| p.is_nan())
+                );
+            }
+        }
+    }
+
     #[test]
     fn noncentral_f_fit_is_at_least_as_good_as_scipy() {
         // 40 samples from scipy ncf.rvs(dfn=5, dfd=10, nc=3, seed=12345).
@@ -103609,12 +103659,12 @@ mod tests {
             1.1573, 2.2714, 2.0008, 1.3171, 5.6385, 2.6986, 2.4623, 9.5572, 1.6277, 0.4523, 1.3335,
             1.3076, 1.6942, 0.8495, 0.4303, 1.8857, 2.4543, 0.4799,
         ];
-        let fitted = NoncentralF::try_fit(&data).expect("fit");
-        let nll = |d: &NoncentralF| -> f64 {
-            -data.iter().map(|&x| d.pdf(x).max(1e-300).ln()).sum::<f64>()
-        };
+        let fitted = fit::<NoncentralF>(&data);
+        assert_numerical_fit_entry_points(&data, &fitted, |d| [d.dfn, d.dfd, d.nc]);
+        let nll = |d: &NoncentralF| -> f64 { -data.iter().map(|&x| d.logpdf(x)).sum::<f64>() };
         // Our MLE must reach a likelihood at least as good as scipy's optimum.
         let scipy = NoncentralF::new(4.6568, 9.6699, 2.2005);
+        assert!(nll(&fitted).is_finite());
         assert!(
             nll(&fitted) <= nll(&scipy) + 1e-3,
             "NCF MLE not optimal: ours NLL={}, scipy-params NLL={}",
@@ -103678,10 +103728,11 @@ mod tests {
             1.6261, 1.1378, 2.0859, 1.0923, 1.4139, 1.7743, 1.202, 1.0151, 0.3565, 0.9591, 2.726,
             1.4728, 0.5724, 0.8462, 3.2725, 2.2045, 1.7951, 0.6421,
         ];
-        let fitted = GenGamma::try_fit(&data).expect("fit");
-        let nll =
-            |d: &GenGamma| -> f64 { -data.iter().map(|&x| d.pdf(x).max(1e-300).ln()).sum::<f64>() };
+        let fitted = fit::<GenGamma>(&data);
+        assert_numerical_fit_entry_points(&data, &fitted, |d| [d.a, d.c]);
+        let nll = |d: &GenGamma| -> f64 { -data.iter().map(|&x| d.logpdf(x)).sum::<f64>() };
         let scipy = GenGamma::new(1.9839, 1.542);
+        assert!(nll(&fitted).is_finite());
         assert!(
             nll(&fitted) <= nll(&scipy) + 1e-3,
             "GenGamma MLE not optimal: ours NLL={}, scipy-params NLL={}",
@@ -103719,12 +103770,13 @@ mod tests {
             0.1418, 0.6692, 0.1075, 0.1398, 0.5553, 0.1366, 0.1364, 0.0354, 0.2517, 0.1344, 0.6994,
             0.1463, 0.5115, 0.2647, 0.2522, 0.9778, 0.7215, 0.0394,
         ];
-        let fitted = GeneralizedExponential::try_fit(&data).expect("fit");
-        let nll = |d: &GeneralizedExponential| -> f64 {
-            -data.iter().map(|&x| d.pdf(x).max(1e-300).ln()).sum::<f64>()
-        };
+        let fitted = fit::<GeneralizedExponential>(&data);
+        assert_numerical_fit_entry_points(&data, &fitted, |d| [d.a, d.b, d.c]);
+        let nll =
+            |d: &GeneralizedExponential| -> f64 { -data.iter().map(|&x| d.logpdf(x)).sum::<f64>() };
         // Our MLE must reach a likelihood at least as good as scipy's optimum.
         let scipy = GeneralizedExponential::new(3.0223, 52.0731, 0.0058);
+        assert!(nll(&fitted).is_finite());
         assert!(
             nll(&fitted) <= nll(&scipy) + 1e-2,
             "genexpon MLE not optimal: ours NLL={}, scipy-params NLL={}",
