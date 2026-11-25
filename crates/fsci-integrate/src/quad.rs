@@ -2577,7 +2577,14 @@ where
 /// define the lower and upper corners of a hyper-rectangle, the integrand takes
 /// one point at a time as `&[f64]`, and the result contains componentwise
 /// integral and error estimates. Infinite limits are handled with smooth
-/// transformations to finite coordinates.
+/// transformations to finite coordinates. Scaled accumulation preserves finite
+/// integrals across extreme axis lengths and integrand magnitudes.
+///
+/// Nonzero regions need at least one representable interior point on every axis.
+/// An unsplittable region or an unrepresentable panel estimate returns
+/// `NotConverged`; non-finite totals never certify convergence. In particular,
+/// individually underflowed panel integrals remain unconverged even if their
+/// mathematical sum would be representable.
 pub fn cubature<F>(
     f: F,
     a: &[f64],
@@ -2611,20 +2618,31 @@ where
         });
     }
 
-    let initial_regions = initial_cubature_regions(&transformed_ranges, &transforms, &options);
+    let initial_regions = initial_cubature_regions(&transformed_ranges, &transforms, &options)?;
+    // Fail before any callback when the interior-only rule has no legal node.
+    for (lower, upper) in &initial_regions {
+        for (&lo, &hi) in lower.iter().zip(upper) {
+            if lo.min(hi).next_up() >= lo.max(hi) {
+                return Err(IntegrateValidationError::QuadInvalidBounds {
+                    detail: "nonzero cubature interval has no representable interior node"
+                        .to_string(),
+                });
+            }
+        }
+    }
     let sample_point = initial_regions
         .first()
         .map(|(lower, upper)| {
             lower
                 .iter()
                 .zip(upper.iter())
-                .map(|(&left, &right)| 0.5 * (left + right))
+                .map(|(&left, &right)| left.midpoint(right))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_else(|| {
             transformed_ranges
                 .iter()
-                .map(|(lower, upper)| 0.5 * (lower + upper))
+                .map(|(lower, upper)| lower.midpoint(*upper))
                 .collect::<Vec<_>>()
         });
     let mut sample_x = vec![0.0; a.len()];
@@ -2635,12 +2653,18 @@ where
         &mut sample_x,
         &mut sample_jacobian,
     );
+    if sample_x.iter().any(|value| !value.is_finite()) {
+        return Err(IntegrateValidationError::QuadInvalidBounds {
+            detail: "cubature sample point is not representable".to_string(),
+        });
+    }
     let sample = f(&sample_x);
     validate_cubature_output(&sample, sample.len())?;
     let output_dim = sample.len();
 
     let mut neval = 1;
     let mut regions = Vec::with_capacity(initial_regions.len());
+    let mut arithmetic_representable = true;
     for (initial_a, initial_b) in initial_regions {
         let initial = estimate_cubature_region(
             &f,
@@ -2651,25 +2675,45 @@ where
             options.rule,
         )?;
         neval += initial.neval;
+        arithmetic_representable &= initial.representable;
         regions.push(initial.region);
     }
     let mut subdivisions = 0usize;
 
     // SciPy's loop: take the region with the largest error and split it at its midpoint in
     // EVERY dimension (2^ndim subregions, `_split_subregion`).
-    while !cubature_converged(&regions, options.atol, options.rtol)
-        && subdivisions < options.max_subdivisions
-    {
+    while arithmetic_representable && subdivisions < options.max_subdivisions {
+        let (estimate, error) = sum_cubature_regions(&regions, output_dim);
+        if componentwise_cubature_converged(&estimate, &error, options.atol, options.rtol)
+            || estimate.iter().chain(&error).any(|value| !value.is_finite())
+        {
+            break;
+        }
         let Some(split_index) = largest_error_region(&regions) else {
             break;
         };
-        let region = regions.swap_remove(split_index);
+        let region = &regions[split_index];
         let midpoint: Vec<f64> = region
             .a
             .iter()
             .zip(region.b.iter())
-            .map(|(&lower, &upper)| 0.5 * (lower + upper))
+            .map(|(&lower, &upper)| lower.midpoint(upper))
             .collect();
+        // Keep the parent if either child would have no interior node. Without
+        // this check refinement repeats unchanged regions or samples a boundary.
+        if region
+            .a
+            .iter()
+            .zip(&region.b)
+            .zip(&midpoint)
+            .any(|((&lo, &hi), &mid)| {
+                let (left, right) = (lo.min(hi), lo.max(hi));
+                left.next_up() >= mid || mid.next_up() >= right
+            })
+        {
+            break;
+        }
+        let region = regions.swap_remove(split_index);
         for corner in 0..(1_usize << region.a.len()) {
             let (sub_a, sub_b): (Vec<f64>, Vec<f64>) = (0..region.a.len())
                 .map(|k| {
@@ -2689,13 +2733,15 @@ where
                 options.rule,
             )?;
             neval += sub.neval;
+            arithmetic_representable &= sub.representable;
             regions.push(sub.region);
         }
         subdivisions += 1;
     }
 
     let (estimate, error) = sum_cubature_regions(&regions, output_dim);
-    let status = if componentwise_cubature_converged(&estimate, &error, options.atol, options.rtol)
+    let status = if arithmetic_representable
+        && componentwise_cubature_converged(&estimate, &error, options.atol, options.rtol)
     {
         CubatureStatus::Converged
     } else {
@@ -2740,6 +2786,7 @@ where
 struct CubatureEstimate {
     region: CubatureRegion,
     neval: usize,
+    representable: bool,
 }
 
 fn validate_cubature_inputs(
@@ -2750,6 +2797,27 @@ fn validate_cubature_inputs(
     if a.len() != b.len() {
         return Err(IntegrateValidationError::QuadInvalidBounds {
             detail: "cubature bounds must have the same dimensionality".to_string(),
+        });
+    }
+    if a.iter().chain(b).any(|value| value.is_nan()) {
+        return Err(IntegrateValidationError::QuadInvalidBounds {
+            detail: "cubature bounds must not contain NaN".to_string(),
+        });
+    }
+    // Both tensor rules and all-axis subdivision have exponential work counts.
+    // Check arithmetic before shifts, allocations, or user callbacks.
+    let dimensions = u32::try_from(a.len()).ok();
+    let corners = dimensions.and_then(|n| 1_usize.checked_shl(n));
+    let nodes = dimensions.and_then(|n| match options.rule {
+        CubatureRule::GaussKronrod | CubatureRule::Gk21 => 21_usize.checked_pow(n),
+        CubatureRule::Gk15 => 15_usize.checked_pow(n),
+        CubatureRule::GenzMalik => corners.and_then(|count| {
+            count.checked_add(2 * a.len() * a.len() + 2 * a.len() + 1)
+        }),
+    });
+    if corners.is_none() || nodes.is_none() {
+        return Err(IntegrateValidationError::ResourceExhausted {
+            message: "cubature rule or subdivision cardinality exceeds usize".to_string(),
         });
     }
     if !options.atol.is_finite()
@@ -2828,7 +2896,7 @@ fn initial_cubature_regions(
     ranges: &[(f64, f64)],
     transforms: &[BoundTransform],
     options: &CubatureOptions,
-) -> Vec<(Vec<f64>, Vec<f64>)> {
+) -> Result<Vec<(Vec<f64>, Vec<f64>)>, IntegrateValidationError> {
     let mut breakpoints = ranges
         .iter()
         .map(|&(lower, upper)| vec![lower, upper])
@@ -2866,11 +2934,24 @@ fn initial_cubature_regions(
         axis_breakpoints.dedup_by(|left, right| *left == *right);
     }
 
+    let region_count = breakpoints.iter().try_fold(1_usize, |count, points| {
+        count.checked_mul(points.len().saturating_sub(1))
+    });
+    let Some(region_count) = region_count else {
+        return Err(IntegrateValidationError::ResourceExhausted {
+            message: "cubature initial partition cardinality exceeds usize".to_string(),
+        });
+    };
     let mut regions = Vec::new();
+    regions.try_reserve(region_count).map_err(|_| {
+        IntegrateValidationError::ResourceExhausted {
+            message: "cubature initial partition exceeds available memory".to_string(),
+        }
+    })?;
     let mut lower = vec![0.0; ranges.len()];
     let mut upper = vec![0.0; ranges.len()];
     collect_initial_cubature_regions(&breakpoints, 0, &mut lower, &mut upper, &mut regions);
-    regions
+    Ok(regions)
 }
 
 fn collect_initial_cubature_regions(
@@ -3120,6 +3201,120 @@ fn for_each_genz_malik_node(
     Ok(())
 }
 
+/// A finite value represented without restricting intermediate products to
+/// f64's exponent range. Cubature weights include both very small and very
+/// large axis lengths; multiplying those lengths first loses valid integrals.
+#[derive(Clone, Copy)]
+struct CubatureProduct {
+    mantissa: f64,
+    exponent: i32,
+}
+
+impl CubatureProduct {
+    fn one() -> Self {
+        Self {
+            mantissa: 1.0,
+            exponent: 0,
+        }
+    }
+
+    fn multiply(&mut self, value: f64) {
+        if value == 0.0 || self.mantissa == 0.0 {
+            self.mantissa *= value;
+            self.exponent = 0;
+            return;
+        }
+        let (mantissa, exponent) = cubature_frexp(value);
+        self.mantissa *= mantissa;
+        self.exponent += exponent;
+        if self.mantissa.abs() >= 2.0 {
+            self.mantissa *= 0.5;
+            self.exponent += 1;
+        }
+    }
+}
+
+/// Decompose a finite, nonzero f64 as mantissa * 2^exponent with
+/// 1 <= abs(mantissa) < 2, including subnormal input.
+fn cubature_frexp(value: f64) -> (f64, i32) {
+    let (value, adjustment) = if value.abs() < f64::MIN_POSITIVE {
+        (value * 18_014_398_509_481_984.0, -54)
+    } else {
+        (value, 0)
+    };
+    let bits = value.to_bits();
+    let exponent = ((bits >> 52) & 0x7ff) as i32 - 1023 + adjustment;
+    let mantissa = f64::from_bits((bits & 0x800f_ffff_ffff_ffff) | (1023_u64 << 52));
+    (mantissa, exponent)
+}
+
+/// Exact nonpositive power of two, or zero when it is unrepresentable.
+fn cubature_downscale(exponent: i32) -> f64 {
+    if exponent < -1074 {
+        0.0
+    } else if exponent < -1022 {
+        f64::from_bits(1_u64 << (exponent + 1074))
+    } else {
+        f64::from_bits(((exponent + 1023) as u64) << 52)
+    }
+}
+
+/// Neumaier summation with a shared exponent. Converting each weighted term
+/// first would erase a subnormal integral even when the final sum is nonzero.
+#[derive(Default)]
+struct CubatureSum {
+    value: f64,
+    correction: f64,
+    exponent: i32,
+}
+
+impl CubatureSum {
+    fn add(&mut self, term: CubatureProduct) {
+        if term.mantissa == 0.0 {
+            return;
+        }
+        if self.value == 0.0 && self.correction == 0.0 {
+            self.value = term.mantissa;
+            self.exponent = term.exponent;
+            return;
+        }
+        if term.exponent > self.exponent {
+            let factor = cubature_downscale(self.exponent - term.exponent);
+            self.value *= factor;
+            self.correction *= factor;
+            self.exponent = term.exponent;
+        }
+        let value = term.mantissa * cubature_downscale(term.exponent - self.exponent);
+        let next = self.value + value;
+        self.correction += if self.value.abs() >= value.abs() {
+            (self.value - next) + value
+        } else {
+            (value - next) + self.value
+        };
+        self.value = next;
+    }
+
+    fn total(&self) -> f64 {
+        let value = self.value + self.correction;
+        if value == 0.0 {
+            return value;
+        }
+        let (mantissa, adjustment) = cubature_frexp(value);
+        let exponent = self.exponent + adjustment;
+        if exponent > 1023 {
+            f64::INFINITY.copysign(mantissa)
+        } else if exponent < -1075 {
+            0.0_f64.copysign(mantissa)
+        } else if exponent < -1022 {
+            // Do the final rounding to subnormal precision only once.
+            let factor = f64::from_bits(((exponent + 1074 + 1023) as u64) << 52);
+            (mantissa * factor) * f64::from_bits(1)
+        } else {
+            mantissa * f64::from_bits(((exponent + 1023) as u64) << 52)
+        }
+    }
+}
+
 /// One region's estimate under `rule`: the higher-order rule's value and, as its error, the
 /// absolute difference from the embedded lower-order rule (SciPy `NestedFixedRule`). Nodes
 /// map from [-1, 1]^ndim onto the region, then through the infinite-limit transforms.
@@ -3135,27 +3330,59 @@ where
     F: Fn(&[f64]) -> Vec<f64>,
 {
     let ndim = a.len();
-    let center: Vec<f64> = a.iter().zip(b).map(|(&lo, &hi)| 0.5 * (lo + hi)).collect();
-    let half: Vec<f64> = a.iter().zip(b).map(|(&lo, &hi)| 0.5 * (hi - lo)).collect();
-    let mut higher = vec![0.0; output_dim];
-    let mut lower = vec![0.0; output_dim];
-    let mut t = vec![0.0; ndim];
+    let center: Vec<f64> = a.iter().zip(b).map(|(&lo, &hi)| lo.midpoint(hi)).collect();
+    let mut half = Vec::with_capacity(ndim);
+    let mut volume = CubatureProduct::one();
+    for (&lo, &hi) in a.iter().zip(b) {
+        let width = hi - lo;
+        if width.is_finite() {
+            half.push(0.5 * width);
+            // Retain an exact factor of two even if width is subnormal.
+            volume.multiply(width);
+            volume.exponent -= 1;
+        } else {
+            let half_width = 0.5 * hi - 0.5 * lo;
+            half.push(half_width);
+            volume.multiply(half_width);
+        }
+    }
+    let mut higher: Vec<CubatureSum> = (0..output_dim).map(|_| CubatureSum::default()).collect();
+    let mut lower: Vec<CubatureSum> = (0..output_dim).map(|_| CubatureSum::default()).collect();
     let mut x = vec![0.0; ndim];
     let mut neval = 0_usize;
 
     let visit =
         |node: &[f64], w_higher: f64, w_lower: f64| -> Result<(), IntegrateValidationError> {
-            for ((tk, &nk), (&ck, &hk)) in t.iter_mut().zip(node).zip(center.iter().zip(&half)) {
-                *tk = ck + hk * nk;
+            let mut weight = volume;
+            for k in 0..ndim {
+                // Interior rules must not round onto an excluded endpoint.
+                let left = a[k].min(b[k]).next_up();
+                let right = a[k].max(b[k]).next_down();
+                let t = (center[k] + half[k] * node[k]).clamp(left, right);
+                let (mapped, derivative) = transforms[k].map(t);
+                if !mapped.is_finite() || !derivative.is_finite() {
+                    return Err(IntegrateValidationError::QuadInvalidBounds {
+                        detail: "cubature transformed node or weight is not representable"
+                            .to_string(),
+                    });
+                }
+                x[k] = mapped;
+                weight.multiply(derivative);
             }
-            let mut jacobian = 1.0;
-            map_cubature_point(&t, transforms, &mut x, &mut jacobian);
             let values = f(&x);
             validate_cubature_output(&values, output_dim)?;
             neval += 1;
+            let mut higher_weight = weight;
+            higher_weight.multiply(w_higher);
+            let mut lower_weight = weight;
+            lower_weight.multiply(w_lower);
             for ((h, l), &value) in higher.iter_mut().zip(lower.iter_mut()).zip(&values) {
-                *h += w_higher * jacobian * value;
-                *l += w_lower * jacobian * value;
+                let mut high_term = higher_weight;
+                high_term.multiply(value);
+                h.add(high_term);
+                let mut low_term = lower_weight;
+                low_term.multiply(value);
+                l.add(low_term);
             }
             Ok(())
         };
@@ -3167,15 +3394,30 @@ where
         CubatureRule::GenzMalik => for_each_genz_malik_node(ndim, visit)?,
     }
 
-    // prod(b − a)/2^ndim: the Jacobian of [-1, 1]^ndim onto the region (signed, so reversed
-    // limits keep their orientation).
-    let volume: f64 = half.iter().product();
-    let estimate: Vec<f64> = higher.iter().map(|h| h * volume).collect();
-    let error: Vec<f64> = higher
+    let estimate: Vec<f64> = higher.iter().map(CubatureSum::total).collect();
+    let representable = higher.iter().chain(&lower).all(|sum| {
+        let total = sum.total();
+        total.is_finite() && (total != 0.0 || sum.value + sum.correction == 0.0)
+    });
+    let mut error: Vec<f64> = estimate
         .iter()
         .zip(&lower)
-        .map(|(h, l)| ((h - l) * volume).abs())
+        .map(|(&high, low)| {
+            let low = low.total();
+            if high.is_finite() && low.is_finite() {
+                (high - low).abs()
+            } else {
+                f64::INFINITY
+            }
+        })
         .collect();
+    if !representable {
+        for value in &mut error {
+            if *value == 0.0 {
+                *value = f64::from_bits(1);
+            }
+        }
+    }
 
     Ok(CubatureEstimate {
         region: CubatureRegion {
@@ -3185,6 +3427,7 @@ where
             error,
         },
         neval,
+        representable,
     })
 }
 
@@ -3197,34 +3440,40 @@ fn map_cubature_point(t: &[f64], transforms: &[BoundTransform], x: &mut [f64], j
     }
 }
 
-fn cubature_converged(regions: &[CubatureRegion], atol: f64, rtol: f64) -> bool {
-    let Some(output_dim) = regions.first().map(|region| region.estimate.len()) else {
-        return true;
-    };
-    let (estimate, error) = sum_cubature_regions(regions, output_dim);
-    componentwise_cubature_converged(&estimate, &error, atol, rtol)
-}
-
 fn componentwise_cubature_converged(estimate: &[f64], error: &[f64], atol: f64, rtol: f64) -> bool {
     estimate
         .iter()
         .zip(error.iter())
-        .all(|(estimate_value, error_value)| *error_value <= atol + rtol * estimate_value.abs())
+        .all(|(estimate_value, error_value)| {
+            estimate_value.is_finite()
+                && error_value.is_finite()
+                && *error_value >= 0.0
+                && *error_value <= atol + rtol * estimate_value.abs()
+        })
 }
 
 fn sum_cubature_regions(regions: &[CubatureRegion], output_dim: usize) -> (Vec<f64>, Vec<f64>) {
-    let mut estimate = vec![0.0; output_dim];
-    let mut error = vec![0.0; output_dim];
-    for region in regions {
-        for ((estimate_total, error_total), (region_estimate, region_error)) in estimate
-            .iter_mut()
-            .zip(error.iter_mut())
-            .zip(region.estimate.iter().zip(region.error.iter()))
-        {
-            *estimate_total += region_estimate;
-            *error_total += region_error;
+    let total = |component: usize, errors: bool| {
+        let values = regions.iter().map(|region| {
+            if errors {
+                region.error[component]
+            } else {
+                region.estimate[component]
+            }
+        });
+        if values.clone().any(|value| !value.is_finite()) {
+            return values.sum();
         }
-    }
+        let mut sum = CubatureSum::default();
+        for value in values {
+            let mut term = CubatureProduct::one();
+            term.multiply(value);
+            sum.add(term);
+        }
+        sum.total()
+    };
+    let estimate = (0..output_dim).map(|i| total(i, false)).collect();
+    let error = (0..output_dim).map(|i| total(i, true)).collect();
     (estimate, error)
 }
 
@@ -6972,7 +7221,8 @@ mod tests {
                 points: vec![vec![middle, middle], vec![next, next]],
                 ..CubatureOptions::default()
             },
-        );
+        )
+        .expect("distinct representable boundaries are retained");
         assert_eq!(regions.len(), 9);
         assert!(
             regions
@@ -6984,6 +7234,217 @@ mod tests {
             .map(|(a, b)| (b[0] - a[0]) * (b[1] - a[1]))
             .sum();
         assert!((volume + 1.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn cubature_range_safe_geometry_and_weights() {
+        let cases = [
+            (vec![1e308], vec![1.2e308], 1.0 / (1.2e308 - 1e308), 1.0),
+            (vec![-1e308], vec![1e308], 1e-308, 2.0),
+            (vec![0.0, 0.0], vec![1e-200, 1e-200], 1e300, 1e-100),
+            (vec![0.0, 0.0], vec![1e200, 1e200], 1e-300, 1e100),
+            (vec![0.0], vec![1.0], 1e308, 1e308),
+            (
+                vec![0.0],
+                vec![3.0 * f64::from_bits(1)],
+                1e308,
+                (3.0 * f64::from_bits(1)) * 1e308,
+            ),
+        ];
+        for (a, b, density, expected) in cases {
+            for rule in [
+                CubatureRule::Gk21,
+                CubatureRule::Gk15,
+                CubatureRule::GenzMalik,
+            ] {
+                if rule == CubatureRule::GenzMalik && a.len() < 2 {
+                    continue;
+                }
+                let result = cubature_scalar(
+                    |x| {
+                        for ((&coordinate, &lo), &hi) in x.iter().zip(&a).zip(&b) {
+                            assert!(coordinate.is_finite() && coordinate > lo && coordinate < hi);
+                        }
+                        density
+                    },
+                    &a,
+                    &b,
+                    CubatureOptions {
+                        rule,
+                        max_subdivisions: 0,
+                        ..CubatureOptions::default()
+                    },
+                )
+                .expect("finite integral despite extreme intermediate scales");
+                assert_eq!(result.status, CubatureStatus::Converged, "{rule:?}: {result:?}");
+                assert!(
+                    (result.estimate / expected - 1.0).abs() < 5e-13,
+                    "{rule:?}: {result:?}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cubature_mixed_axis_scales_preserve_volume_and_orientation() {
+        for widths in [
+            [1e-200, 1e-200, 1e200, 1e200],
+            [1e200, 1e200, 1e-200, 1e-200],
+            [1e-200, 1e200, 1e-200, 1e200],
+        ] {
+            for reverse in [false, true] {
+                let mut a = [0.0; 4];
+                let mut b = widths;
+                if reverse {
+                    a[0] = widths[0];
+                    b[0] = 0.0;
+                }
+                let result = cubature_scalar(
+                    |_| 1.0,
+                    &a,
+                    &b,
+                    CubatureOptions {
+                        rule: CubatureRule::GenzMalik,
+                        max_subdivisions: 0,
+                        ..CubatureOptions::default()
+                    },
+                )
+                .expect("mixed scale volume remains one");
+                let expected = if reverse { -1.0 } else { 1.0 };
+                assert_eq!(result.status, CubatureStatus::Converged);
+                assert!((result.estimate - expected).abs() < 5e-13, "{result:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn cubature_preserves_subnormal_totals_and_reports_panel_underflow() {
+        let tiny = f64::from_bits(1);
+        for rule in [CubatureRule::Gk21, CubatureRule::Gk15] {
+            let result = cubature_scalar(
+                |_| tiny,
+                &[0.0],
+                &[1.0],
+                CubatureOptions {
+                    rule,
+                    ..CubatureOptions::default()
+                },
+            )
+            .expect("weighted terms must be accumulated before subnormal rounding");
+            assert_eq!(result.status, CubatureStatus::Converged);
+            assert_eq!(result.estimate.to_bits(), tiny.to_bits());
+
+            // Each half-panel rounds below the available result precision.
+            // Report that limit instead of calling an erased integral converged.
+            let split = cubature_scalar(
+                |_| tiny,
+                &[0.0],
+                &[1.0],
+                CubatureOptions {
+                    rule,
+                    points: vec![vec![0.5]],
+                    ..CubatureOptions::default()
+                },
+            )
+            .expect("panel underflow returns diagnostics");
+            assert_eq!(split.status, CubatureStatus::NotConverged);
+            assert_eq!(split.subdivisions, 0);
+            assert!(split.error > 0.0);
+        }
+    }
+
+    #[test]
+    fn cubature_nonfinite_estimates_never_converge() {
+        assert!(!componentwise_cubature_converged(
+            &[f64::INFINITY],
+            &[f64::INFINITY],
+            0.0,
+            1e-8,
+        ));
+        for points in [Vec::new(), vec![vec![1.0], vec![2.0], vec![3.0]]] {
+            let result = cubature_scalar(
+                |_| 1e308,
+                &[0.0],
+                &[4.0],
+                CubatureOptions {
+                    points,
+                    ..CubatureOptions::default()
+                },
+            )
+            .expect("unrepresentable integral returns nonconvergence diagnostics");
+            assert_eq!(result.status, CubatureStatus::NotConverged);
+            assert!(!result.estimate.is_finite());
+            assert_eq!(result.subdivisions, 0);
+        }
+    }
+
+    #[test]
+    fn cubature_unsplittable_region_keeps_its_estimate() {
+        let a = 1.0_f64;
+        let b = f64::from_bits(a.to_bits() + 2);
+        let result = cubature(
+            |x| {
+                assert!(x[0] > a && x[0] < b);
+                vec![(10.0 * x[1]).exp() / (b - a)]
+            },
+            &[a, 0.0],
+            &[b, 1.0],
+            CubatureOptions {
+                rule: CubatureRule::GenzMalik,
+                rtol: 1e-15,
+                ..CubatureOptions::default()
+            },
+        )
+        .expect("an unsplittable region retains its best estimate");
+        assert_eq!(result.status, CubatureStatus::NotConverged);
+        assert_eq!(result.subdivisions, 0);
+        assert_eq!(result.regions.len(), 1);
+        assert!(result.estimate[0].is_finite() && result.estimate[0] > 0.0);
+        assert_eq!(result.estimate, result.regions[0].estimate);
+        assert_eq!(result.error, result.regions[0].error);
+    }
+
+    #[test]
+    fn cubature_rejects_unrepresentable_geometry_before_callbacks() {
+        let adjacent = cubature_scalar(
+            |_| panic!("an interval without an interior node must fail before evaluation"),
+            &[1.0],
+            &[1.0_f64.next_up()],
+            CubatureOptions::default(),
+        );
+        assert!(matches!(
+            adjacent,
+            Err(IntegrateValidationError::QuadInvalidBounds { .. })
+        ));
+        for rule in [CubatureRule::Gk21, CubatureRule::GenzMalik] {
+            let dimensions = usize::BITS as usize;
+            let excessive = cubature_scalar(
+                |_| panic!("unrepresentable node counts must fail before evaluation"),
+                &vec![0.0; dimensions],
+                &vec![1.0; dimensions],
+                CubatureOptions {
+                    rule,
+                    ..CubatureOptions::default()
+                },
+            );
+            assert!(matches!(
+                excessive,
+                Err(IntegrateValidationError::ResourceExhausted { .. })
+            ));
+        }
+        for nan in [f64::NAN, -f64::NAN] {
+            for (a, b) in [(nan, 1.0), (0.0, nan)] {
+                assert!(
+                    cubature_scalar(
+                        |_| panic!("NaN must not select an infinite-bound transform"),
+                        &[a],
+                        &[b],
+                        CubatureOptions::default(),
+                    )
+                    .is_err()
+                );
+            }
+        }
     }
 
     #[test]
