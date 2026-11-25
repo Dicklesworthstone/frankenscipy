@@ -767,19 +767,53 @@ pub fn solve(
     b: &[C64],
     options: SolveOptions,
 ) -> Result<ComplexSolveResult, LinalgError> {
+    let mut x = b.to_vec();
+    let rcond = solve_columns(a, &mut x, b.len(), options, true)?;
+    Ok(ComplexSolveResult {
+        x,
+        rcond,
+        warning: ill_conditioned(rcond),
+    })
+}
+
+/// `scipy.linalg.solve(a, B)` for a matrix right-hand side. The columns share one
+/// factorization. A scalar coefficient divides every entry of `B`, as in SciPy.
+///
+/// # Errors
+/// As [`solve`]. Except for scalar coefficients, `B` must have as many rows as `a`.
+pub fn solve_matrix(
+    a: &[Vec<C64>],
+    b: &[Vec<C64>],
+    options: SolveOptions,
+) -> Result<ComplexMatrix, LinalgError> {
+    let (rows, cols) = shape(b)?;
+    let mut x = to_dm(b, rows, cols);
+    solve_columns(a, x.as_mut_slice(), rows, options, false)?;
+    Ok(rows_of(&x))
+}
+
+/// Solve consecutive column-major right-hand sides in place. Only the vector API
+/// returns a condition estimate, so the matrix API can skip the inverse-norm iteration.
+fn solve_columns(
+    a: &[Vec<C64>],
+    rhs: &mut [C64],
+    rhs_rows: usize,
+    options: SolveOptions,
+    estimate_condition: bool,
+) -> Result<f64, LinalgError> {
     let decomp = DecompOptions {
         mode: options.mode,
         check_finite: options.check_finite,
     };
     let n = square(a, decomp)?;
-    if b.len() != n {
+    if rhs_rows != n && n != 1 {
         return Err(LinalgError::IncompatibleShapes {
             a_shape: (n, n),
-            b_len: b.len(),
+            b_len: rhs_rows,
         });
     }
     if (options.check_finite || options.mode == RuntimeMode::Hardened)
-        && b.iter().any(|&z| !is_finite(z))
+        && rhs.iter().any(|&z| !is_finite(z))
     {
         return Err(LinalgError::NonFiniteInput);
     }
@@ -790,25 +824,21 @@ pub fn solve(
                 .to_string(),
         });
     }
-    if n == 0 {
-        return Ok(ComplexSolveResult {
-            x: Vec::new(),
-            rcond: 1.0,
-            warning: None,
-        });
+    if rhs.is_empty() {
+        return Ok(1.0);
     }
     // SciPy handles a scalar system before dispatching on its assumed structure.
     if n == 1 {
-        if a[0][0] == CZERO {
+        let d = a[0][0];
+        if d == CZERO {
             return Err(LinalgError::SingularMatrix);
         }
-        return Ok(ComplexSolveResult {
-            x: vec![zladiv(b[0], a[0][0])],
-            rcond: 1.0,
-            warning: None,
-        });
+        for z in rhs {
+            *z = zladiv(*z, d);
+        }
+        return Ok(1.0);
     }
-    let am = match options.assume_a {
+    let mut am = match options.assume_a {
         Some(MatrixAssumption::Symmetric) => symmetric_from_triangle(a, options.lower, false),
         Some(MatrixAssumption::Hermitian | MatrixAssumption::PositiveDefinite) => {
             symmetric_from_triangle(a, options.lower, true)
@@ -817,129 +847,83 @@ pub fn solve(
     };
     match options.assume_a {
         Some(MatrixAssumption::Diagonal) => {
-            let mut x = Vec::with_capacity(n);
-            for i in 0..n {
-                if am[(i, i)] == CZERO {
-                    return Err(LinalgError::SingularMatrix);
-                }
-                x.push(zladiv(b[i], am[(i, i)]));
+            if (0..n).any(|i| am[(i, i)] == CZERO) {
+                return Err(LinalgError::SingularMatrix);
             }
-            Ok(ComplexSolveResult {
-                x,
-                rcond: 1.0,
-                warning: None,
-            })
+            for col in rhs.chunks_exact_mut(n) {
+                for (i, x) in col.iter_mut().enumerate() {
+                    *x = zladiv(*x, am[(i, i)]);
+                }
+            }
+            Ok(1.0)
         }
         Some(MatrixAssumption::UpperTriangular | MatrixAssumption::LowerTriangular) => {
             let upper = matches!(options.assume_a, Some(MatrixAssumption::UpperTriangular));
             if (0..n).any(|i| am[(i, i)] == CZERO) {
                 return Err(LinalgError::SingularMatrix);
             }
-            let x = triangular_solve(&am, b, upper, false);
-            Ok(ComplexSolveResult {
-                x,
-                rcond: 1.0,
-                warning: None,
-            })
+            for col in rhs.chunks_exact_mut(n) {
+                triangular_solve_in_place(&am, col, upper);
+            }
+            Ok(1.0)
         }
         Some(MatrixAssumption::PositiveDefinite) => {
             let u = potrf_upper(&am)?;
-            // A = Uᴴ·U: solve Uᴴ·y = b, then U·x = y.
-            let mut y = vec![CZERO; n];
-            for j in 0..n {
-                let mut t = b[j];
-                for i in 0..j {
-                    t -= u[(i, j)].conj() * y[i];
-                }
-                y[j] = zladiv(t, u[(j, j)].conj());
+            for col in rhs.chunks_exact_mut(n) {
+                chol_solve_in_place(&u, col);
             }
-            for j in (0..n).rev() {
-                let mut t = y[j];
-                for i in j + 1..n {
-                    t -= u[(j, i)] * y[i];
-                }
-                y[j] = zladiv(t, u[(j, j)]);
-            }
-            let rcond = chol_rcond(&u, one_norm(&am));
-            Ok(ComplexSolveResult {
-                x: y,
-                rcond,
-                warning: ill_conditioned(rcond),
+            Ok(if estimate_condition {
+                chol_rcond(&u, one_norm(&am))
+            } else {
+                1.0
             })
         }
         _ => {
-            let mut lu = am.clone();
-            let (piv, info) = getrf(&mut lu);
+            let anorm = if estimate_condition {
+                one_norm(&am)
+            } else {
+                0.0
+            };
+            let (piv, info) = getrf(&mut am);
             if info.is_some() {
                 return Err(LinalgError::SingularMatrix);
             }
-            let mut x = b.to_vec();
-            getrs(&lu, &piv, &mut x, 0);
-            let rcond = lu_rcond(&lu, one_norm(&am));
-            Ok(ComplexSolveResult {
-                x,
-                rcond,
-                warning: ill_conditioned(rcond),
+            for col in rhs.chunks_exact_mut(n) {
+                getrs(&am, &piv, col, 0);
+            }
+            Ok(if estimate_condition {
+                lu_rcond(&am, anorm)
+            } else {
+                1.0
             })
         }
     }
 }
 
-/// `scipy.linalg.solve(a, B)` for a matrix right-hand side (one solve per column of `B`).
-///
-/// # Errors
-/// As [`solve`]; `B` must have `n` rows.
-pub fn solve_matrix(
-    a: &[Vec<C64>],
-    b: &[Vec<C64>],
-    options: SolveOptions,
-) -> Result<ComplexMatrix, LinalgError> {
-    let (rows, cols) = shape(b)?;
-    let n = a.len();
-    if rows != n {
-        return Err(LinalgError::IncompatibleShapes {
-            a_shape: (n, n),
-            b_len: rows,
-        });
-    }
-    let mut out = vec![vec![CZERO; cols]; rows];
-    for j in 0..cols {
-        let col: Vec<C64> = (0..rows).map(|i| b[i][j]).collect();
-        let x = solve(a, &col, options)?.x;
-        for i in 0..rows {
-            out[i][j] = x[i];
-        }
-    }
-    Ok(out)
-}
-
-/// Triangular solve `T·x = b` (`upper`), or `Tᵀ·x = b` when `transpose` (the triangle flips).
-fn triangular_solve(t: &DMatrix<C64>, b: &[C64], upper: bool, transpose: bool) -> Vec<C64> {
+/// In-place column-oriented triangular substitution.
+fn triangular_solve_in_place(t: &DMatrix<C64>, x: &mut [C64], upper: bool) {
     let n = t.nrows();
-    let at = |i: usize, j: usize| if transpose { t[(j, i)] } else { t[(i, j)] };
-    let mut x = b.to_vec();
     if upper {
         for j in (0..n).rev() {
             if x[j] != CZERO {
-                x[j] = zladiv(x[j], at(j, j));
+                x[j] = zladiv(x[j], t[(j, j)]);
                 let xj = x[j];
                 for i in 0..j {
-                    x[i] -= xj * at(i, j);
+                    x[i] -= xj * t[(i, j)];
                 }
             }
         }
     } else {
         for j in 0..n {
             if x[j] != CZERO {
-                x[j] = zladiv(x[j], at(j, j));
+                x[j] = zladiv(x[j], t[(j, j)]);
                 let xj = x[j];
                 for i in j + 1..n {
-                    x[i] -= xj * at(i, j);
+                    x[i] -= xj * t[(i, j)];
                 }
             }
         }
     }
-    x
 }
 
 /// `scipy.linalg.inv` on complex input.
@@ -1000,6 +984,25 @@ fn potrf_upper(a: &DMatrix<C64>) -> Result<DMatrix<C64>, LinalgError> {
     Ok(u)
 }
 
+/// With A = Uᴴ U, solve Uᴴ y = b and then U x = y.
+fn chol_solve_in_place(u: &DMatrix<C64>, x: &mut [C64]) {
+    let n = x.len();
+    for j in 0..n {
+        let mut t = x[j];
+        for i in 0..j {
+            t -= u[(i, j)].conj() * x[i];
+        }
+        x[j] = zladiv(t, u[(j, j)]);
+    }
+    for j in (0..n).rev() {
+        let mut t = x[j];
+        for i in j + 1..n {
+            t -= u[(j, i)] * x[i];
+        }
+        x[j] = zladiv(t, u[(j, j)]);
+    }
+}
+
 /// `zpocon`: the 1-norm reciprocal condition estimate from the Cholesky factor.
 fn chol_rcond(u: &DMatrix<C64>, anorm: f64) -> f64 {
     let n = u.nrows();
@@ -1011,22 +1014,7 @@ fn chol_rcond(u: &DMatrix<C64>, anorm: f64) -> f64 {
     }
     let ainvnm = zlacn2(n, |x, _herm| {
         // A⁻¹ = U⁻¹·U⁻ᴴ is Hermitian, so both products are the same solve.
-        let mut y = x.to_vec();
-        for j in 0..n {
-            let mut t = y[j];
-            for i in 0..j {
-                t -= u[(i, j)].conj() * y[i];
-            }
-            y[j] = zladiv(t, u[(j, j)]);
-        }
-        for j in (0..n).rev() {
-            let mut t = y[j];
-            for i in j + 1..n {
-                t -= u[(j, i)] * y[i];
-            }
-            y[j] = zladiv(t, u[(j, j)]);
-        }
-        x.copy_from_slice(&y);
+        chol_solve_in_place(u, x);
     });
     if ainvnm == 0.0 || !ainvnm.is_finite() {
         return 0.0;
@@ -2587,8 +2575,8 @@ fn logm_triu(t0: &DMatrix<C64>) -> Result<DMatrix<C64>, LinalgError> {
         // solve_triangular(I + beta·R, alpha·R): upper-triangular solve per column.
         let lhs = &ident + &r * Complex::new(beta, 0.0);
         for c in 0..n {
-            let rhs: Vec<C64> = (0..n).map(|i| r[(i, c)] * alpha).collect();
-            let x = triangular_solve(&lhs, &rhs, true, false);
+            let mut x: Vec<C64> = (0..n).map(|i| r[(i, c)] * alpha).collect();
+            triangular_solve_in_place(&lhs, &mut x, true);
             for i in 0..n {
                 u[(i, c)] += x[i];
             }
@@ -2883,6 +2871,44 @@ mod tests {
         };
         let x = solve(&[vec![c(0.0, 2.0)]], &[c(4.0, 0.0)], options).unwrap();
         assert_eq!(x.x, vec![c(0.0, -2.0)]);
+    }
+
+    #[test]
+    fn matrix_solve_applies_pivots_to_each_rhs_column() {
+        let a = [vec![CZERO, c(1.0, 1.0)], vec![c(2.0, 0.0), c(0.0, -1.0)]];
+        let b = [
+            vec![c(2.0, 2.0), c(-1.0, -1.0), c(-1.0, 1.0)],
+            vec![c(2.0, -4.0), c(0.0, 5.0), CONE],
+        ];
+        let x = solve_matrix(&a, &b, SolveOptions::default()).unwrap();
+        let expected = [
+            vec![c(1.0, -1.0), c(0.0, 2.0), CZERO],
+            vec![c(2.0, 0.0), c(-1.0, 0.0), c(0.0, 1.0)],
+        ];
+        assert!(max_abs_diff(&x, &expected) < 1e-14);
+    }
+
+    #[test]
+    fn scalar_solve_broadcasts_and_empty_rhs_validates_coefficients() {
+        let a = [vec![c(0.0, 2.0)]];
+        let options = SolveOptions::default();
+        let b = [vec![c(2.0, 0.0), c(0.0, 2.0)], vec![CZERO, c(2.0, 2.0)]];
+        let x = solve_matrix(&a, &b, options).unwrap();
+        assert_eq!(x, [vec![c(0.0, -1.0), CONE], vec![CZERO, c(1.0, -1.0)]]);
+        assert_eq!(solve(&a, &b[0], options).unwrap().x, x[0]);
+
+        let empty = [vec![], vec![]];
+        let singular = [vec![CZERO; 2], vec![CZERO; 2]];
+        assert_eq!(solve_matrix(&singular, &empty, options).unwrap(), empty);
+        assert_eq!(
+            solve_matrix(&[vec![CONE], vec![CONE]], &empty, options).unwrap_err(),
+            LinalgError::ExpectedSquareMatrix
+        );
+        let bad = [vec![CONE, c(f64::NAN, 0.0)], vec![CZERO, CONE]];
+        assert_eq!(
+            solve_matrix(&bad, &empty, options).unwrap_err(),
+            LinalgError::NonFiniteInput
+        );
     }
 
     #[test]
