@@ -130,7 +130,7 @@ impl Problem<'_> {
     ) -> Result<(Vec<f64>, Vec<f64>), String> {
         let (n, k) = (self.n, self.k);
         if let Some(jac) = self.fun_jac {
-            let (mut dfdy, dfdp) = jac(x, y, p);
+            let (mut dfdy, mut dfdp) = jac(x, y, p);
             if dfdy.len() != n * n || dfdp.len() != n * k {
                 return Err(format!(
                     "`fun_jac` must return {n}x{n} and {n}x{k} matrices"
@@ -146,6 +146,19 @@ impl Problem<'_> {
                         }
                     }
                     dfdy = out;
+                    // The endpoint RHS is D*f, so both Jacobian blocks must
+                    // differentiate that transformed function. SciPy 1.17.1
+                    // leaves df/dp untransformed here; copying that omission
+                    // makes analytic parameter solves disagree with finite
+                    // differences and can defeat every Newton backtrack.
+                    let mut out = vec![0.0; n * k];
+                    for i in 0..n {
+                        for j in 0..k {
+                            out[i * k + j] =
+                                (0..n).map(|l| sing.d[i * n + l] * dfdp[l * k + j]).sum();
+                        }
+                    }
+                    dfdp = out;
                 } else {
                     for (v, s) in dfdy.iter_mut().zip(&sing.s) {
                         *v += s / (x - self.a);
@@ -664,9 +677,80 @@ pub(crate) fn solve(
             h = x.windows(2).map(|w| w[1] - w[0]).collect();
             y = x.iter().flat_map(|&xq| sol.eval(xq, 0)).collect();
         } else if max_bc_res <= bc_tol {
+            // NaN fails both refinement predicates above. It must not turn
+            // an invalid off-collocation residual into a convergence proof.
+            // Preserve the existing failure statuses for singular Jacobians
+            // and unmet boundary conditions; reject this false-success path.
+            if rms.iter().any(|value| !value.is_finite()) {
+                return Err(
+                    "non-finite RMS residual prevents convergence certification".to_string(),
+                );
+            }
             return Ok((finish(0, x, y, p, rms), sol));
         } else if iteration >= MAX_ITERATION {
             return Ok((finish(3, x, y, p, rms), sol));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Problem, Singular};
+
+    #[test]
+    fn singular_parameter_jacobian_matches_rhs_derivatives() {
+        let fun = |_: f64, y: &[f64], p: &[f64]| {
+            vec![
+                2.0 * y[0] + 3.0 * y[1] + 5.0 * p[0] + 7.0 * p[1] + 23.0 * p[2],
+                11.0 * y[0] + 13.0 * y[1] + 17.0 * p[0] + 19.0 * p[1] + 29.0 * p[2],
+            ]
+        };
+        let bc = |_: &[f64], _: &[f64], _: &[f64]| vec![0.0; 5];
+        let jac = |_: f64, _: &[f64], _: &[f64]| {
+            (
+                vec![2.0, 3.0, 11.0, 13.0],
+                vec![5.0, 7.0, 23.0, 17.0, 19.0, 29.0],
+            )
+        };
+        let singular = || Singular {
+            s: vec![0.0, -1.0, 0.0, 0.0],
+            b: vec![1.0, 0.0, 0.0, 0.0],
+            d: vec![1.0, -1.0, 0.0, 1.0],
+        };
+        let analytic = Problem {
+            n: 2,
+            k: 3,
+            a: 0.0,
+            fun: &fun,
+            bc: &bc,
+            fun_jac: Some(&jac),
+            bc_jac: None,
+            singular: Some(singular()),
+        };
+        let numeric = Problem {
+            n: 2,
+            k: 3,
+            a: 0.0,
+            fun: &fun,
+            bc: &bc,
+            fun_jac: None,
+            bc_jac: None,
+            singular: Some(singular()),
+        };
+        let y = [1.0, 0.0];
+        let p = [1.0, 2.0, 3.0];
+        for t in [0.0, 0.25] {
+            let f0 = analytic.f(t, &y, &p).expect("wrapped RHS");
+            let (dy, dp) = analytic.f_jac(t, &y, &p, &f0).expect("analytic Jacobian");
+            let (dy_fd, dp_fd) = numeric.f_jac(t, &y, &p, &f0).expect("finite differences");
+            for (actual, expected) in dy.iter().chain(&dp).zip(dy_fd.iter().chain(&dp_fd)) {
+                assert!((actual - expected).abs() < 1e-5, "t={t}: {actual} != {expected}");
+            }
+            if t == 0.0 {
+                assert_eq!(dp, vec![-12.0, -12.0, -6.0, 17.0, 19.0, 29.0]);
+            } else {
+                assert_eq!(dp, vec![5.0, 7.0, 23.0, 17.0, 19.0, 29.0]);
+            }
         }
     }
 }

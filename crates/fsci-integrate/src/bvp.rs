@@ -13,6 +13,10 @@
 //! This replaced a single-shooting solver, which fails on exactly the problems collocation is
 //! for: `y'' = 100·y` on `[0, 10]` (a boundary layer the forward IVP amplifies by e¹⁰⁰) and
 //! Troesch's problem (frankenscipy-1ksfv.7).
+//!
+//! Two numerical correctness exceptions to SciPy 1.17.1 are intentional: analytic
+//! parameter derivatives at a singular endpoint differentiate the wrapped RHS
+//! `(I - S)^+ f`, and a non-finite residual estimate cannot certify convergence.
 
 use crate::collocation::{self, LinearSolver, Problem, Singular, Spline};
 use fsci_sparse::{
@@ -105,7 +109,7 @@ impl BvpResult {
     }
 }
 
-/// Invalid input, as SciPy raises `ValueError`.
+/// Invalid input or a non-finite residual that prevents convergence certification.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BvpError {
     InvalidArgument(String),
@@ -180,15 +184,6 @@ fn row_major(m: &DMatrix<f64>) -> Vec<f64> {
     out
 }
 
-fn flatten_rows(rows: &[Vec<f64>], ncols: usize) -> Vec<f64> {
-    let mut out = Vec::with_capacity(rows.len() * ncols);
-    for r in rows {
-        out.extend(r.iter().take(ncols));
-        out.extend(std::iter::repeat_n(f64::NAN, ncols.saturating_sub(r.len())));
-    }
-    out
-}
-
 fn flatten_rows_exact(rows: &[Vec<f64>], nrows: usize, ncols: usize) -> Vec<f64> {
     if ncols == 0 {
         if (rows.len() == nrows || rows.is_empty()) && rows.iter().all(|r| r.is_empty()) {
@@ -219,6 +214,8 @@ fn flatten_rows_exact(rows: &[Vec<f64>], nrows: usize, ncols: usize) -> Vec<f64>
 /// `BvpError::InvalidArgument` for the inputs SciPy rejects with `ValueError` (a mesh that is
 /// not strictly increasing, a guess of the wrong shape, `fun`/`bc`/Jacobians returning the
 /// wrong number of values, `S` not n×n), and for non-finite mesh or tolerance values.
+/// Also returned when the boundary conditions pass but a non-finite RMS residual
+/// would otherwise be mistaken for a converged solution.
 pub fn solve_bvp<F, BC>(
     fun: F,
     bc: BC,
@@ -297,7 +294,7 @@ where
     let fun_jac_flat = options.fun_jac.map(|jac| {
         move |xq: f64, yq: &[f64], pq: &[f64]| {
             let (dy, dp) = jac(xq, yq, pq);
-            (flatten_rows(&dy, n), flatten_rows(&dp, k))
+            (flatten_rows_exact(&dy, n, n), flatten_rows_exact(&dp, n, k))
         }
     });
     let bc_jac_flat = options.bc_jac.map(|jac| {
@@ -366,6 +363,11 @@ where
 /// guess and options but differ by a parameter row (`fun(x, y, params)`,
 /// `bc(ya, yb, params)`; no unknown parameters), fanned across cores. Result `i` is
 /// byte-identical to the per-row `solve_bvp` call.
+///
+/// Analytic `fun_jac` and `bc_jac` callbacks receive the same fixed parameter row
+/// as `fun` and `bc`. Only their state-derivative blocks are used; parameter
+/// derivatives are discarded because these coefficients are not Newton unknowns.
+/// The boundary callback and its state Jacobians still have exactly `y.len()` rows.
 pub fn solve_bvp_many<F, BC>(
     fun: F,
     bc: BC,
@@ -384,13 +386,30 @@ where
     }
     let (fun_ref, bc_ref) = (&fun, &bc);
     let solve_one = move |params: &[f64]| {
+        let fun_jac = options.fun_jac.map(|jac| {
+            move |xq: f64, yq: &[f64], _: &[f64]| {
+                let (dy, _) = jac(xq, yq, params);
+                (dy, Vec::new())
+            }
+        });
+        let bc_jac = options.bc_jac.map(|jac| {
+            move |ya: &[f64], yb: &[f64], _: &[f64]| {
+                let (da, db, _) = jac(ya, yb, params);
+                (da, db, Vec::new())
+            }
+        });
+        let row_options = BvpOptions {
+            fun_jac: fun_jac.as_ref().map(|jac| jac as BvpFunJac<'_>),
+            bc_jac: bc_jac.as_ref().map(|jac| jac as BvpBcJac<'_>),
+            ..options
+        };
         solve_bvp(
             |xq: f64, yq: &[f64], _: &[f64]| fun_ref(xq, yq, params),
             |ya: &[f64], yb: &[f64], _: &[f64]| bc_ref(ya, yb, params),
             x,
             y,
             &[],
-            options,
+            row_options,
         )
     };
 
@@ -738,6 +757,221 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(e, BvpError::InvalidArgument(m) if m.contains("`bc_jac`")));
+    }
+
+    // This regular-singular problem has the exact solution y=x and p=1001.
+    // Leaving df/dp untransformed at x=0 gives d(collocation)/dp=-1 instead
+    // of -167.333666..., so even the smallest Newton backtrack increases
+    // the residual. The two-node exact solution must need no mesh refinement.
+    #[test]
+    fn solve_bvp_singular_parameter_jacobian_matches_regular_solution() {
+        let s = [vec![-1000.0]];
+        let fun_jac = |_: f64, _: &[f64], _: &[f64]| (vec![vec![0.0]], vec![vec![1.0]]);
+        let bc_jac = |_: &[f64], _: &[f64], _: &[f64]| {
+            (
+                vec![vec![1.0], vec![0.0]],
+                vec![vec![0.0], vec![1.0]],
+                vec![vec![0.0], vec![0.0]],
+            )
+        };
+        for analytic in [false, true] {
+            let result = solve_bvp(
+                |_, _, p| vec![p[0]],
+                |ya, yb, _| vec![ya[0], yb[0] - 1.0],
+                &[0.0, 1.0],
+                &[vec![0.0, 1.0]],
+                &[1000.0],
+                BvpOptions {
+                    tol: 1e-6,
+                    max_nodes: 2,
+                    singular_term: Some(&s),
+                    fun_jac: if analytic { Some(&fun_jac) } else { None },
+                    bc_jac: Some(&bc_jac),
+                    ..BvpOptions::default()
+                },
+            )
+            .expect("valid regular-singular BVP");
+            assert!(result.success, "analytic={analytic}: {result:?}");
+            assert_eq!(result.x, vec![0.0, 1.0]);
+            assert!((result.p[0] - 1001.0).abs() < 1e-8, "{result:?}");
+            for t in [0.0, 0.125, 0.5, 0.875, 1.0] {
+                assert!((result.sol(t)[0] - t).abs() < 1e-8, "{result:?}");
+                assert!((result.sol_derivative(t)[0] - 1.0).abs() < 1e-8);
+            }
+            assert!(result.rms_residuals.iter().all(|r| r.is_finite() && *r <= 1e-6));
+        }
+    }
+
+    #[test]
+    fn solve_bvp_rejects_nonfinite_residual_audit() {
+        let fun_jac = |_: f64, _: &[f64], _: &[f64]| (vec![vec![0.0]], Vec::new());
+        let bc_jac = |_: &[f64], _: &[f64], _: &[f64]| {
+            (vec![vec![1.0]], vec![vec![0.0]], Vec::new())
+        };
+        let options = BvpOptions {
+            fun_jac: Some(&fun_jac),
+            bc_jac: Some(&bc_jac),
+            ..BvpOptions::default()
+        };
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let result = solve_bvp(
+                |t, _, _| {
+                    let value = if t == 0.0 || t == 0.5 || t == 1.0 {
+                        0.0
+                    } else {
+                        bad
+                    };
+                    vec![value]
+                },
+                |ya, _, _| vec![ya[0]],
+                &[0.0, 1.0],
+                &[vec![0.0, 0.0]],
+                &[],
+                options,
+            );
+            assert!(
+                matches!(result, Err(BvpError::InvalidArgument(message))
+                    if message.contains("non-finite RMS residual")),
+                "a non-finite off-collocation residual must not certify success"
+            );
+        }
+        let finite = solve_bvp(
+            |_, _, _| vec![0.0],
+            |ya, _, _| vec![ya[0]],
+            &[0.0, 1.0],
+            &[vec![0.0, 0.0]],
+            &[],
+            options,
+        )
+        .expect("finite residual control");
+        assert!(finite.success);
+        assert_eq!(finite.rms_residuals, vec![0.0]);
+    }
+
+    #[test]
+    fn solve_bvp_rejects_malformed_rhs_jacobian_shapes() {
+        let fun = |_: f64, _: &[f64], p: &[f64]| vec![p.first().copied().unwrap_or(0.0)];
+        let bc = |ya: &[f64], yb: &[f64], p: &[f64]| {
+            if p.is_empty() {
+                vec![ya[0]]
+            } else {
+                vec![ya[0], yb[0] - 1.0]
+            }
+        };
+        for (p, dy, dp) in [
+            (vec![], vec![vec![0.0, 1.0]], vec![]),
+            (vec![], vec![vec![]], vec![]),
+            (vec![], vec![vec![0.0], vec![0.0]], vec![]),
+            (vec![], vec![vec![0.0]], vec![vec![1.0]]),
+            (vec![], vec![vec![0.0]], vec![vec![], vec![]]),
+            (vec![1.0], vec![vec![0.0]], vec![vec![1.0, 2.0]]),
+            (vec![1.0], vec![vec![0.0]], vec![]),
+            (vec![1.0], vec![vec![0.0]], vec![vec![]]),
+        ] {
+            let jac = |_: f64, _: &[f64], _: &[f64]| (dy.clone(), dp.clone());
+            let result = solve_bvp(
+                fun,
+                bc,
+                &[0.0, 1.0],
+                &[vec![0.0, 1.0]],
+                &p,
+                BvpOptions {
+                    fun_jac: Some(&jac),
+                    ..BvpOptions::default()
+                },
+            );
+            assert!(
+                matches!(result, Err(BvpError::InvalidArgument(message))
+                    if message.contains("`fun_jac`")),
+                "malformed analytic Jacobians must produce a shape error"
+            );
+        }
+        // Validate every callback result, including a malformed midpoint Jacobian.
+        let changing_jac = |t: f64, _: &[f64], _: &[f64]| {
+            let dy = if t == 0.5 {
+                vec![vec![0.0, 1.0]]
+            } else {
+                vec![vec![0.0]]
+            };
+            (dy, Vec::new())
+        };
+        let result = solve_bvp(
+            fun,
+            bc,
+            &[0.0, 1.0],
+            &[vec![0.0, 0.0]],
+            &[],
+            BvpOptions {
+                fun_jac: Some(&changing_jac),
+                ..BvpOptions::default()
+            },
+        );
+        assert!(
+            matches!(result, Err(BvpError::InvalidArgument(message))
+                if message.contains("`fun_jac`"))
+        );
+    }
+
+    #[test]
+    fn solve_bvp_many_routes_fixed_parameters_to_analytic_jacobians() {
+        let fun = |_: f64, y: &[f64], p: &[f64]| vec![p[0] * y[0]];
+        let bc = |ya: &[f64], _: &[f64], p: &[f64]| vec![p[1] * ya[0] - 1.0];
+        let fun_jac =
+            |_: f64, y: &[f64], p: &[f64]| (vec![vec![p[0]]], vec![vec![y[0], 0.0]]);
+        let bc_jac = |ya: &[f64], _: &[f64], p: &[f64]| {
+            (vec![vec![p[1]]], vec![vec![0.0]], vec![vec![0.0, ya[0]]])
+        };
+        let parameters: Vec<Vec<f64>> = [-2.0, -1.0, -0.5, 0.0, 0.25, 0.5, 1.0, 2.0]
+            .iter()
+            .enumerate()
+            .map(|(i, &rate)| vec![rate, (i + 1) as f64])
+            .collect();
+        let x = [0.0, 0.5, 1.0];
+        let guess = [vec![1.0; 3]];
+        let options = BvpOptions {
+            tol: 1e-7,
+            fun_jac: Some(&fun_jac),
+            bc_jac: Some(&bc_jac),
+            ..BvpOptions::default()
+        };
+        // Exercise the serial branch and the parallel-eligible branch.
+        for rows in [&parameters[..3], &parameters[..]] {
+            let batch = solve_bvp_many(fun, bc, &x, &guess, rows, options);
+            assert_eq!(batch.len(), rows.len());
+            for (row, item) in rows.iter().zip(batch) {
+                let single_fun_jac =
+                    |_: f64, _: &[f64], _: &[f64]| (vec![vec![row[0]]], Vec::new());
+                let single_bc_jac = |_: &[f64], _: &[f64], _: &[f64]| {
+                    (vec![vec![row[1]]], vec![vec![0.0]], Vec::new())
+                };
+                let single = solve_bvp(
+                    |t, y, _| fun(t, y, row),
+                    |ya, yb, _| bc(ya, yb, row),
+                    &x,
+                    &guess,
+                    &[],
+                    BvpOptions {
+                        fun_jac: Some(&single_fun_jac),
+                        bc_jac: Some(&single_bc_jac),
+                        ..options
+                    },
+                )
+                .expect("independent fixed-parameter solve");
+                let many = item.expect("batched fixed-parameter solve");
+                assert!(many.success && single.success);
+                assert!(many.p.is_empty());
+                assert_eq!(many.status, single.status);
+                assert_eq!(many.niter, single.niter);
+                assert_eq!(many.x, single.x);
+                for (actual, expected) in many.y.iter().flatten().zip(single.y.iter().flatten()) {
+                    assert_eq!(actual.to_bits(), expected.to_bits());
+                }
+                for t in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                    let exact = (row[0] * t).exp() / row[1];
+                    assert!((many.sol(t)[0] - exact).abs() < 2e-6 * (1.0 + exact.abs()));
+                }
+            }
+        }
     }
 
     #[test]
