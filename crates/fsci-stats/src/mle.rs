@@ -1139,6 +1139,109 @@ pub(crate) fn trapezoid_mle(data: &[f64]) -> Result<crate::Trapezoid, FitError> 
     Ok(distribution)
 }
 
+/// Normal location and scale, retaining the ordinary two-pass arithmetic when
+/// its variance is representable. The fallback scales residuals before squaring:
+/// variance can overflow or underflow even when its square root is finite.
+///
+/// `ddof = 0` gives the MLE scale; the normal goodness-of-fit estimator uses
+/// `ddof = 1`. Residuals are centered at the final representable location,
+/// matching the ordinary estimator even when a near-constant sample's exact
+/// mean lies between two floating-point numbers.
+pub(crate) fn normal_fit_moments(data: &[f64], ddof: usize) -> crate::Normal {
+    let n = data.len() as f64;
+    let mut loc = data.iter().sum::<f64>() / n;
+    let variance = data.iter().map(|&x| (x - loc).powi(2)).sum::<f64>() / (n - ddof as f64);
+    let ordinary = crate::Normal {
+        loc,
+        scale: variance.sqrt(),
+    };
+    if variance.is_normal() || data.len() <= ddof || data.iter().any(|x| !x.is_finite()) {
+        return ordinary;
+    }
+
+    if !loc.is_finite() {
+        let minimum = data.iter().copied().fold(f64::INFINITY, f64::min);
+        let maximum = data.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        if minimum == maximum {
+            return crate::Normal {
+                loc: minimum,
+                scale: 0.0,
+            };
+        }
+        if minimum < 0.0 && maximum > 0.0 {
+            // Normalize by the sample count before summing to avoid the
+            // overflowing partial sums. Neumaier compensation retains small
+            // observations between large, cancelling positive/negative terms.
+            fn add(sum: &mut f64, correction: &mut f64, value: f64) {
+                let next = *sum + value;
+                *correction += if sum.abs() >= value.abs() {
+                    (*sum - next) + value
+                } else {
+                    (value - next) + *sum
+                };
+                *sum = next;
+            }
+            let (mut sum, mut correction) = (0.0, 0.0);
+            let (mut tiny_sum, mut tiny_correction) = (0.0, 0.0);
+            for &x in data {
+                let term = x / n;
+                if term.abs() < f64::MIN_POSITIVE {
+                    // Dividing individual subnormals could erase all of them.
+                    // Their unscaled sum is bounded by n*n*MIN_POSITIVE.
+                    add(&mut tiny_sum, &mut tiny_correction, x);
+                } else {
+                    add(&mut sum, &mut correction, term);
+                }
+            }
+            add(&mut sum, &mut correction, (tiny_sum + tiny_correction) / n);
+            loc = sum + correction;
+        }
+        if !loc.is_finite() {
+            let width = maximum - minimum;
+            let center = if width.is_finite() {
+                minimum + 0.5 * width
+            } else {
+                0.5 * minimum + 0.5 * maximum
+            };
+            let spread = (minimum - center).abs().max((maximum - center).abs());
+            let mean_offset =
+                compensated_mean(data.iter().map(|&x| (x - center) / spread), data.len());
+            loc = spread.mul_add(mean_offset, center);
+        }
+        // The true mean is inside the sample range; clamp only endpoint
+        // roundoff. The residual pass below uses this final location.
+        loc = loc.clamp(minimum, maximum);
+    }
+
+    let mut spread = data
+        .iter()
+        .map(|&x| (x - loc).abs())
+        .fold(0.0_f64, f64::max);
+    if spread == 0.0 {
+        // Retain SciPy's zero-scale convention for a constant sample.
+        return crate::Normal { loc, scale: 0.0 };
+    }
+    let differences_overflow = spread.is_infinite();
+    if differences_overflow {
+        spread = data.iter().map(|x| x.abs()).fold(0.0_f64, f64::max);
+    }
+    let normalized_variance = compensated_mean(
+        data.iter().map(|&x| {
+            let residual = if differences_overflow {
+                x / spread - loc / spread
+            } else {
+                (x - loc) / spread
+            };
+            residual * residual
+        }),
+        data.len() - ddof,
+    );
+    crate::Normal {
+        loc,
+        scale: spread * normalized_variance.sqrt(),
+    }
+}
+
 fn compensated_mean(values: impl Iterator<Item = f64>, count: usize) -> f64 {
     let mut mean = 0.0;
     let mut correction = 0.0;
@@ -3108,6 +3211,127 @@ where
         FitError::NonConvergent("MLE parameters are not finite or are outside their domains".into())
     })?;
     finish(values, result.nit, result.nfev)
+}
+
+#[cfg(test)]
+mod normal_fit_tests {
+    use super::normal_fit_moments;
+    use crate::{ContinuousDistribution, FitError, Normal};
+
+    #[test]
+    fn normal_fit_preserves_finite_scales_when_variance_cannot_be_represented() {
+        for scale in [1.0e200, 1.0e-200, 1.0e-310, f64::from_bits(1)] {
+            let data = [-scale, scale];
+            let fitted = Normal::try_fit(&data).unwrap();
+            assert_eq!(fitted.loc, 0.0);
+            assert_eq!(fitted.scale, scale);
+            assert_eq!(fitted.std(), scale);
+            assert!((fitted.entropy() - Normal::standard().entropy() - scale.ln()).abs() < 2.0e-13);
+        }
+        let fitted = Normal::try_fit(&[1.0e308, 1.0e308]).unwrap();
+        assert_eq!(fitted.loc, 1.0e308);
+        assert_eq!(fitted.scale, 0.0);
+        let fitted = Normal::try_fit(&[-f64::MAX, f64::MAX]).unwrap();
+        assert_eq!(fitted.loc, 0.0);
+        assert_eq!(fitted.scale, f64::MAX);
+    }
+
+    #[test]
+    fn normal_fit_mean_keeps_small_observations_between_cancelling_large_values() {
+        let data = [1.0e308, 1.0e308, 1.0, -1.0e308, -1.0e308];
+        let fitted = Normal::try_fit(&data).unwrap();
+        assert_eq!(fitted.loc, 0.2);
+        assert!(fitted.scale.is_finite());
+
+        let tiny = f64::from_bits(1);
+        let data = [
+            1.0e308, 1.0e308, -1.0e308, -1.0e308, tiny, tiny, tiny, tiny, tiny,
+        ];
+        let fitted = Normal::try_fit(&data).unwrap();
+        assert_eq!(fitted.loc, tiny);
+        assert!(fitted.scale.is_finite());
+    }
+
+    #[test]
+    fn normal_fit_retains_ordinary_arithmetic_and_rounded_location_centering() {
+        let ordinary = [-2.5_f64, -0.3, 0.2, 1.7, 2.9, 3.2, 5.4];
+        let origin = 2.0_f64.powi(40);
+        let near_constant = [origin, origin, origin.next_up()];
+        for data in [&ordinary[..], &near_constant[..]] {
+            for ddof in [0, 1] {
+                let loc = data.iter().sum::<f64>() / data.len() as f64;
+                let scale = (data.iter().map(|x| (x - loc).powi(2)).sum::<f64>()
+                    / (data.len() - ddof) as f64)
+                    .sqrt();
+                let fitted = normal_fit_moments(data, ddof);
+                assert_eq!(fitted.loc.to_bits(), loc.to_bits());
+                assert_eq!(fitted.scale.to_bits(), scale.to_bits());
+            }
+        }
+
+        // The exact mean is origin + step/3, which rounds to origin. Match
+        // SciPy's variance about that returned location, not the unrounded
+        // mean: one residual is step, so sigma = step/sqrt(n - ddof).
+        let origin = 2.0_f64.powi(1023);
+        let step = origin.next_up() - origin;
+        let data = [origin, origin, origin.next_up()];
+        for ddof in [0, 1] {
+            let fitted = normal_fit_moments(&data, ddof);
+            assert_eq!(fitted.loc, origin);
+            let expected = step / ((data.len() - ddof) as f64).sqrt();
+            assert!((fitted.scale / expected - 1.0).abs() < 4.0e-16);
+        }
+    }
+
+    #[test]
+    fn normal_fit_rejects_unrepresentable_scales_without_changing_invalid_data_errors() {
+        assert!(matches!(
+            Normal::try_fit(&[]),
+            Err(FitError::InsufficientData { .. })
+        ));
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(matches!(
+                Normal::try_fit(&[0.0, invalid]),
+                Err(FitError::UnsupportedData(_))
+            ));
+        }
+        let minimum = f64::from_bits(1);
+        assert_eq!(Normal::try_fit(&[minimum, 0.0]).unwrap().scale, minimum);
+        let too_small = [minimum, 0.0, 0.0, 0.0, 0.0];
+        assert!(matches!(
+            Normal::try_fit(&too_small),
+            Err(FitError::NonConvergent(_))
+        ));
+        assert!(matches!(
+            Normal::try_fit_for_goodness_of_fit(&[-f64::MAX, f64::MAX]),
+            Err(FitError::NonConvergent(_))
+        ));
+        let constant = Normal::try_fit(&[42.0]).unwrap();
+        assert_eq!(constant.loc, 42.0);
+        assert_eq!(constant.scale, 0.0);
+    }
+
+    #[test]
+    fn normal_fitted_likelihood_and_tails_survive_overflowed_differences() {
+        let fitted = Normal::try_fit(&[-f64::MAX, f64::MAX, f64::MAX]).unwrap();
+        let standard = Normal::standard();
+        let z = -std::f64::consts::SQRT_2;
+        assert!((-f64::MAX - fitted.loc).is_infinite());
+        assert!((fitted.logpdf(-f64::MAX) + fitted.scale.ln() - standard.logpdf(z)).abs() < 2e-13);
+        assert!((fitted.cdf(-f64::MAX) - standard.cdf(z)).abs() < 2e-15);
+        assert!((fitted.sf(-f64::MAX) - standard.sf(z)).abs() < 2e-15);
+        assert!((fitted.logcdf(-f64::MAX) - standard.logcdf(z)).abs() < 2e-14);
+        assert!((fitted.logsf(-f64::MAX) - standard.logsf(z)).abs() < 2e-14);
+        assert!(fitted.pdf(-f64::MAX) > 0.0);
+        assert!((fitted.pdf(-f64::MAX) * fitted.scale - standard.pdf(z)).abs() < 2e-14);
+
+        let tiny = Normal {
+            loc: 0.0,
+            scale: f64::from_bits(1),
+        };
+        let expected = (standard.logpdf(37.0) - tiny.scale.ln()).exp();
+        assert!((tiny.pdf(37.0 * tiny.scale) / expected - 1.0).abs() < 2e-13);
+    }
 }
 
 #[cfg(test)]

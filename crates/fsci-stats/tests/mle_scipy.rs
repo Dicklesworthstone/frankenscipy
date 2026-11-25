@@ -5070,3 +5070,127 @@ fn generalized_normal_mle_rejects_invalid_data_and_honors_caps() {
         });
     });
 }
+
+#[test]
+fn normal_fit_range_regressions_preserve_public_workflows() {
+    for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+        with_stats_runtime_mode(mode, || {
+            for magnitude in [1.0e200, 1.0e-200, 1.0e-310] {
+                let data = [magnitude, 2.0 * magnitude];
+                let fitted = Normal::try_fit(&data).unwrap();
+                assert!((fitted.loc / magnitude - 1.5).abs() < 1.0e-12);
+                assert!((fitted.scale / magnitude - 0.5).abs() < 1.0e-12);
+                assert_eq!(Normal::fit(&data), fitted);
+                assert_eq!(fitted.std(), fitted.scale);
+                assert!(data.iter().all(|&x| fitted.logpdf(x).is_finite()));
+
+                let gof = Normal::try_fit_for_goodness_of_fit(&data).unwrap();
+                assert_eq!(gof.loc, fitted.loc);
+                assert!((gof.scale / magnitude - std::f64::consts::FRAC_1_SQRT_2).abs() < 1.0e-12);
+            }
+            let data = [f64::MAX, f64::MAX, -f64::MAX];
+            let fitted = Normal::try_fit(&data).unwrap();
+            assert!((fitted.loc / f64::MAX - 1.0 / 3.0).abs() < 1.0e-15);
+            assert!((fitted.scale / f64::MAX - (8.0_f64 / 9.0).sqrt()).abs() < 1.0e-15);
+            assert!(data.iter().all(|&x| fitted.logpdf(x).is_finite()));
+        });
+    }
+}
+
+#[test]
+fn normal_fit_matches_live_scipy_across_representable_scales() {
+    let python = std::env::var("FSCI_PYTHON").unwrap_or_else(|_| "python3".into());
+    let required = std::env::var("FSCI_REQUIRE_SCIPY_ORACLE").as_deref() == Ok("1");
+    let available = Command::new(&python)
+        .args(["-c", "import numpy; import scipy"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !available {
+        assert!(
+            !required,
+            "required SciPy oracle is unavailable via {python}"
+        );
+        eprintln!("SKIP Normal range MLE: SciPy oracle unavailable; compared cases = 0");
+        return;
+    }
+    let script = r#"
+import os
+import numpy as np
+import scipy
+from scipy import stats
+print('versions', scipy.__version__, np.__version__)
+if os.environ.get('FSCI_REQUIRE_SCIPY_ORACLE') == '1':
+    assert (scipy.__version__, np.__version__) == ('1.17.1', '2.4.3')
+samples = [[-2., -1., 0., 1., 4.], [1., 2., 3., 5., 8.],
+           [-8., -5., -3., -2., -1.], [0., 1., 1., 2., 3., 10.]]
+for sample in samples:
+    for factor in [1., 1e200, 1e-200, 1e-310, 1e307]:
+        data = np.array(sample) * factor
+        # Normalize the actual rounded observations. Direct NumPy variance
+        # also over/underflows here, so use normal-model affine invariance as
+        # the oracle instead of accepting matching infinities or zeros.
+        normalized = data / factor
+        loc, scale = stats.norm.fit(normalized)
+        sample_scale = np.std(normalized, ddof=1)
+        nll = -np.sum(stats.norm.logpdf(normalized, loc=loc, scale=scale))
+        nll += len(data) * np.log(factor)
+        print(*(format(x, '.17g') for x in [factor, loc, scale, sample_scale, nll]))
+        print(' '.join(format(x, '.17g') for x in data))
+"#;
+    let output = Command::new(&python).args(["-c", script]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "SciPy Normal range MLE oracle failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut lines = stdout.lines();
+    let versions = lines.next().expect("oracle version metadata");
+    eprintln!("Normal range MLE oracle {versions}");
+    if required {
+        assert_eq!(versions, "versions 1.17.1 2.4.3");
+    }
+    let mut compared = 0;
+    while let Some(header) = lines.next() {
+        let expected: Vec<f64> = header
+            .split_whitespace()
+            .map(|field| field.parse().unwrap())
+            .collect();
+        assert_eq!(expected.len(), 5);
+        let data: Vec<f64> = lines
+            .next()
+            .expect("oracle observations")
+            .split_whitespace()
+            .map(|field| field.parse().unwrap())
+            .collect();
+        let factor = expected[0];
+        for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+            with_stats_runtime_mode(mode, || {
+                let fitted = Normal::try_fit(&data).unwrap();
+                let gof = Normal::try_fit_for_goodness_of_fit(&data).unwrap();
+                assert!(
+                    (fitted.loc / factor - expected[1]).abs() < 1.0e-12,
+                    "normal location: factor={factor:e}, mode={mode:?}, fitted={fitted:?}"
+                );
+                assert!(
+                    (fitted.scale / factor - expected[2]).abs() < 1.0e-12,
+                    "normal MLE scale: factor={factor:e}, mode={mode:?}, fitted={fitted:?}"
+                );
+                assert!(
+                    (gof.scale / factor - expected[3]).abs() < 1.0e-12,
+                    "normal GoF scale: factor={factor:e}, mode={mode:?}, fitted={gof:?}"
+                );
+                let nll = likelihood(&fitted, &data);
+                assert!(nll.is_finite());
+                assert!(
+                    (nll - expected[4]).abs() < 2.0e-9,
+                    "normal likelihood: factor={factor:e}, actual={nll}, scipy={}",
+                    expected[4]
+                );
+            });
+            compared += 1;
+        }
+    }
+    assert_eq!(compared, 40, "normal range MLE cases must all be compared");
+    eprintln!("Normal range MLE compared cases = {compared}");
+}

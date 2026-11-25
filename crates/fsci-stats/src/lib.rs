@@ -2028,6 +2028,21 @@ impl Normal {
         Self { loc, scale }
     }
 
+    fn standardize(&self, x: f64) -> f64 {
+        let difference = x - self.loc;
+        if difference.is_infinite()
+            && x.is_finite()
+            && self.loc.is_finite()
+            && self.scale.is_finite()
+        {
+            // Opposite-sign finite observations can overflow subtraction
+            // even though the standardized residual is representable.
+            x / self.scale - self.loc / self.scale
+        } else {
+            difference / self.scale
+        }
+    }
+
     /// Percent point function (inverse CDF) using rational approximation.
     ///
     /// Matches `scipy.stats.norm.ppf(q)`.
@@ -2058,12 +2073,27 @@ impl ContinuousDistribution for Normal {
     }
 
     fn pdf(&self, x: f64) -> f64 {
-        let z = (x - self.loc) / self.scale;
-        (-0.5 * z * z).exp() / (self.scale * (2.0 * PI).sqrt())
+        let z = self.standardize(x);
+        let kernel = (-0.5 * z * z).exp();
+        let denominator = self.scale * (2.0 * PI).sqrt();
+        let density = kernel / denominator;
+        if self.scale.is_finite()
+            && self.scale > 0.0
+            && (kernel == 0.0
+                || kernel.is_subnormal()
+                || denominator.is_subnormal()
+                || !denominator.is_finite())
+        {
+            // Rescaling can rescue an underflowed kernel; a large scale can
+            // overflow the denominator while the final density is subnormal.
+            self.logpdf(x).exp()
+        } else {
+            density
+        }
     }
 
     fn logpdf(&self, x: f64) -> f64 {
-        let z = (x - self.loc) / self.scale;
+        let z = self.standardize(x);
         -0.5 * z * z - self.scale.ln() - 0.5 * (2.0 * PI).ln()
     }
 
@@ -2073,22 +2103,22 @@ impl ContinuousDistribution for Normal {
         // cancels for z ≲ -3; standard_normal_cdf switches to the
         // 0.5·erfc(-z·FRAC_1_SQRT_2) path for z < 0. Resolves
         // [frankenscipy-701x0]; see also [frankenscipy-6exgz].
-        let z = (x - self.loc) / self.scale;
+        let z = self.standardize(x);
         standard_normal_cdf(z)
     }
 
     fn logcdf(&self, x: f64) -> f64 {
-        let z = (x - self.loc) / self.scale;
+        let z = self.standardize(x);
         fsci_special::log_ndtr_scalar(z)
     }
 
     fn sf(&self, x: f64) -> f64 {
-        let z = (x - self.loc) / self.scale;
+        let z = self.standardize(x);
         0.5 * fsci_special::erfc_scalar(z * FRAC_1_SQRT_2)
     }
 
     fn logsf(&self, x: f64) -> f64 {
-        let z = (x - self.loc) / self.scale;
+        let z = self.standardize(x);
         fsci_special::log_ndtr_scalar(-z)
     }
 
@@ -2123,20 +2153,13 @@ impl ContinuousDistribution for Normal {
         self.scale * self.scale
     }
 
+    fn std(&self) -> f64 {
+        // The variance may overflow or underflow even when scale is finite.
+        self.scale.abs()
+    }
+
     fn fit(data: &[f64]) -> Self {
-        let n = data.len() as f64;
-        if n == 0.0 {
-            return Self {
-                loc: f64::NAN,
-                scale: f64::NAN,
-            };
-        }
-        let mean = data.iter().sum::<f64>() / n;
-        let var = data.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n;
-        Self {
-            loc: mean,
-            scale: var.sqrt(),
-        }
+        mle::normal_fit_moments(data, 0)
     }
 
     fn try_fit(data: &[f64]) -> Result<Self, FitError> {
@@ -2151,19 +2174,39 @@ impl ContinuousDistribution for Normal {
                 "Normal::fit: non-finite samples".to_owned(),
             ));
         }
-        Ok(Self::fit(data))
+        let fitted = Self::fit(data);
+        if !fitted.loc.is_finite()
+            || !fitted.scale.is_finite()
+            || (fitted.scale == 0.0 && data.iter().any(|&x| x != data[0]))
+        {
+            return Err(FitError::NonConvergent(
+                "Normal MLE scale is outside the representable positive range".into(),
+            ));
+        }
+        Ok(fitted)
     }
 
     fn try_fit_for_goodness_of_fit(data: &[f64]) -> Result<Self, FitError> {
         validate_finite_fit_data(data, 2, "Normal")?;
-        let n = data.len() as f64;
-        let loc = sample_mean(data);
-        let scale = (data.iter().map(|&x| (x - loc).powi(2)).sum::<f64>() / (n - 1.0)).sqrt();
-        Ok(Self { loc, scale })
+        let fitted = mle::normal_fit_moments(data, 1);
+        if !fitted.loc.is_finite()
+            || !fitted.scale.is_finite()
+            || (fitted.scale == 0.0 && data.iter().any(|&x| x != data[0]))
+        {
+            return Err(FitError::NonConvergent(
+                "Normal goodness-of-fit scale is outside the representable positive range".into(),
+            ));
+        }
+        Ok(fitted)
     }
 
     fn entropy(&self) -> f64 {
-        0.5 * (2.0 * PI * std::f64::consts::E * self.scale * self.scale).ln()
+        let entropy = 0.5 * (2.0 * PI * std::f64::consts::E * self.scale * self.scale).ln();
+        if !entropy.is_finite() && self.scale.is_finite() && self.scale != 0.0 {
+            self.scale.abs().ln() + 0.5 * (2.0 * PI * std::f64::consts::E).ln()
+        } else {
+            entropy
+        }
     }
 
     fn skewness(&self) -> f64 {
