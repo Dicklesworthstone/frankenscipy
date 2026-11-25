@@ -236,8 +236,23 @@ fn is_finite(z: C64) -> bool {
     z.re.is_finite() && z.im.is_finite()
 }
 
-/// LAPACK `zladiv`: complex division without the overflow of the textbook formula (Smith).
+/// Smith's ratio formula retains the ordinary-range LAPACK rounding path.
 fn zladiv(a: C64, b: C64) -> C64 {
+    // With every nonzero component in [2^-250, 2^250], the ratio, its products
+    // and the denominator all fit comfortably in binary64's normal range.
+    const LOW: f64 = f64::from_bits((1023 - 250) << 52);
+    const HIGH: f64 = f64::from_bits((1023 + 250) << 52);
+    let ordinary = |x: f64| x == 0.0 || (LOW..=HIGH).contains(&x.abs());
+    if !(ordinary(a.re) && ordinary(a.im) && ordinary(b.re) && ordinary(b.im))
+        && is_finite(a)
+        && is_finite(b)
+        && b != CZERO
+    {
+        let norm = scaled_sum_of_products(b.re, b.re, b.im, b.im);
+        let real = scaled_sum_of_products(a.re, b.re, a.im, b.im);
+        let imag = scaled_sum_of_products(a.im, b.re, -a.re, b.im);
+        return Complex::new(scaled_quotient(real, norm), scaled_quotient(imag, norm));
+    }
     if b.re.abs() >= b.im.abs() {
         let r = b.im / b.re;
         let d = b.re + b.im * r;
@@ -247,6 +262,45 @@ fn zladiv(a: C64, b: C64) -> C64 {
         let d = b.im + b.re * r;
         Complex::new((a.re * r + a.im) / d, (a.im * r - a.re) / d)
     }
+}
+
+/// Represent x*y + z*w as a significand and an unrestricted binary exponent.
+fn scaled_sum_of_products(x: f64, y: f64, z: f64, w: f64) -> (f64, i32) {
+    let product = |a: f64, b: f64| {
+        if a == 0.0 || b == 0.0 {
+            // Below the smallest exponent of any product of two nonzero f64s.
+            return (a * b, 0.0, -4096);
+        }
+        let (fa, ea) = super::jacobi_frexp(a);
+        let (fb, eb) = super::jacobi_frexp(b);
+        let hi = fa * fb;
+        (hi, fa.mul_add(fb, -hi), ea + eb)
+    };
+    let (p, p_err, ep) = product(x, y);
+    let (q, q_err, eq) = product(z, w);
+    let exponent = ep.max(eq);
+    let sp = 2.0_f64.powi(ep - exponent);
+    let sq = 2.0_f64.powi(eq - exponent);
+    // Keep the low parts when the two leading products nearly cancel.
+    ((p * sp + q * sq) + (p_err * sp + q_err * sq), exponent)
+}
+
+/// Apply the exponent difference only after forming the quotient of significands.
+fn scaled_quotient((a, ea): (f64, i32), (b, eb): (f64, i32)) -> f64 {
+    if a == 0.0 {
+        return a;
+    }
+    let (fraction, adjustment) = super::jacobi_frexp(a / b);
+    let exponent = ea - eb + adjustment;
+    if exponent > 1024 {
+        return f64::INFINITY.copysign(fraction);
+    }
+    if exponent < -1074 {
+        return 0.0_f64.copysign(fraction);
+    }
+    // Both powers are representable. Only the final multiply can round to a subnormal.
+    let outer = exponent.clamp(-1022, 1023);
+    (fraction * 2.0_f64.powi(exponent - outer)) * 2.0_f64.powi(outer)
 }
 
 /// LAPACK `dlapy3`: `√(x² + y² + z²)` without destructive underflow or overflow.
@@ -2909,6 +2963,40 @@ mod tests {
             solve_matrix(&bad, &empty, options).unwrap_err(),
             LinalgError::NonFiniteInput
         );
+    }
+
+    #[test]
+    fn complex_solve_handles_extreme_finite_divisors() {
+        let huge = c(f64::MAX, f64::MAX);
+        let tiny = f64::from_bits(1);
+        let scalar = |a, b| {
+            solve(&[vec![a]], &[b], SolveOptions::default())
+                .unwrap()
+                .x[0]
+        };
+        assert_eq!(scalar(huge, huge), CONE);
+        assert_eq!(scalar(huge, huge.conj()), c(0.0, -1.0));
+        let inv = scalar(huge, CONE);
+        assert!((inv.re * f64::MAX - 0.5).abs() < 1e-15);
+        assert_eq!(inv.im, -inv.re);
+
+        let x = scalar(c(tiny, 2.0 * tiny), c(2.0 * tiny, tiny));
+        assert!((x - c(0.8, -0.6)).norm() < 1e-15);
+        // The ratio of the two denominator components rounds to zero, yet the
+        // real component of the quotient remains representable.
+        let x = scalar(
+            c(2.0_f64.powi(100), 2.0_f64.powi(-1000)),
+            c(0.0, 2.0_f64.powi(1000)),
+        );
+        assert_eq!(x, c(2.0_f64.powi(-200), 2.0_f64.powi(900)));
+
+        let options = SolveOptions {
+            assume_a: Some(MatrixAssumption::UpperTriangular),
+            ..SolveOptions::default()
+        };
+        let a = [vec![huge, CZERO], vec![CZERO, huge.conj()]];
+        let x = solve(&a, &[huge, huge], options).unwrap().x;
+        assert_eq!(x, [CONE, c(0.0, 1.0)]);
     }
 
     #[test]
