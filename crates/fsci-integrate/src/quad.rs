@@ -4402,7 +4402,14 @@ where
                 converged: true,
             };
         }
-        let intervals = ((b - a) / step).floor();
+        let width = b - a;
+        let intervals = if width.is_finite() {
+            (width / step).floor()
+        } else {
+            // Opposite-sign endpoints can overflow the span while defining
+            // just a handful of representable terms.
+            ((0.5 * b - 0.5 * a) / (0.5 * step)).floor()
+        };
         // A saturating float-to-integer cast followed by +1 can panic, wrap
         // into an empty loop, or schedule an effectively unbounded loop.
         // Beyond 2^53, f64 cannot distinguish consecutive grid indices either.
@@ -4415,26 +4422,37 @@ where
             return nan;
         }
         let count = intervals as usize + 1;
-        let mut sum = 0.0;
-        let mut nfev = 0usize;
+        let mut direct = CompensatedSum::default();
+        let mut error = 0.0;
+        let mut previous = f64::NEG_INFINITY;
         for k in 0..count {
-            sum += f(a + k as f64 * step);
-            nfev += 1;
+            let index = k as f64;
+            let mut x = a + index * step;
+            if !x.is_finite() || x > b {
+                x = index.mul_add(step, a);
+            }
+            if !x.is_finite() || x <= previous || x > b {
+                return NsumResult { nfev: k, ..nan };
+            }
+            previous = x;
+            error += direct.add(f(x));
+            let sum = direct.total();
             if !sum.is_finite() {
                 return NsumResult {
                     sum,
                     error: f64::INFINITY,
-                    nfev,
+                    nfev: k + 1,
                     converged: false,
                 };
             }
         }
-        // A non-finite partial sum is SciPy's status -3, not a converged result.
+        let sum = direct.total();
+        error += sum_residual(direct.value, direct.correction, sum).abs();
         return NsumResult {
             sum,
-            error: 0.0,
-            nfev,
-            converged: sum.is_finite(),
+            error,
+            nfev: count,
+            converged: error.is_finite() && error <= atol + rtol * sum.abs(),
         };
     }
     nsum_right(f, a, step, atol, rtol)
@@ -4447,7 +4465,8 @@ where
     // Infinite tail via Euler–Maclaurin with a growing direct window.
     // Σ_{k≥m} f(a+ks) ≈ (1/s)∫_{n_m}^∞ f dx + f(n_m)/2
     //                   − (s/12) f'(n_m) + (s³/720) f'''(n_m)
-    let mut direct = 0.0;
+    let mut direct = CompensatedSum::default();
+    let mut direct_error = 0.0;
     let mut nfev = 0usize;
     let mut filled = 0i64; // number of leading terms already in `direct`
     let mut prev_est = f64::INFINITY;
@@ -4466,12 +4485,12 @@ where
         }
         // Extend the direct partial sum to the first `m` terms.
         while filled < m {
-            direct += f(a + filled as f64 * s);
+            direct_error += direct.add(f(a + filled as f64 * s));
             nfev += 1;
             filled += 1;
-            if !direct.is_finite() {
+            if !direct.total().is_finite() {
                 return NsumResult {
-                    sum: direct,
+                    sum: direct.total(),
                     error: f64::INFINITY,
                     nfev,
                     converged: false,
@@ -4512,7 +4531,8 @@ where
         let d1 = (fp - fm) / (2.0 * delta); // f'(n_m)
         let d3 = (fp2 - 2.0 * fp + 2.0 * fm - fm2) / (2.0 * delta.powi(3)); // f'''(n_m)
 
-        let integ = tanhsinh(&f, n_m, f64::INFINITY, atol, rtol, 16);
+        let integral_atol = (atol * s).min(f64::MAX);
+        let integ = tanhsinh(&f, n_m, f64::INFINITY, integral_atol, rtol, 16);
         nfev += integ.neval;
         if !integ.integral.is_finite() {
             return NsumResult {
@@ -4524,7 +4544,10 @@ where
         }
 
         let tail = integ.integral / s + 0.5 * f_nm - (s / 12.0) * d1 + (s.powi(3) / 720.0) * d3;
-        let est = direct + tail;
+        // Keep the direct sum's compensation when adding the final tail.
+        let mut estimate = direct;
+        let tail_roundoff = estimate.add(tail);
+        let est = estimate.total();
         if !est.is_finite() {
             return NsumResult {
                 sum: est,
@@ -4534,15 +4557,17 @@ where
             };
         }
 
-        last_err = (est - prev_est).abs();
-        // Two successive estimates agreeing is not enough if the tail integral itself missed its
-        // tolerance: both could carry the same unconverged tail.
+        let roundoff = sum_residual(estimate.value, estimate.correction, est).abs();
+        last_err =
+            (est - prev_est).abs() + integ.error / s + direct_error + tail_roundoff + roundoff;
+        // Agreement between windows cannot remove a quadrature error they
+        // share. The integral contributes in series units, divided by step.
         if integ.converged && last_err.is_finite() && last_err <= atol + rtol * est.abs() {
             return NsumResult {
                 sum: est,
                 error: last_err,
                 nfev,
-                // status: tail integral converged and |est - prev| <= atol + rtol·|est|
+                // status: quadrature converged and the combined error meets tolerance
                 converged: true,
             };
         }
@@ -4632,9 +4657,9 @@ where
     let (lower, upper, sign) = if a < b { (a, b, 1.0) } else { (b, a, -1.0) };
     let mut neval = 0;
     let first = gauss_kronrod_panel(&f, lower, upper, &mut neval);
-    let mut integral = GaussKronrodSum::default();
-    let mut error = GaussKronrodSum::default();
-    let mut roundoff = GaussKronrodSum::default();
+    let mut integral = CompensatedSum::default();
+    let mut error = CompensatedSum::default();
+    let mut roundoff = CompensatedSum::default();
     integral.add(first.integral);
     error.add(first.error);
     roundoff.add(first.roundoff);
@@ -4718,25 +4743,29 @@ impl Ord for GaussKronrodPanel {
     }
 }
 
-#[derive(Default)]
-struct GaussKronrodSum {
+#[derive(Clone, Copy, Default)]
+struct CompensatedSum {
     value: f64,
     correction: f64,
 }
 
-impl GaussKronrodSum {
-    fn add(&mut self, term: f64) {
+impl CompensatedSum {
+    /// Neumaier summation. Return the roundoff lost while accumulating the
+    /// correction so callers that report summation error can account for it.
+    fn add(&mut self, term: f64) -> f64 {
         let next = self.value + term;
-        if self.value.is_finite() && term.is_finite() && next.is_finite() {
-            self.correction += if self.value.abs() >= term.abs() {
-                (self.value - next) + term
-            } else {
-                (term - next) + self.value
-            };
+        let loss = if next.is_finite() {
+            let residual = sum_residual(self.value, term, next);
+            let correction = self.correction + residual;
+            let loss = sum_residual(self.correction, residual, correction).abs();
+            self.correction = correction;
+            loss
         } else {
             self.correction = 0.0;
-        }
+            f64::INFINITY
+        };
         self.value = next;
+        loss
     }
 
     fn total(&self) -> f64 {
@@ -4744,7 +4773,17 @@ impl GaussKronrodSum {
     }
 }
 
-fn gauss_kronrod_replace_panel(sum: &mut GaussKronrodSum, parent: f64, left: f64, right: f64) {
+// FastTwoSum with the larger operand first. For finite inputs and sum,
+// this is the signed roundoff discarded by the floating-point addition.
+fn sum_residual(a: f64, b: f64, sum: f64) -> f64 {
+    if a.abs() >= b.abs() {
+        (a - sum) + b
+    } else {
+        (b - sum) + a
+    }
+}
+
+fn gauss_kronrod_replace_panel(sum: &mut CompensatedSum, parent: f64, left: f64, right: f64) {
     // Add the three terms separately so that removing a large coarse-panel
     // estimate cannot erase tiny children. Prefer cancellation at each step:
     // removing a negative parent first can overflow a positive total even
@@ -4872,9 +4911,9 @@ fn gauss_kronrod_panel(
             roundoff: 0.0,
         };
     }
-    let mut kronrod = GaussKronrodSum::default();
-    let mut gauss = GaussKronrodSum::default();
-    let mut absolute = GaussKronrodSum::default();
+    let mut kronrod = CompensatedSum::default();
+    let mut gauss = CompensatedSum::default();
+    let mut absolute = CompensatedSum::default();
     for (&value, &weight) in fvals.iter().zip(&k_weights) {
         let normalized = value / scale;
         kronrod.add(weight * normalized);
@@ -4884,7 +4923,7 @@ fn gauss_kronrod_panel(
         gauss.add(weight * (fvals[idx] / scale));
     }
     let mean = 0.5 * kronrod.total();
-    let mut deviation = GaussKronrodSum::default();
+    let mut deviation = CompensatedSum::default();
     for (&value, &weight) in fvals.iter().zip(&k_weights) {
         deviation.add(weight * (value / scale - mean).abs());
     }
@@ -8922,6 +8961,47 @@ mod tests {
             assert_eq!(result.error, f64::INFINITY);
             assert_eq!(result.nfev, calls.get());
         }
+    }
+
+    #[test]
+    fn nsum_retains_cancellation_and_reports_unrepresentable_low_bits() {
+        let terms = [1e16, 1.0, -1e16];
+        let exact = nsum(|x| terms[x as usize], 0.0, 2.0, 1.0, 0.0, 1e-11);
+        assert!(exact.converged);
+        assert_eq!((exact.sum, exact.error), (1.0, 0.0));
+
+        // The mathematical sum of 2^53 and 1 lies between adjacent floats.
+        let large = (1_u64 << 53) as f64;
+        let rounded = nsum(
+            |x| if x == 0.0 { large } else { 1.0 },
+            0.0,
+            1.0,
+            1.0,
+            0.0,
+            1e-20,
+        );
+        assert!(!rounded.converged);
+        assert_eq!(rounded.sum, large);
+        assert_eq!(rounded.error, 1.0);
+    }
+
+    #[test]
+    fn nsum_handles_wide_spans_and_detects_collapsed_interior_nodes() {
+        let wide = nsum(
+            |x| (x / f64::MAX).powi(2),
+            -f64::MAX,
+            f64::MAX,
+            f64::MAX,
+            0.0,
+            1e-11,
+        );
+        assert!(wide.converged);
+        assert_eq!((wide.sum, wide.nfev), (2.0, 3));
+
+        let boundary = (1_u64 << 53) as f64;
+        let aliased = nsum(|_| 1.0, boundary - 1.0, boundary + 4.0, 1.0, 0.0, 1e-11);
+        assert!(!aliased.converged && aliased.sum.is_nan());
+        assert_eq!(aliased.nfev, 2);
     }
 
     #[test]
