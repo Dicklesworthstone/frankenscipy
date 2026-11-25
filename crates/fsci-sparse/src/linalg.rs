@@ -8730,16 +8730,16 @@ fn cg_within_tolerance(norm: ScaledValue, rhs_norm: ScaledValue, tolerance: f64)
 }
 
 /// Do not let a partial user product inherit a previous iteration's entries.
-fn cg_matvec(a: &dyn LinearOperator, x: &[f64], out: &mut [f64]) -> SparseResult<()> {
+fn checked_krylov_matvec(a: &dyn LinearOperator, x: &[f64], out: &mut [f64]) -> SparseResult<()> {
     let expected = Shape2D::new(out.len(), x.len());
     if a.shape() != expected {
         return Err(SparseError::IncompatibleShape {
-            message: "CG operator changed shape during the solve".to_string(),
+            message: "Krylov operator changed shape during the solve".to_string(),
         });
     }
     if x.iter().any(|value| !value.is_finite()) {
         return Err(SparseError::NonFiniteInput {
-            message: "CG iterate or search direction is not finite".to_string(),
+            message: "Krylov iterate or search direction is not finite".to_string(),
         });
     }
     if a.as_csr().is_none() {
@@ -8748,26 +8748,26 @@ fn cg_matvec(a: &dyn LinearOperator, x: &[f64], out: &mut [f64]) -> SparseResult
     a.matvec_into(x, out)?;
     if a.shape() != expected {
         return Err(SparseError::IncompatibleShape {
-            message: "CG operator changed shape while applying a product".to_string(),
+            message: "Krylov operator changed shape while applying a product".to_string(),
         });
     }
     if out.iter().any(|value| !value.is_finite()) {
         return Err(SparseError::NonFiniteInput {
-            message: "CG operator returned a non-finite or incomplete product".to_string(),
+            message: "Krylov operator returned a non-finite or incomplete product".to_string(),
         });
     }
     Ok(())
 }
 
-fn cg_residual(a: &dyn LinearOperator, b: &[f64], x: &[f64]) -> SparseResult<Vec<f64>> {
+fn checked_krylov_residual(a: &dyn LinearOperator, b: &[f64], x: &[f64]) -> SparseResult<Vec<f64>> {
     let mut residual = vec![0.0; b.len()];
-    cg_matvec(a, x, &mut residual)?;
+    checked_krylov_matvec(a, x, &mut residual)?;
     for (value, &rhs) in residual.iter_mut().zip(b) {
         *value = rhs - *value;
     }
     if residual.iter().any(|value| !value.is_finite()) {
         return Err(SparseError::NonFiniteInput {
-            message: "CG residual is outside the finite floating-point range".to_string(),
+            message: "Krylov residual is outside the finite floating-point range".to_string(),
         });
     }
     Ok(residual)
@@ -8857,7 +8857,7 @@ fn cg_solve(
         });
     }
 
-    let mut residual = cg_residual(a, b, &x)?;
+    let mut residual = checked_krylov_residual(a, b, &x)?;
     let max_iter = options
         .max_iter
         .unwrap_or_else(|| b.len().saturating_mul(10));
@@ -8902,7 +8902,7 @@ fn cg_solve(
         );
         x = fast.solution;
         completed = fast.iterations;
-        residual = cg_residual(a, b, &x)?;
+        residual = checked_krylov_residual(a, b, &x)?;
         let norm = cg_dot(&residual, &residual).sqrt();
         if cg_within_tolerance(norm, rhs_norm, options.tol) || completed >= max_iter {
             return Ok(IterativeSolveResult {
@@ -8925,7 +8925,7 @@ fn cg_solve(
     while completed < max_iter {
         let norm = cg_dot(&residual, &residual).sqrt();
         if cg_within_tolerance(norm, rhs_norm, options.tol) {
-            residual = cg_residual(a, b, &x)?;
+            residual = checked_krylov_residual(a, b, &x)?;
             let actual_norm = cg_dot(&residual, &residual).sqrt();
             if cg_within_tolerance(actual_norm, rhs_norm, options.tol) {
                 return Ok(IterativeSolveResult {
@@ -8958,7 +8958,7 @@ fn cg_solve(
         } else {
             &normalized
         };
-        cg_matvec(a, search, &mut image)?;
+        checked_krylov_matvec(a, search, &mut image)?;
         let curvature = cg_dot(search, &image);
         let floor = ScaledValue::from_f64(f64::EPSILON * 100.0)
             .mul(cg_dot(search, search).sqrt())
@@ -8986,7 +8986,7 @@ fn cg_solve(
         }
     }
 
-    let residual = cg_residual(a, b, &x)?;
+    let residual = checked_krylov_residual(a, b, &x)?;
     let norm = cg_dot(&residual, &residual).sqrt();
     Ok(IterativeSolveResult {
         solution: x,
@@ -9754,6 +9754,19 @@ where
     Ok(z)
 }
 
+/// Arnoldi stores these norms in f64. Reject an unrepresentable scale before
+/// it reaches a normalization or a convergence comparison.
+fn gmres_norm(values: &[f64]) -> SparseResult<f64> {
+    let norm = vec_norm(values);
+    if norm.is_finite() {
+        Ok(norm)
+    } else {
+        Err(SparseError::NonFiniteInput {
+            message: "GMRES vector or norm is outside the finite floating-point range".to_string(),
+        })
+    }
+}
+
 /// LAPACK `dlartg` (the 3.10+ algorithm SciPy's bundled LAPACK runs): `c`, `s`, `r` with
 /// `[c s; −s c]·[f; g] = [r; 0]`, `r` carrying the sign of `f`.
 fn lapack_lartg(f: f64, g: f64) -> (f64, f64, f64) {
@@ -9814,7 +9827,7 @@ where
         });
     }
     let n = b.len();
-    let b_norm = vec_norm(b);
+    let b_norm = gmres_norm(b)?;
     if rhs_is_zero(b_norm) {
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
@@ -9824,65 +9837,66 @@ where
             residual_norm: 0.0,
         });
     }
-    let atol = options.tol * b_norm;
     let eps = f64::EPSILON;
-    let max_cycles = options.max_iter.unwrap_or(n * 10);
+    let max_cycles = options.max_iter.unwrap_or_else(|| n.saturating_mul(10));
     let restart = restart.unwrap_or(20).min(n);
 
-    let mb_norm = vec_norm(&apply_preconditioner(&preconditioner, b)?);
+    let mut r = if x.iter().any(|&value| value != 0.0) {
+        checked_krylov_residual(a, b, &x)?
+    } else {
+        b.to_vec()
+    };
+    let mut r_norm = gmres_norm(&r)?;
+    let threshold = ScaledValue::from_f64(b_norm).mul(ScaledValue::from_f64(options.tol));
+    let initial_converged = ScaledValue::from_f64(r_norm).abs_le(threshold);
+    if initial_converged || max_cycles == 0 {
+        return Ok(IterativeSolveResult {
+            solution: x,
+            converged: initial_converged,
+            iterations: 0,
+            residual_norm: r_norm / b_norm,
+        });
+    }
+
+    let mb_norm = gmres_norm(&apply_preconditioner(&preconditioner, b)?)?;
     let mut ptol_max_factor = 1.0_f64;
-    let mut ptol = mb_norm * ptol_max_factor.min(atol / b_norm);
+    let mut ptol = mb_norm * ptol_max_factor.min(options.tol);
     let mut presid = 0.0_f64;
     let mut v = vec![vec![0.0; n]; restart + 1];
     let mut h = vec![vec![0.0; restart + 1]; restart];
     let mut givens = vec![(0.0_f64, 0.0_f64); restart];
     let mut inner = 0usize;
-    let mut r = if x.iter().any(|&value| value != 0.0) {
-        let ax = a.matvec(&x)?;
-        b.iter().zip(&ax).map(|(bi, axi)| bi - axi).collect()
-    } else {
-        b.to_vec()
-    };
-    if vec_norm(&r) < atol {
-        let residual_norm = vec_norm(&r) / b_norm;
-        return Ok(IterativeSolveResult {
-            solution: x,
-            // status: ‖b − A·x0‖ < tol·‖b‖ before any step
-            converged: true,
-            iterations: 0,
-            residual_norm,
-        });
-    }
-    let mut r_norm = f64::INFINITY;
     let mut av = vec![0.0; n];
     for _cycle in 0..max_cycles {
         v[0] = apply_preconditioner(&preconditioner, &r)?;
-        let beta = vec_norm(&v[0]);
-        let inverse = 1.0 / beta;
-        v[0].iter_mut().for_each(|value| *value *= inverse);
+        let beta = gmres_norm(&v[0])?;
+        if beta == 0.0 {
+            // M annihilated a nonconverged residual. There is no Arnoldi direction.
+            break;
+        }
+        normalize_krylov_vector(&mut v[0], beta, true);
         let mut s = vec![0.0; restart + 1];
         s[0] = beta;
         let mut breakdown = false;
         let mut col = 0;
         for column in 0..restart {
             col = column;
-            a.matvec_into(&v[col], &mut av)?;
+            checked_krylov_matvec(a, &v[col], &mut av)?;
             let mut w = apply_preconditioner(&preconditioner, &av)?;
-            let h0 = vec_norm(&w);
+            let h0 = gmres_norm(&w)?;
             for k in 0..=col {
                 let projection = dot_product(&v[k], &w);
                 h[col][k] = projection;
                 subtract_scaled_basis_vector(&mut w, projection, &v[k]);
             }
-            let h1 = vec_norm(&w);
+            let h1 = gmres_norm(&w)?;
             h[col][col + 1] = h1;
             if h1 <= eps * h0 {
                 h[col][col + 1] = 0.0;
                 breakdown = true;
                 v[col + 1] = w;
             } else {
-                let inverse = 1.0 / h1;
-                w.iter_mut().for_each(|value| *value *= inverse);
+                normalize_krylov_vector(&mut w, h1, true);
                 v[col + 1] = w;
             }
             for k in 0..col {
@@ -9925,10 +9939,9 @@ where
                 *xi += coefficient * bi;
             }
         }
-        let ax = a.matvec(&x)?;
-        r = b.iter().zip(&ax).map(|(bi, axi)| bi - axi).collect();
-        r_norm = vec_norm(&r);
-        if r_norm <= atol || breakdown {
+        r = checked_krylov_residual(a, b, &x)?;
+        r_norm = gmres_norm(&r)?;
+        if ScaledValue::from_f64(r_norm).abs_le(threshold) || breakdown {
             break;
         }
         if presid <= ptol {
@@ -9936,12 +9949,16 @@ where
         } else {
             ptol_max_factor = (1.5 * ptol_max_factor).min(1.0);
         }
-        ptol = presid * ptol_max_factor.min(atol / r_norm);
+        let remaining_tolerance = threshold
+            .div(ScaledValue::from_f64(r_norm))
+            .to_f64()
+            .unwrap_or(f64::INFINITY);
+        ptol = presid * ptol_max_factor.min(remaining_tolerance);
     }
     Ok(IterativeSolveResult {
         solution: x,
         // status: SciPy's `info = 0 if rnorm <= atol`
-        converged: r_norm <= atol,
+        converged: ScaledValue::from_f64(r_norm).abs_le(threshold),
         iterations: inner,
         residual_norm: r_norm / b_norm,
     })
@@ -10095,7 +10112,7 @@ pub fn gmres(
         });
     }
     validate_iterative_finite_inputs(a, b, x0, options)?;
-    let max_cycles = options.max_iter.unwrap_or(n * 10);
+    let max_cycles = options.max_iter.unwrap_or_else(|| n.saturating_mul(10));
     let restart = n.min(GMRES_DEFAULT_RESTART);
 
     let mut x = match x0 {
@@ -10110,7 +10127,7 @@ pub fn gmres(
         None => vec![0.0; n],
     };
 
-    let b_norm = vec_norm(b);
+    let b_norm = gmres_norm(b)?;
     if rhs_is_zero(b_norm) {
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
@@ -10121,50 +10138,51 @@ pub fn gmres(
         });
     }
 
+    let threshold = ScaledValue::from_f64(b_norm).mul(ScaledValue::from_f64(options.tol));
     let mut total_iter = 0usize;
     let mut ptol_max_factor = 1.0_f64;
     let mut inner_tol = options.tol;
 
-    // Outer restart loop. As in SciPy (`info = 0 if rnorm <= atol else maxiter`), convergence is
-    // decided on the TRUE residual after each cycle: the Givens estimate can pass while the true
-    // residual does not (restart), and a lucky breakdown only means the Krylov space is exhausted,
-    // which for a singular A leaves a residual that no further cycle can reduce (stop, unconverged).
+    let mut residual = checked_krylov_residual(a, b, &x)?;
+    let mut r_norm = gmres_norm(&residual)?;
+    let mut converged = ScaledValue::from_f64(r_norm).abs_le(threshold);
     for _ in 0..max_cycles {
+        if converged {
+            break;
+        }
         let (stop, iters, presid_rel) =
-            gmres_inner(a, b, &mut x, b_norm, restart, inner_tol, restart)?;
+            gmres_inner(a, &residual, &mut x, r_norm, b_norm, restart, inner_tol)?;
         total_iter = total_iter
             .checked_add(iters)
             .ok_or_else(|| SparseError::InvalidArgument {
                 message: "GMRES inner iteration count exceeds usize".to_string(),
             })?;
 
-        let ax = a.matvec(&x)?;
-        let r_norm = vec_norm_diff(&ax, b) / b_norm;
-        let converged = r_norm < options.tol;
+        // Reuse this true residual to seed the next cycle. A happy breakdown
+        // exhausts the basis even when a singular system has a residual floor.
+        residual = checked_krylov_residual(a, b, &x)?;
+        r_norm = gmres_norm(&residual)?;
+        converged = ScaledValue::from_f64(r_norm).abs_le(threshold);
         if converged || stop == KrylovCycleStop::Breakdown {
-            return Ok(IterativeSolveResult {
-                solution: x,
-                converged,
-                iterations: total_iter,
-                residual_norm: r_norm,
-            });
+            break;
         }
         if stop == KrylovCycleStop::Tolerance {
             ptol_max_factor = f64::EPSILON.max(0.25 * ptol_max_factor);
         } else {
             ptol_max_factor = (1.5 * ptol_max_factor).min(1.0);
         }
-        inner_tol = presid_rel * ptol_max_factor.min(options.tol / r_norm);
+        let remaining_tolerance = threshold
+            .div(ScaledValue::from_f64(r_norm))
+            .to_f64()
+            .unwrap_or(f64::INFINITY);
+        inner_tol = presid_rel * ptol_max_factor.min(remaining_tolerance);
     }
 
-    let ax = a.matvec(&x)?;
-    let r_norm = vec_norm_diff(&ax, b) / b_norm;
     Ok(IterativeSolveResult {
         solution: x,
-        // status: true residual also decides convergence when no cycle ran
-        converged: r_norm < options.tol,
+        converged,
         iterations: total_iter,
-        residual_norm: r_norm,
+        residual_norm: r_norm / b_norm,
     })
 }
 
@@ -10172,7 +10190,7 @@ pub fn gmres(
 /// decides that from the true residual.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KrylovCycleStop {
-    /// The residual (true at cycle start, Givens estimate inside) met the tolerance.
+    /// The residual estimate inside the cycle met the tolerance.
     Tolerance,
     /// Arnoldi produced a vector in the span of the basis; the space cannot grow.
     Breakdown,
@@ -10217,24 +10235,14 @@ fn subtract_scaled_basis_vector(destination: &mut [f64], scale: f64, basis: &[f6
 
 fn gmres_inner(
     a: &dyn LinearOperator,
-    b: &[f64],
+    residual: &[f64],
     x: &mut [f64],
+    r_norm: f64,
     b_norm: f64,
-    restart: usize,
+    m: usize,
     tol: f64,
-    max_iter: usize,
 ) -> SparseResult<(KrylovCycleStop, usize, f64)> {
     let n = x.len();
-    let m = restart.min(max_iter);
-
-    // r = b - A*x
-    let ax = a.matvec(x)?;
-    let r: Vec<f64> = b.iter().zip(ax.iter()).map(|(bi, axi)| bi - axi).collect();
-    let r_norm = vec_norm(&r);
-
-    if r_norm / b_norm < tol {
-        return Ok((KrylovCycleStop::Tolerance, 0, r_norm / b_norm));
-    }
 
     // Arnoldi process with modified Gram-Schmidt. The basis is one contiguous
     // `(m + 1) × n` slab rather than `m + 1` individually allocated rows. Each
@@ -10242,7 +10250,7 @@ fn gmres_inner(
     // reads and writes the identical values while the MGS kernel gets a direct
     // slice for every basis vector.
     let mut v = Vec::with_capacity((m + 1) * n);
-    v.extend(r.iter().map(|&ri| ri / r_norm));
+    v.extend(residual.iter().map(|&ri| ri / r_norm));
 
     // Upper Hessenberg matrix H (stored as (m+1) x m)
     let mut h = vec![vec![0.0; m]; m + 1];
@@ -10264,10 +10272,10 @@ fn gmres_inner(
 
         // w = A * v_j
         let current_basis = &v[j * n..(j + 1) * n];
-        a.matvec_into(current_basis, &mut wj)?;
+        checked_krylov_matvec(a, current_basis, &mut wj)?;
         // Captured before orthogonalization: this is what the breakdown test
         // below is measured against (frankenscipy-4u7vp).
-        let w_norm_before = vec_norm(&wj);
+        let w_norm_before = gmres_norm(&wj)?;
 
         // Modified Gram-Schmidt orthogonalization
         for i in 0..=j {
@@ -10277,7 +10285,7 @@ fn gmres_inner(
             subtract_scaled_basis_vector(&mut wj, coefficient, basis);
         }
 
-        h[j + 1][j] = vec_norm(&wj);
+        h[j + 1][j] = gmres_norm(&wj)?;
 
         if h[j + 1][j].abs() <= arnoldi_breakdown_floor(w_norm_before) {
             // Lucky breakdown — solution is in the current Krylov subspace
@@ -10289,8 +10297,8 @@ fn gmres_inner(
         }
 
         // Normalize
-        let inv_h = 1.0 / h[j + 1][j];
-        v.extend(wj.iter().map(|&wi| wi * inv_h));
+        normalize_krylov_vector(&mut wj, h[j + 1][j], true);
+        v.extend_from_slice(&wj);
 
         // Apply previous Givens rotations to column j of H
         apply_givens_to_column(&mut h, &cs, &sn, j);
@@ -12314,7 +12322,7 @@ fn lsqr_core(
         });
     }
     beta = beta_0;
-    lsmr_normalize(&mut u, beta_0, tracking.is_some());
+    normalize_krylov_vector(&mut u, beta_0, tracking.is_some());
 
     // α₁v₁ = A^T u₁
     let mut atb = vec![0.0; n];
@@ -12322,7 +12330,7 @@ fn lsqr_core(
     let mut alpha = finite_least_squares_norm(vec_norm(&atb))?;
     let mut v = atb;
     if alpha > 0.0 {
-        lsmr_normalize(&mut v, alpha, tracking.is_some());
+        normalize_krylov_vector(&mut v, alpha, tracking.is_some());
     }
     if let Some(state) = tracking.as_deref_mut() {
         state.r1norm = beta_0;
@@ -12377,7 +12385,7 @@ fn lsqr_core(
         }
         beta = finite_least_squares_norm(vec_norm(&u))?;
         if beta > 0.0 {
-            lsmr_normalize(&mut u, beta, tracking.is_some());
+            normalize_krylov_vector(&mut u, beta, tracking.is_some());
             // The current diagonal belongs to this bidiagonal column; the
             // alpha computed below belongs to the NEXT column. Omitting the
             // current alpha loses alpha_1 from the stopping-test scale.
@@ -12391,7 +12399,7 @@ fn lsqr_core(
             }
             alpha = finite_least_squares_norm(vec_norm(&v))?;
             if alpha > 0.0 {
-                lsmr_normalize(&mut v, alpha, tracking.is_some());
+                normalize_krylov_vector(&mut v, alpha, tracking.is_some());
             }
         }
 
@@ -12975,11 +12983,11 @@ pub fn lsmr_with_options(
     let mut v = vec![0.0; n];
     let mut alpha = 0.0;
     if beta > 0.0 {
-        lsmr_normalize(&mut u, beta, true);
+        normalize_krylov_vector(&mut u, beta, true);
         csc_transpose_matvec_into(a, cached_csc.as_ref(), &u, &mut v)?;
         alpha = finite_least_squares_norm(vec_norm(&v))?;
         if alpha > 0.0 {
-            lsmr_normalize(&mut v, alpha, true);
+            normalize_krylov_vector(&mut v, alpha, true);
         }
     }
     if !alpha.is_finite() || !beta.is_finite() {
@@ -13474,7 +13482,7 @@ fn lsmr_impl(
 
 /// Normalize without an overflowing reciprocal for a subnormal norm. Preserve
 /// SciPy's multiplication order wherever its reciprocal is representable.
-fn lsmr_normalize(vector: &mut [f64], norm: f64, reciprocal_scaling: bool) {
+fn normalize_krylov_vector(vector: &mut [f64], norm: f64, reciprocal_scaling: bool) {
     let inverse = 1.0 / norm;
     if reciprocal_scaling && inverse.is_finite() {
         for entry in vector {
@@ -13506,14 +13514,14 @@ fn lsmr_bidiagonalize(
     }
     let beta = finite_least_squares_norm(vec_norm(u))?;
     if beta > 0.0 {
-        lsmr_normalize(u, beta, reciprocal_scaling);
+        normalize_krylov_vector(u, beta, reciprocal_scaling);
         csc_transpose_matvec_into(a, cached_csc, u, atu)?;
         for index in 0..v.len() {
             v[index] = atu[index] - beta * v[index];
         }
         *alpha = finite_least_squares_norm(vec_norm(v))?;
         if *alpha > 0.0 {
-            lsmr_normalize(v, *alpha, reciprocal_scaling);
+            normalize_krylov_vector(v, *alpha, reciprocal_scaling);
         }
     }
     Ok(beta)
@@ -32088,6 +32096,103 @@ mod tests {
             assert_eq!(residual == 0.0, converged);
             assert_eq!(result.residual_norm == 0.0, converged);
             assert!(result.residual_norm.is_finite());
+        }
+    }
+
+    #[test]
+    fn gmres_checks_exact_starts_and_solutions_at_zero_tolerance() {
+        let a = crate::DenseLinearOperator::from_rows(&[vec![1.0]]).expect("identity");
+        let options = IterativeSolveOptions {
+            tol: 0.0,
+            ..IterativeSolveOptions::default()
+        };
+        for rhs in [1.0, f64::from_bits(1)] {
+            let b = [rhs];
+            for start in [None, Some(b.as_slice())] {
+                let plain = gmres(&a, &b, start, options).expect("GMRES");
+                let left = gmres_preconditioned(&a, &b, |r| Ok(r.to_vec()), start, None, options)
+                    .expect("identity preconditioner");
+                for result in [plain, left] {
+                    assert!(result.converged, "{result:?}");
+                    assert_eq!(result.solution, b);
+                    assert_eq!(result.residual_norm, 0.0);
+                    assert_eq!(result.iterations, usize::from(start.is_none()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gmres_reports_true_residual_without_a_preconditioned_direction() {
+        let a = crate::DenseLinearOperator::from_rows(&[vec![2.0]]).expect("scalar");
+        for budget in [0, 5] {
+            let result = gmres_preconditioned(
+                &a,
+                &[4.0],
+                |_| Ok(vec![0.0]),
+                Some(&[1.0]),
+                None,
+                IterativeSolveOptions {
+                    max_iter: Some(budget),
+                    ..IterativeSolveOptions::default()
+                },
+            )
+            .expect("a zero direction returns the current approximation");
+            assert!(!result.converged);
+            assert_eq!(result.iterations, 0);
+            assert_eq!(result.solution, [1.0]);
+            assert_eq!(result.residual_norm, 0.5);
+        }
+    }
+
+    #[test]
+    fn gmres_keeps_a_nonzero_residual_when_its_relative_norm_underflows() {
+        let a = crate::DenseLinearOperator::from_rows(&[vec![1.0, 0.0], vec![0.0, 1.0]])
+            .expect("identity");
+        let b = [1.0e200, f64::from_bits(1)];
+        let x0 = [b[0], 0.0];
+        let options = IterativeSolveOptions {
+            tol: 0.0,
+            max_iter: Some(0),
+            ..IterativeSolveOptions::default()
+        };
+        let plain = gmres(&a, &b, Some(&x0), options).expect("GMRES");
+        let left = gmres_preconditioned(&a, &b, |r| Ok(r.to_vec()), Some(&x0), None, options)
+            .expect("identity preconditioner");
+        for result in [plain, left] {
+            assert!(!result.converged);
+            assert_eq!(result.residual_norm, 0.0);
+            assert_eq!(result.iterations, 0);
+            assert_eq!(result.solution, x0);
+        }
+    }
+
+    #[test]
+    fn gmres_rejects_incomplete_operator_products_and_unrepresentable_norms() {
+        struct PartialProduct;
+
+        impl LinearOperator for PartialProduct {
+            fn shape(&self) -> Shape2D {
+                Shape2D::new(2, 2)
+            }
+
+            fn matvec_into(&self, x: &[f64], out: &mut [f64]) -> SparseResult<()> {
+                out[0] = x[0];
+                Ok(())
+            }
+        }
+
+        let identity = crate::DenseLinearOperator::from_rows(&[vec![1.0, 0.0], vec![0.0, 1.0]])
+            .expect("identity");
+        for (operator, b) in [
+            (&PartialProduct as &dyn LinearOperator, [1.0, 2.0]),
+            (&identity as &dyn LinearOperator, [f64::MAX; 2]),
+        ] {
+            let options = IterativeSolveOptions::default();
+            let plain = gmres(operator, &b, None, options);
+            let left = gmres_preconditioned(operator, &b, |r| Ok(r.to_vec()), None, None, options);
+            assert!(matches!(plain, Err(SparseError::NonFiniteInput { .. })));
+            assert!(matches!(left, Err(SparseError::NonFiniteInput { .. })));
         }
     }
 
