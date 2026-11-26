@@ -39,8 +39,10 @@
 //! can match on the resulting enum variants instead of substring-parsing
 //! `Display` text.
 
+mod gustafsson;
 mod short_time;
 
+pub use gustafsson::filtfilt_gust;
 pub use short_time::{
     IstftOptions, StftBoundary, StftOptions, StftWindow, istft_with_options, stft_with_options,
 };
@@ -10046,6 +10048,7 @@ fn lfilter_axis_thread_count(lines: usize, line_len: usize, nfilt: usize) -> usi
 /// Matches `scipy.signal.filtfilt(b, a, x)`.
 ///
 /// This results in zero phase distortion (linear phase) and doubled filter order.
+/// For Gustafsson's initial conditions, including on short records, use [`filtfilt_gust`].
 pub fn filtfilt(b: &[f64], a: &[f64], x: &[f64]) -> Result<Vec<f64>, SignalError> {
     filtfilt_with_padtype(b, a, x, None)
 }
