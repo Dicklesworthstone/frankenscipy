@@ -962,10 +962,7 @@ where
             // magnitude by so much that the secant is pinned to `u`, or the
             // root is essentially at `u`. Nudge deliberately rather than
             // stalling into pure bisection for the rest of the solve.
-            let exponents = [
-                frexp_exponent(fab[0]),
-                frexp_exponent(fab[1]),
-            ];
+            let exponents = [frexp_exponent(fab[0]), frexp_exponent(fab[1])];
             c = if exponents[uix] < exponents[1 - uix] - 50 {
                 (31.0 * ab[uix] + ab[1 - uix]) / 32.0
             } else {
@@ -1100,83 +1097,154 @@ where
     F: Fn(f64) -> f64,
 {
     validate_root_options(options)?;
+    secant_solve(&f, x0, x1, options)
+}
+
+/// The secant intercept formed from a ratio whose magnitude is at most one.
+/// Multiplying an unscaled residual by the distance between iterates can lose
+/// a finite step to overflow or underflow. Keep SciPy's ordinary arithmetic;
+/// recover a weighted coordinate from a subnormal residual ratio, and divide
+/// the point weights first if their numerator overflows.
+fn secant_intercept(p0: f64, p1: f64, q0: f64, q1: f64) -> f64 {
+    let (anchor, other, smaller, larger) = if q1.abs() > q0.abs() {
+        (p0, p1, q0, q1)
+    } else {
+        (p1, p0, q1, q0)
+    };
+    let ratio = smaller / larger;
+    let denominator = 1.0 - ratio;
+    let numerator = if smaller != 0.0 && !ratio.is_normal() {
+        // The ratio can round to zero even when its product with a large
+        // coordinate is representable. Form that product before dividing
+        // whenever it retains full precision; otherwise divide the coordinate
+        // first. The latter also handles a product that overflows or underflows.
+        let product = smaller * other;
+        let weighted = if product.is_normal() {
+            product / larger
+        } else {
+            smaller * (other / larger)
+        };
+        -weighted + anchor
+    } else {
+        -ratio * other + anchor
+    };
+    let point = numerator / denominator;
+    if point.is_finite() {
+        point
+    } else {
+        anchor / denominator - (ratio / denominator) * other
+    }
+}
+
+/// Shared derivative-free driver for secant, root_scalar, batched secant, and
+/// newton without a derivative. The iteration and evaluation counts follow
+/// SciPy's scalar newton implementation, including its signed default seed.
+fn secant_solve<F>(
+    f: &F,
+    x0: f64,
+    x1: Option<f64>,
+    options: RootOptions,
+) -> Result<RootResult, OptError>
+where
+    F: Fn(f64) -> f64,
+{
     if !x0.is_finite() {
         return Err(OptError::NonFiniteInput {
             detail: String::from("secant: x0 must be finite"),
         });
     }
-    if let Some(x1_val) = x1
-        && !x1_val.is_finite()
-    {
+    let mut p0 = x0;
+    let mut p1 = match x1 {
+        Some(value) => {
+            if value == x0 {
+                return Err(OptError::InvalidArgument {
+                    detail: String::from("x1 and x0 must be different"),
+                });
+            }
+            value
+        }
+        None => {
+            let epsilon = 1e-4;
+            let shifted = x0 * (1.0 + epsilon);
+            shifted + if shifted >= 0.0 { epsilon } else { -epsilon }
+        }
+    };
+    if !p1.is_finite() {
         return Err(OptError::NonFiniteInput {
             detail: String::from("secant: x1 must be finite"),
         });
     }
-    let mut nfev = 0usize;
-    let mut xprev = x0;
-    nfev += 1;
-    let mut fprev = f(xprev);
-    let mut xcurr = x1.unwrap_or(x0 * (1.0 + 1e-4) + 1e-4);
-    nfev += 1;
-    let mut fcurr = f(xcurr);
+    let mut eval = RootEvaluator::new(f, options);
+    let mut q0 = eval.evaluate(p0)?;
+    let mut q1 = eval.evaluate(p1)?;
+    if q1.abs() < q0.abs() {
+        std::mem::swap(&mut p0, &mut p1);
+        std::mem::swap(&mut q0, &mut q1);
+    }
 
-    for iter in 0..options.maxiter {
-        // Exact zero only; see newton_scalar (frankenscipy-szq1n.7).
-        if fcurr == 0.0 {
+    let mut point = p1;
+    for iteration in 0..options.maxiter {
+        if q1 == q0 {
             return Ok(RootResult::terminal(
                 RootMethod::Secant,
-                xcurr,
-                true,
-                ConvergenceStatus::Success,
-                iter,
-                nfev,
-                "converged",
-            ));
-        }
-
-        let denom = fcurr - fprev;
-        if denom == 0.0 {
-            return Ok(RootResult::terminal(
-                RootMethod::Secant,
-                xcurr,
+                finite_midpoint(p0, p1),
                 false,
                 ConvergenceStatus::PrecisionLoss,
-                iter,
-                nfev,
-                "identical function values",
+                iteration + 1,
+                eval.function_calls,
+                "Tolerance reached.",
             ));
         }
 
-        let x_new = xcurr - fcurr * (xcurr - xprev) / denom;
-        let step = (x_new - xcurr).abs();
-        xprev = xcurr;
-        fprev = fcurr;
-        xcurr = x_new;
-        nfev += 1;
-        fcurr = f(xcurr);
-
-        // Step-size convergence check
-        if step < options.xtol + options.rtol * xcurr.abs() {
+        point = secant_intercept(p0, p1, q0, q1);
+        if !point.is_finite() {
             return Ok(RootResult::terminal(
                 RootMethod::Secant,
-                xcurr,
+                p1,
+                false,
+                ConvergenceStatus::NanEncountered,
+                iteration + 1,
+                eval.function_calls,
+                "secant produced a non-finite iterate",
+            ));
+        }
+
+        let difference = (point - p1).abs();
+        let tolerance = options.xtol + options.rtol * p1.abs();
+        let close = if difference.is_finite() && tolerance.is_finite() {
+            difference <= tolerance
+        } else {
+            // Neither an overflowing distance nor an overflowing tolerance
+            // should turn inf <= inf into an unsupported convergence claim.
+            let magnitude = point.abs().max(p1.abs());
+            (point / magnitude - p1 / magnitude).abs()
+                <= options.xtol / magnitude + options.rtol * (p1.abs() / magnitude)
+        };
+        if close {
+            return Ok(RootResult::terminal(
+                RootMethod::Secant,
+                point,
                 true,
                 ConvergenceStatus::Success,
-                iter + 1,
-                nfev,
+                iteration + 1,
+                eval.function_calls,
                 "converged",
             ));
         }
+        p0 = p1;
+        q0 = q1;
+        p1 = point;
+        q1 = eval.evaluate(p1)?;
     }
 
     Ok(RootResult::terminal(
         RootMethod::Secant,
-        xcurr,
+        point,
         false,
         ConvergenceStatus::MaxIterations,
         options.maxiter,
-        nfev,
-        "secant failed to converge",
+        eval.function_calls,
+        "Failed to converge",
     ))
 }
 
@@ -1392,83 +1460,17 @@ where
         ));
     }
 
-    // Secant method.
-    let method = RootMethod::Secant;
-    let mut p0 = x0;
-    let mut p1 = match x1 {
-        Some(x1v) => {
-            if !x1v.is_finite() {
-                return Err(OptError::NonFiniteInput {
-                    detail: String::from("newton: x1 must be finite"),
-                });
-            }
-            if x1v == x0 {
-                return Err(OptError::InvalidArgument {
-                    detail: String::from("x1 and x0 must be different"),
-                });
-            }
-            x1v
-        }
-        None => {
-            let eps = 1e-4;
-            let mut p1 = x0 * (1.0 + eps);
-            p1 += if p1 >= 0.0 { eps } else { -eps };
-            p1
-        }
-    };
-    let mut q0 = func(p0);
-    funcalls += 1;
-    let mut q1 = func(p1);
-    funcalls += 1;
-    if q1.abs() < q0.abs() {
-        std::mem::swap(&mut p0, &mut p1);
-        std::mem::swap(&mut q0, &mut q1);
-    }
-    let mut p = p1;
-    for itr in 0..maxiter {
-        if q1 == q0 {
-            p = (p1 + p0) / 2.0;
-            return Ok(RootResult::terminal(
-                method,
-                p,
-                false,
-                ConvergenceStatus::PrecisionLoss,
-                itr + 1,
-                funcalls,
-                "Tolerance reached.",
-            ));
-        }
-        if q1.abs() > q0.abs() {
-            p = (-q0 / q1 * p1 + p0) / (1.0 - q0 / q1);
-        } else {
-            p = (-q1 / q0 * p0 + p1) / (1.0 - q1 / q0);
-        }
-        if close(p, p1) {
-            return Ok(RootResult::terminal(
-                method,
-                p,
-                true,
-                ConvergenceStatus::Success,
-                itr + 1,
-                funcalls,
-                "converged",
-            ));
-        }
-        p0 = p1;
-        q0 = q1;
-        p1 = p;
-        q1 = func(p1);
-        funcalls += 1;
-    }
-    Ok(RootResult::terminal(
-        method,
-        p,
-        false,
-        ConvergenceStatus::MaxIterations,
-        maxiter,
-        funcalls,
-        "Failed to converge",
-    ))
+    secant_solve(
+        &func,
+        x0,
+        x1,
+        RootOptions {
+            xtol: tol,
+            rtol,
+            maxiter,
+            ..RootOptions::default()
+        },
+    )
 }
 
 fn require_bracket(bracket: Option<(f64, f64)>) -> Result<(f64, f64), OptError> {
@@ -3127,7 +3129,9 @@ where
             let values = counted(x);
             if values.iter().any(|value| !value.is_finite()) {
                 return Err(OptError::NonFiniteInput {
-                    detail: String::from("lm_root: function output must contain only finite values"),
+                    detail: String::from(
+                        "lm_root: function output must contain only finite values",
+                    ),
                 });
             }
             Ok(values)
@@ -3437,9 +3441,7 @@ mod tests {
     fn nk_gmres_restarts_nonsymmetric_system() {
         let apply = |x: &[f64]| -> Vec<f64> {
             (0..x.len())
-                .map(|i| {
-                    4.0 * x[i] - x[(i + 1) % x.len()] + 0.25 * x[(i + x.len() - 1) % x.len()]
-                })
+                .map(|i| 4.0 * x[i] - x[(i + 1) % x.len()] + 0.25 * x[(i + x.len() - 1) % x.len()])
                 .collect()
         };
         let expected: Vec<f64> = (0..37).map(|i| [0.5, -1.0, 2.0, 0.75][i % 4]).collect();
@@ -3450,10 +3452,17 @@ mod tests {
             Ok(apply(x))
         };
         let result = super::nk_gmres(&mut matvec, &rhs, 1e-11, 3, 90).unwrap();
-        let residual: Vec<f64> = apply(&result).iter().zip(&rhs).map(|(a, b)| a - b).collect();
+        let residual: Vec<f64> = apply(&result)
+            .iter()
+            .zip(&rhs)
+            .map(|(a, b)| a - b)
+            .collect();
         assert!(super::euclidean_norm(&residual) / super::euclidean_norm(&rhs) <= 1e-11);
         assert!(calls.get() > 4, "fixture must require at least one restart");
-        assert!(calls.get() <= 120, "90 Arnoldi steps plus at most 30 residual checks");
+        assert!(
+            calls.get() <= 120,
+            "90 Arnoldi steps plus at most 30 residual checks"
+        );
         for (actual, expected) in result.iter().zip(expected) {
             assert!((actual - expected).abs() < 1e-10);
         }
@@ -3468,17 +3477,27 @@ mod tests {
         };
         let rhs = [1.0, 1.0, 1.0];
         let result = super::nk_gmres(&mut matvec, &rhs, 1e-12, 2, 1).unwrap();
-        assert_eq!(calls.get(), 2, "one Arnoldi step and one true-residual check");
-        let residual = [result[0] - 1.0, 10.0 * result[1] - 1.0, 100.0 * result[2] - 1.0];
-        assert!(super::euclidean_norm(&residual) > 0.1, "one step cannot solve this system");
+        assert_eq!(
+            calls.get(),
+            2,
+            "one Arnoldi step and one true-residual check"
+        );
+        let residual = [
+            result[0] - 1.0,
+            10.0 * result[1] - 1.0,
+            100.0 * result[2] - 1.0,
+        ];
+        assert!(
+            super::euclidean_norm(&residual) > 0.1,
+            "one step cannot solve this system"
+        );
     }
 
     #[test]
     fn nk_gmres_is_invariant_to_rhs_scale() {
         for scale in [1e-200, 1.0, 1e200] {
             let mut matvec = |x: &[f64]| Ok(vec![x[0], 2.0 * x[1], 3.0 * x[2]]);
-            let result =
-                super::nk_gmres(&mut matvec, &[scale, scale, scale], 1e-12, 3, 9).unwrap();
+            let result = super::nk_gmres(&mut matvec, &[scale, scale, scale], 1e-12, 3, 9).unwrap();
             for (actual, expected) in result.iter().zip([1.0, 0.5, 1.0 / 3.0]) {
                 assert!((actual / scale - expected).abs() < 1e-12, "scale={scale:e}");
             }
@@ -3493,9 +3512,7 @@ mod tests {
         let residual = |x: &[f64]| {
             x.iter()
                 .enumerate()
-                .map(|(i, &value)| {
-                    [1.0, 2.0, 3.0][i % 3] * (value - [0.5, 1.5, -2.0, 0.75][i % 4])
-                })
+                .map(|(i, &value)| [1.0, 2.0, 3.0][i % 3] * (value - [0.5, 1.5, -2.0, 0.75][i % 4]))
                 .collect::<Vec<_>>()
         };
         let result = newton_krylov(residual, &vec![0.0; n], 1e-8, 20).unwrap();
@@ -3632,8 +3649,7 @@ mod tests {
 
     #[test]
     fn newton_krylov_small_residual_does_not_underflow() {
-        let result = newton_krylov(|x| vec![1e-200 * (x[0] - 1.0)], &[0.0], 1e-210, 20)
-            .unwrap();
+        let result = newton_krylov(|x| vec![1e-200 * (x[0] - 1.0)], &[0.0], 1e-210, 20).unwrap();
         assert!(result.converged);
         assert!((result.x[0] - 1.0).abs() < 1e-10);
         assert!(result.fun[0].abs() < 1e-210);
@@ -5240,6 +5256,228 @@ mod tests {
             "root = {}",
             result.root
         );
+    }
+
+    #[test]
+    fn secant_routes_share_stable_steps_across_residual_and_coordinate_units() {
+        let options = RootOptions {
+            xtol: f64::from_bits(1),
+            rtol: 1e-12,
+            maxiter: 20,
+            ..RootOptions::default()
+        };
+        let parameters = vec![vec![1e-308], vec![1.0], vec![1e308]];
+        for unit in [1e-100, 1.0, 1e200] {
+            let batch = secant_many(
+                |x, p| p[0] * (x / unit - 1.0),
+                0.0,
+                Some(2.0 * unit),
+                &parameters,
+                options,
+            );
+            for (index, parameter) in parameters.iter().enumerate() {
+                let scale = parameter[0];
+                let f = |x: f64| scale * (x / unit - 1.0);
+                let direct = secant(f, 0.0, Some(2.0 * unit), options).unwrap();
+                let routed = root_scalar(f, None, Some(0.0), Some(2.0 * unit), options).unwrap();
+                let unified = newton(
+                    f,
+                    0.0,
+                    None,
+                    None,
+                    Some(2.0 * unit),
+                    options.xtol,
+                    options.rtol,
+                    options.maxiter,
+                )
+                .unwrap();
+                assert!(direct.converged, "unit={unit}, scale={scale}: {direct:?}");
+                assert!(
+                    (direct.root / unit - 1.0).abs() < 2e-14,
+                    "unit={unit}, scale={scale}: {direct:?}"
+                );
+                assert_eq!((direct.iterations, direct.function_calls), (2, 3));
+                assert_eq!(direct, routed);
+                assert_eq!(direct, unified);
+                assert_eq!(&direct, batch[index].as_ref().unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn secant_preserves_tiny_residual_corrections_across_seed_orders_and_routes() {
+        let options = RootOptions {
+            xtol: f64::from_bits(1),
+            rtol: 0.0,
+            maxiter: 20,
+            ..RootOptions::default()
+        };
+        // These give a zero ratio, a rounded subnormal ratio, and a
+        // subnormal ratio whose unscaled coordinate product overflows.
+        for offset in [1e-300, 1e-10, 2.0] {
+            for far in [1e300, 1e308, -1e300, -1e308] {
+                for (x0, x1) in [(far, 0.0), (0.0, far)] {
+                    let f = |x| x + offset;
+                    let direct = secant(f, x0, Some(x1), options).unwrap();
+                    let routed = root_scalar(f, None, Some(x0), Some(x1), options).unwrap();
+                    let unified = newton(
+                        f,
+                        x0,
+                        None,
+                        None,
+                        Some(x1),
+                        options.xtol,
+                        options.rtol,
+                        options.maxiter,
+                    )
+                    .unwrap();
+                    assert!(direct.converged, "{offset}/{x0}/{x1}: {direct:?}");
+                    assert_eq!(direct.root, -offset, "{offset}/{x0}/{x1}: {direct:?}");
+                    assert_eq!(f(direct.root), 0.0);
+                    assert_eq!(direct, routed);
+                    assert_eq!(direct, unified);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn secant_subnormal_ratio_handles_underflowing_coordinate_products() {
+        // smaller*other underflows, but (other/larger)*smaller is exactly
+        // 2^20 times the smallest subnormal. Do not erase this correction.
+        let other = 2.0_f64.powi(-20);
+        let smaller = f64::from_bits(1);
+        let larger = 2.0_f64.powi(-40);
+        let expected = -f64::from_bits(1 << 20);
+        assert_eq!(
+            super::secant_intercept(0.0, other, smaller, larger),
+            expected
+        );
+        assert_eq!(
+            super::secant_intercept(other, 0.0, larger, smaller),
+            expected
+        );
+    }
+
+    #[test]
+    fn secant_default_seed_moves_away_from_negative_initial_points() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let result = secant(
+            |x| {
+                calls.borrow_mut().push(x);
+                x + 2.0
+            },
+            -1.0,
+            None,
+            RootOptions::default(),
+        )
+        .unwrap();
+        assert!(result.converged, "{result:?}");
+        assert_eq!(result.root, -2.0);
+        assert_eq!((result.iterations, result.function_calls), (2, 3));
+        let calls = calls.borrow();
+        assert_eq!(calls[0], -1.0);
+        assert!(calls[1] < calls[0], "the negative seed must be distinct");
+        assert_eq!(calls.len(), result.function_calls);
+    }
+
+    #[test]
+    fn secant_handles_wide_spans_and_finite_huge_intercepts() {
+        let options = RootOptions {
+            xtol: f64::from_bits(1),
+            rtol: 1e-12,
+            maxiter: 20,
+            ..RootOptions::default()
+        };
+        for (a, b, target) in [
+            (-1e308, 1e308, 0.25),
+            (1.4e308, 1.7e308, 1.6),
+            (-1.7e308, -1.4e308, -1.6),
+        ] {
+            let result = secant(|x| x / 1e308 - target, a, Some(b), options).unwrap();
+            assert!(result.converged && result.root.is_finite(), "{result:?}");
+            assert!((result.root / 1e308 - target).abs() < 2e-12, "{result:?}");
+        }
+        let flat = secant(|_| 1.0, 1.4e308, Some(1.7e308), options).unwrap();
+        assert!(!flat.converged);
+        assert_eq!(flat.status, ConvergenceStatus::PrecisionLoss);
+        assert!(flat.root.is_finite() && flat.root >= 1.4e308 && flat.root <= 1.7e308);
+        assert_eq!(flat.function_calls, 2);
+    }
+
+    #[test]
+    fn secant_rejects_bad_seeds_and_nonfinite_samples_before_false_success() {
+        use std::cell::Cell;
+
+        let invalid_seeds = [(1.0, Some(1.0)), (1.0, Some(f64::NAN)), (f64::MAX, None)];
+        for (x0, x1) in invalid_seeds {
+            assert!(
+                secant(
+                    |_| panic!("invalid seeds must be rejected before the callback"),
+                    x0,
+                    x1,
+                    RootOptions::default(),
+                )
+                .is_err()
+            );
+        }
+        for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+            for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                for at_start in [false, true] {
+                    let calls = Cell::new(0);
+                    let result = secant(
+                        |x| {
+                            calls.set(calls.get() + 1);
+                            if at_start {
+                                invalid
+                            } else if x == 0.0 {
+                                -1.0
+                            } else if x == 1.0 {
+                                1.0
+                            } else {
+                                invalid
+                            }
+                        },
+                        0.0,
+                        Some(1.0),
+                        RootOptions {
+                            mode,
+                            ..RootOptions::default()
+                        },
+                    );
+                    let error = result.expect_err("nonfinite samples cannot certify a root");
+                    match mode {
+                        RuntimeMode::Strict => {
+                            assert!(matches!(error, crate::OptError::InvalidArgument { .. }));
+                        }
+                        RuntimeMode::Hardened => {
+                            assert!(matches!(error, crate::OptError::NonFiniteInput { .. }));
+                        }
+                    }
+                    assert_eq!(calls.get(), if at_start { 1 } else { 3 });
+                }
+            }
+        }
+
+        let calls = Cell::new(0);
+        let result = secant(
+            |x| {
+                assert!(
+                    x.is_finite(),
+                    "never pass an invalid iterate to the callback"
+                );
+                calls.set(calls.get() + 1);
+                if x == 1e308 { 1.0 } else { 1.0 - f64::EPSILON }
+            },
+            1e308,
+            Some(1.5e308),
+            RootOptions::default(),
+        )
+        .unwrap();
+        assert!(!result.converged && result.root.is_finite());
+        assert_eq!(result.status, ConvergenceStatus::NanEncountered);
+        assert_eq!(result.function_calls, 2);
+        assert_eq!(calls.get(), 2);
     }
 
     #[test]
