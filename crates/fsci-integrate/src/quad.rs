@@ -1203,7 +1203,11 @@ where
         // the nonlinear QUADPACK correction, using the selected vector norm.
         // A ratio that underflows cannot affect this norm: a component at
         // the maximum scale contributes a strictly positive roundoff bound.
-        let ratio = if scale == 0.0 { 0.0 } else { sums.scale / scale };
+        let ratio = if scale == 0.0 {
+            0.0
+        } else {
+            sums.scale / scale
+        };
         difference = norm.combine(difference, sums.difference * ratio);
         deviation = norm.combine(deviation, sums.deviation * ratio);
         absolute = norm.combine(absolute, sums.absolute * ratio);

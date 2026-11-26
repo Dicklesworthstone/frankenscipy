@@ -193,7 +193,7 @@
   },
   "scipy.integrate": {
    "applicable": 32,
-   "compared": 14,
+   "compared": 15,
    "crate": "fsci-integrate",
    "declared": 31,
    "matched_by": {
@@ -225,8 +225,7 @@
     "nquad",
     "nsum",
     "ode",
-    "qmc_quad",
-    "tanhsinh"
+    "qmc_quad"
    ],
    "scipy": 33
   },
@@ -389,7 +388,7 @@
   },
   "scipy.linalg": {
    "applicable": 95,
-   "compared": 71,
+   "compared": 72,
    "crate": "fsci-linalg",
    "declared": 95,
    "matched_by": {
@@ -418,7 +417,6 @@
     "eigvals_banded",
     "eigvalsh_tridiagonal",
     "expm_cond",
-    "expm_frechet",
     "invpascal",
     "matmul_toeplitz",
     "orthogonal_procrustes",
@@ -538,7 +536,7 @@
   },
   "scipy.optimize": {
    "applicable": 70,
-   "compared": 29,
+   "compared": 30,
    "crate": "fsci-opt",
    "declared": 68,
    "matched_by": {
@@ -570,7 +568,6 @@
     "brent",
     "broyden2",
     "diagbroyden",
-    "differential_evolution",
     "direct",
     "dual_annealing",
     "excitingmixing",
@@ -618,7 +615,7 @@
   },
   "scipy.signal": {
    "applicable": 157,
-   "compared": 77,
+   "compared": 78,
    "crate": "fsci-signal",
    "declared": 153,
    "matched_by": {
@@ -660,7 +657,6 @@
     "cspline2d",
     "czt_points",
     "dbode",
-    "decimate",
     "dfreqresp",
     "dimpulse",
     "dlsim",
@@ -1092,21 +1088,19 @@
   },
   "scipy.stats": {
    "applicable": 303,
-   "compared": 239,
+   "compared": 240,
    "crate": "fsci-stats",
-   "declared": 299,
+   "declared": 300,
    "matched_by": {
     "case_fold": 105,
     "exact": 152,
-    "reexport": 0,
+    "reexport": 1,
     "trait": 0,
     "type_alias": 42
    },
    "na": 0,
-   "not_real": {
-    "make_distribution": "missing: needs a generic user-defined distribution mechanism (frankenscipy-1ksfv)"
-   },
-   "real": 302,
+   "not_real": {},
+   "real": 303,
    "real_not_compared": [
     "Binomial",
     "CensoredData",
@@ -1134,7 +1128,6 @@
     "exp",
     "fit",
     "gausshyper",
-    "gengamma",
     "genhyperbolic",
     "geninvgauss",
     "gibrat",
@@ -1143,6 +1136,7 @@
     "ksone",
     "log",
     "logrank",
+    "make_distribution",
     "mode",
     "monte_carlo_test",
     "multiscale_graphcorr",
@@ -1292,17 +1286,17 @@
  "scipy": "1.17.1",
  "total": {
   "applicable": 1538,
-  "compared": 904,
-  "declared": 1498,
+  "compared": 909,
+  "declared": 1499,
   "matched_by": {
    "case_fold": 131,
    "exact": 1292,
-   "reexport": 13,
+   "reexport": 14,
    "trait": 2,
    "type_alias": 60
   },
   "na": 17,
-  "real": 1531,
+  "real": 1532,
   "scipy": 1555
  }
 }
