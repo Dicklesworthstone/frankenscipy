@@ -81,3 +81,49 @@
 - [x] No deprecation warnings introduced
 - [x] Tokio ban maintained (`cargo tree -i tokio` empty)
 - [x] Documentation updated in UPGRADE_LOG.md
+
+---
+
+# Dependency Pass — 2026-11-26
+
+**Scope:** semver-compatible refresh of `Cargo.lock` and `fuzz/Cargo.lock`; no manifest
+requirement changed.
+
+## Summary
+
+| Metric | Count |
+|--------|-------|
+| **Lock entries refreshed** | 20 (`Cargo.lock`), 14 (`fuzz/Cargo.lock`) |
+| **Major upgrades taken** | 0 |
+| **Held** | `sha2` 0.10.9 (0.11.2 available) |
+| **Failed (rolled back)** | 0 |
+| **Advisories (`cargo audit`)** | 0 before, 0 after (334 and 259 crates) |
+
+## Refreshed (patch and minor releases)
+
+`ahash` 0.8.14, `anyhow` 1.0.105, `clap` 4.6.10, `clap_builder` 4.6.10,
+`constant_time_eq` 0.6.2, `crc32fast` 1.5.6, `litrs` 1.1.0, `lru` 0.19.2,
+`pest`/`pest_derive`/`pest_generator`/`pest_meta` 2.9.7, `sha2` 0.11.2 (the copy
+`asupersync` uses), `toml` 1.2.3, `toml_edit` 0.25.21, `toml_parser` 1.1.7,
+`zerocopy`/`zerocopy-derive` 0.8.66, `zip` 9.8.2, `zlib-rs` 0.6.9. The fuzz lock takes
+the subset it contains.
+
+- **Hot paths:** none of these is in the normal dependency graph of fsci-linalg,
+  fsci-fft, fsci-opt, fsci-special or fsci-stats (`cargo tree -e normal -p <crate>`).
+  In fsci-sparse they sit only under the optional `npz` archive codec (`zip`, `zlib-rs`,
+  `crc32fast`, `constant_time_eq`, and `pest` through `npyz`). The rest serve
+  fsci-conformance, benches and build tooling. So there was no kernel to A/B.
+- **Gates (pinned nightly, x86_64 Linux):** `cargo clippy --locked --workspace
+  --all-targets -- -D warnings` is clean. Against live SciPy 1.17.1, `diff_sparse`
+  (39/39, including `.npz` wire compatibility), `diff_sparse_lobpcg` and
+  `diff_stats_multivariate` pass. `cargo audit` reports nothing for either lock.
+
+## Held
+
+### sha2: 0.10.9 → 0.11.2
+- **Reason:** `digest` 0.11's output type no longer implements `LowerHex`, so 27 files
+  that format digests with `{:x}` need an explicit encoder. All of them are optional
+  perf/identity binaries, benches or test helpers; no library code path uses `sha2`.
+  Tracked in [#9](https://github.com/Dicklesworthstone/frankenscipy/issues/9).
+- `generic-array` stays at 0.14.7 because `crypto-common` 0.1.7, in the same 0.10
+  `digest` chain, requires exactly `=0.14.7`.
