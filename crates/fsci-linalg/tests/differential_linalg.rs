@@ -6,7 +6,7 @@
 
 use fsci_linalg::{
     InvOptions, LstsqOptions, PinvOptions, SolveOptions, TriangularSolveOptions, det, inv, lstsq,
-    pinv, solve, solve_banded, solve_discrete_are, solve_triangular,
+    pinv, solve, solve_banded, solve_continuous_are, solve_discrete_are, solve_triangular,
 };
 use fsci_runtime::RuntimeMode;
 
@@ -82,6 +82,52 @@ fn identity(n: usize) -> Vec<Vec<f64>> {
 
 fn vec_add(a: &[f64], b: &[f64]) -> Vec<f64> {
     a.iter().zip(b.iter()).map(|(x, y)| x + y).collect()
+}
+
+#[test]
+fn care_selects_the_stabilizing_zero_state_cost_branch() {
+    // Q = 0 admits X = 0 even for unstable A; the stabilizing scalar answer is 2a.
+    for (a, expected) in [(2.0, 4.0), (-2.0, 0.0)] {
+        let x = solve_continuous_are(
+            &[vec![a]],
+            &[vec![1.0]],
+            &[vec![0.0]],
+            &[vec![1.0]],
+            Default::default(),
+        ).unwrap()[0][0];
+        assert_close(x, expected);
+        assert!(a - x < 0.0);
+    }
+
+    // A complex-conjugate pair shifts from 1.25 ± 0.875i to −1.25 ± 0.875i.
+    let x = solve_continuous_are(
+        &[vec![1.25, -0.875], vec![0.875, 1.25]],
+        &identity(2),
+        &[vec![0.0; 2], vec![0.0; 2]],
+        &identity(2),
+        Default::default(),
+    ).unwrap();
+    assert_mat_close(&x, &[vec![2.5, 0.0], vec![0.0, 2.5]]);
+}
+
+#[test]
+fn care_handles_mixed_modes_and_rejects_an_unstabilizable_system() {
+    let x = solve_continuous_are(
+        &[vec![2.0, 0.0], vec![0.0, -1.0]],
+        &[vec![1.0], vec![0.0]],
+        &[vec![0.0, 0.0], vec![0.0, 2.0]],
+        &[vec![1.0]],
+        Default::default(),
+    ).unwrap();
+    assert_mat_close(&x, &[vec![4.0, 0.0], vec![0.0, 1.0]]);
+
+    assert!(solve_continuous_are(
+        &[vec![2.0]],
+        &[vec![0.0]],
+        &[vec![0.0]],
+        &[vec![1.0]],
+        Default::default(),
+    ).is_err());
 }
 
 #[test]

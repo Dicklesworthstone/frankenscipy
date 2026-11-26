@@ -21500,21 +21500,28 @@ fn matrix_sign_iteration(
     let mut s = h.clone();
     let n = s.nrows() as f64;
     for _ in 0..max_iter {
-        let s_inv = s.clone().try_inverse().ok_or(LinalgError::SingularMatrix)?;
-        let det_abs = s.determinant().abs();
-        let c = if det_abs > 1e-300 {
-            det_abs.powf(1.0 / n).max(1e-12)
-        } else {
-            1.0
-        };
-        let s_next = (&s / c + &s_inv * c) * 0.5;
-        let diff = (&s_next - &s).norm();
-        s = s_next;
-        if diff < tol {
+        let lu = s.clone().lu();
+        let s_inv = lu.try_inverse().ok_or(LinalgError::SingularMatrix)?;
+        // The determinant can overflow or underflow even when its nth root is ordinary.
+        let log_abs_det: f64 = lu
+            .lu_internal()
+            .diagonal()
+            .iter()
+            .map(|v| v.abs().ln())
+            .sum();
+        let c = (log_abs_det / n).exp();
+        let s_next = (&s / c + s_inv * c) * 0.5;
+        if !s_next.iter().all(|v| v.is_finite()) {
             break;
         }
+        if (&s_next - &s).amax() <= tol * s_next.amax().max(1.0) {
+            return Ok(s_next);
+        }
+        s = s_next;
     }
-    Ok(s)
+    Err(LinalgError::ConvergenceFailure {
+        detail: "Hamiltonian sign iteration failed to converge".into(),
+    })
 }
 
 /// Structure-preserving doubling (SDA) for DARE. Iterates
@@ -21651,7 +21658,7 @@ fn dare_stabilizes(
 ///   H = [[A, -G], [-Q, -Aᵀ]]   with G = BR⁻¹Bᵀ,
 /// iterate the matrix sign function until convergence, then take
 /// (I − sign(H))/2 — a rank-n projector onto the stable invariant
-/// subspace. QR-decompose to extract a 2n×n basis [U₁; U₂], and
+/// subspace. Use column-pivoted QR to extract a 2n×n basis [U₁; U₂], and
 /// recover X = U₂ U₁⁻¹ (symmetrized for robustness).
 ///
 /// Matches `scipy.linalg.solve_continuous_are(a, b, q, r)` for the
@@ -21702,12 +21709,12 @@ pub fn solve_continuous_are(
     let q_mat = dmatrix_from_rows(q)?;
     let r_mat = dmatrix_from_rows(r)?;
 
-    // G = B R⁻¹ Bᵀ (n × n).
-    let r_inv = r_mat
-        .clone()
-        .try_inverse()
+    // G = B R⁻¹ Bᵀ. Reuse R's factors to compute the feedback gain below.
+    let r_lu = r_mat.lu();
+    let rinv_bt = r_lu
+        .solve(&b_mat.transpose())
         .ok_or(LinalgError::SingularMatrix)?;
-    let g = &b_mat * &r_inv * b_mat.transpose();
+    let g = &b_mat * rinv_bt;
 
     // Build Hamiltonian: H = [[A, -G], [-Q, -Aᵀ]].
     let two_n = 2 * n;
@@ -21721,8 +21728,7 @@ pub fn solve_continuous_are(
         }
     }
 
-    // sign(H) — eigenvalues map to ±1, splitting stable/unstable
-    // subspaces orthogonally.
+    // sign(H) maps the stable and unstable spectra to −1 and +1.
     let s = matrix_sign_iteration(&h, 100, 1e-12)?;
 
     // P = (I - sign(H))/2: rank-n projector onto stable subspace.
@@ -21732,16 +21738,38 @@ pub fn solve_continuous_are(
     }
     p *= 0.5;
 
-    // QR of P; the leading n columns of Q span the column space of P.
-    let qr = p.qr();
-    let q_full = qr.q();
-    let u_top = q_full.view((0, 0), (n, n)).into_owned();
-    let u_bot = q_full.view((n, 0), (n, n)).into_owned();
-    let u_top_inv = u_top.try_inverse().ok_or(LinalgError::SingularMatrix)?;
-    let x_raw = &u_bot * &u_top_inv;
+    // The projector has rank n, but its first n columns can be zero or dependent.
+    let basis = p.col_piv_qr().q();
+    let top = basis.view((0, 0), (n, n));
+    let bottom = basis.view((n, 0), (n, n));
+    let xt = top
+        .transpose()
+        .lu()
+        .solve(&bottom.transpose())
+        .ok_or(LinalgError::SingularMatrix)?;
+    let x_sym = &xt * 0.5 + xt.transpose() * 0.5;
 
-    // Symmetrize for numerical stability.
-    let x_sym = (&x_raw + x_raw.transpose()) * 0.5;
+    // Several symmetric matrices can solve the equation. Only the one whose
+    // feedback poles lie in the open left half-plane is the stabilizing solution.
+    let gain = r_lu
+        .solve(&(b_mat.transpose() * &x_sym))
+        .ok_or(LinalgError::SingularMatrix)?;
+    let closed_loop = &a_mat - &b_mat * gain;
+    let left = a_mat.transpose() * &x_sym;
+    let right = &x_sym * &closed_loop;
+    let residual = &left + &right + &q_mat;
+    let scale = left.amax().max(right.amax()).max(q_mat.amax());
+    if !closed_loop.iter().chain(residual.iter()).all(|v| v.is_finite())
+        || residual.amax() > (2048.0 * n as f64 * f64::EPSILON) * scale
+        || !bounded_schur(closed_loop)?
+            .complex_eigenvalues()
+            .iter()
+            .all(|pole| pole.re < 0.0)
+    {
+        return Err(LinalgError::ConvergenceFailure {
+            detail: "failed to find a finite stabilizing continuous Riccati solution".into(),
+        });
+    }
 
     emit_trace(LinalgTrace {
         operation: "solve_continuous_are",
