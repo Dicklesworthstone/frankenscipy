@@ -178,6 +178,20 @@ fn generate_query() -> OracleQuery {
             vec![4.0, 4.0, 2.0, 2.0],
             vec![3.0, 1.0, 1.0, 3.0],
         ),
+        ("large_equal_weights", vec![2.0, 1.0], vec![1e200; 2]),
+        ("tiny_equal_weights", vec![2.0, 1.0], vec![1e-200; 2]),
+        ("large_negative", vec![-1.0, -2.0], vec![1e200; 2]),
+        ("tiny_negative", vec![-1.0, -2.0], vec![1e-200; 2]),
+        (
+            "large_merging_chain",
+            vec![3.0, 1.0, 4.0, 0.0, 6.0, 5.0],
+            vec![1e200, 3e200, 2e200, 2e200, 1e200, 1e200],
+        ),
+        (
+            "tiny_merging_chain",
+            vec![3.0, 1.0, 4.0, 0.0, 6.0, 5.0],
+            vec![1e-200, 3e-200, 2e-200, 2e-200, 1e-200, 1e-200],
+        ),
     ];
     for (label, y, w) in &y_data {
         points.push(Case {
@@ -406,13 +420,16 @@ fn diff_opt_nnls_isotonic_lsa() {
                     continue;
                 };
                 let abs_d = vec_max_diff(r, expected);
+                let pass = abs_d <= ISO_TOL
+                    && r.iter().all(|value| value.is_finite())
+                    && r.windows(2).all(|pair| pair[0] <= pair[1]);
                 max_overall = max_overall.max(abs_d);
-                ledger.compared("iso", &case.case_id, abs_d <= ISO_TOL);
+                ledger.compared("iso", &case.case_id, pass);
                 diffs.push(CaseDiff {
                     case_id: case.case_id.clone(),
                     op: case.op.clone(),
                     abs_diff: abs_d,
-                    pass: abs_d <= ISO_TOL,
+                    pass,
                 });
             }
             "lsa" => {

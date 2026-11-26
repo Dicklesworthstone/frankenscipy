@@ -5500,14 +5500,154 @@ fn solve_small_system(a: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
     x
 }
 
+/// A finite value with an extended binary exponent. Block weights and weighted
+/// sums may exceed f64's range even though every fitted mean is representable.
+#[derive(Clone, Copy)]
+struct IsotonicNumber {
+    mantissa: f64,
+    exponent: i32,
+}
+
+impl IsotonicNumber {
+    const SIGN_AND_FRACTION: u64 = 0x800f_ffff_ffff_ffff;
+
+    fn new(value: f64) -> Self {
+        if value == 0.0 {
+            return Self {
+                mantissa: value,
+                exponent: 0,
+            };
+        }
+        let mut bits = value.to_bits();
+        let mut exponent = ((bits >> 52) & 0x7ff) as i32 - 1023;
+        if exponent == -1023 {
+            bits = (value * 4_503_599_627_370_496.0).to_bits();
+            exponent = ((bits >> 52) & 0x7ff) as i32 - 1023 - 52;
+        }
+        Self {
+            mantissa: f64::from_bits((bits & Self::SIGN_AND_FRACTION) | (1023_u64 << 52)),
+            exponent,
+        }
+    }
+
+    fn from_parts(mantissa: f64, exponent: i32) -> Self {
+        let mut value = Self::new(mantissa);
+        if value.mantissa != 0.0 {
+            value.exponent += exponent;
+        }
+        value
+    }
+
+    fn add(self, other: Self) -> Self {
+        if self.mantissa == 0.0 {
+            return other;
+        }
+        if other.mantissa == 0.0 {
+            return self;
+        }
+        let (large, small) = if self.exponent >= other.exponent {
+            (self, other)
+        } else {
+            (other, self)
+        };
+        let difference = large.exponent - small.exponent;
+        if difference > 54 {
+            return large;
+        }
+        let scale = f64::from_bits(((1023 - difference) as u64) << 52);
+        Self::from_parts(large.mantissa + small.mantissa * scale, large.exponent)
+    }
+
+    fn sub(self, other: Self) -> Self {
+        self.add(Self {
+            mantissa: -other.mantissa,
+            exponent: other.exponent,
+        })
+    }
+
+    fn abs_ge(self, other: Self) -> bool {
+        if self.mantissa == 0.0 || other.mantissa == 0.0 {
+            return self.mantissa.abs() >= other.mantissa.abs();
+        }
+        self.exponent > other.exponent
+            || (self.exponent == other.exponent && self.mantissa.abs() >= other.mantissa.abs())
+    }
+
+    fn ratio(self, denominator: Self) -> f64 {
+        let value = Self::from_parts(
+            self.mantissa / denominator.mantissa,
+            self.exponent - denominator.exponent,
+        );
+        if value.mantissa == 0.0 {
+            return value.mantissa;
+        }
+        if value.exponent > 1023 {
+            return f64::INFINITY.copysign(value.mantissa);
+        }
+        if value.exponent >= -1022 {
+            return f64::from_bits(
+                (value.mantissa.to_bits() & Self::SIGN_AND_FRACTION)
+                    | (((value.exponent + 1023) as u64) << 52),
+            );
+        }
+        if value.exponent < -1075 {
+            return 0.0_f64.copysign(value.mantissa);
+        }
+        let scale = f64::from_bits(((value.exponent + 2045) as u64) << 52);
+        (value.mantissa * f64::MIN_POSITIVE) * scale
+    }
+}
+
+/// Compensated block sums also retain small observations when large responses
+/// of opposite signs cancel during a later merge.
+#[derive(Clone, Copy)]
+struct IsotonicSum {
+    value: IsotonicNumber,
+    correction: IsotonicNumber,
+}
+
+impl IsotonicSum {
+    fn product(weight: f64, response: f64) -> Self {
+        let weight = IsotonicNumber::new(weight);
+        let response = IsotonicNumber::new(response);
+        let product = weight.mantissa * response.mantissa;
+        let exponent = weight.exponent + response.exponent;
+        Self {
+            value: IsotonicNumber::from_parts(product, exponent),
+            correction: IsotonicNumber::from_parts(
+                weight.mantissa.mul_add(response.mantissa, -product),
+                exponent,
+            ),
+        }
+    }
+
+    fn accumulate(&mut self, value: IsotonicNumber) {
+        let sum = self.value.add(value);
+        let error = if self.value.abs_ge(value) {
+            self.value.sub(sum).add(value)
+        } else {
+            value.sub(sum).add(self.value)
+        };
+        self.correction = self.correction.add(error);
+        self.value = sum;
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.accumulate(other.value);
+        self.accumulate(other.correction);
+    }
+
+    fn total(self) -> IsotonicNumber {
+        self.value.add(self.correction)
+    }
+}
+
 /// A pooled block of adjacent points produced by the PAVA stack.
 struct IsotonicBlock {
-    /// Number of original points the block spans.
     count: usize,
-    /// Sum of case weights over the block.
-    weight: f64,
-    /// Weight-weighted sum of responses over the block.
-    weighted_sum: f64,
+    weight: IsotonicNumber,
+    weighted_sum: IsotonicSum,
+    mean: f64,
 }
 
 /// Isotonic regression: fit a non-decreasing least-squares function.
@@ -5518,6 +5658,8 @@ struct IsotonicBlock {
 ///
 /// `weights` must be strictly positive and the same length as `y`; violating
 /// either, or a non-finite entry in `y`/`weights`, yields a `NaN` vector.
+/// Finite positive weights retain their relative influence without a global
+/// normalization that could round a small weight to zero.
 pub fn isotonic_regression(y: &[f64], weights: Option<&[f64]>) -> Vec<f64> {
     let n = y.len();
     if n == 0 {
@@ -5537,26 +5679,30 @@ pub fn isotonic_regression(y: &[f64], weights: Option<&[f64]>) -> Vec<f64> {
         vec![1.0; n]
     };
 
-    // Pool Adjacent Violators Algorithm (Busing 2022): scan left to right,
-    // maintaining a stack of blocks whose means are strictly increasing. Each
-    // new point starts a singleton block and is merged into the block to its
-    // left as long as the left block's mean exceeds it — a downward
-    // violation. Means are compared by cross-multiplication (all weights are
-    // strictly positive) to avoid division until the final expansion.
+    // PAVA remains linear in the number of observations: each block is pushed
+    // and popped once. Compare finite means directly; cross multiplication of
+    // weighted sums can overflow or underflow and hide a decreasing pair.
     let mut blocks: Vec<IsotonicBlock> = Vec::with_capacity(n);
     for i in 0..n {
         let mut block = IsotonicBlock {
             count: 1,
-            weight: w[i],
-            weighted_sum: w[i] * y[i],
+            weight: IsotonicNumber::new(w[i]),
+            weighted_sum: IsotonicSum::product(w[i], y[i]),
+            mean: y[i],
         };
         while let Some(prev) = blocks.last() {
-            // prev.mean > block.mean  ⇔  prev.wsum·block.w > block.wsum·prev.w
-            if prev.weighted_sum * block.weight > block.weighted_sum * prev.weight {
+            if prev.mean > block.mean {
                 let prev = blocks.pop().expect("last() returned Some");
                 block.count += prev.count;
-                block.weight += prev.weight;
-                block.weighted_sum += prev.weighted_sum;
+                block.weight = block.weight.add(prev.weight);
+                block.weighted_sum.merge(prev.weighted_sum);
+                // A positive weighted mean lies between its two block means.
+                // This also bounds a final rounding overshoot at f64::MAX.
+                block.mean = block
+                    .weighted_sum
+                    .total()
+                    .ratio(block.weight)
+                    .clamp(block.mean, prev.mean);
             } else {
                 break;
             }
@@ -5564,11 +5710,9 @@ pub fn isotonic_regression(y: &[f64], weights: Option<&[f64]>) -> Vec<f64> {
         blocks.push(block);
     }
 
-    // Expand each block's weighted mean back across the points it spans.
     let mut result = Vec::with_capacity(n);
     for block in &blocks {
-        let mean = block.weighted_sum / block.weight;
-        result.resize(result.len() + block.count, mean);
+        result.resize(result.len() + block.count, block.mean);
     }
     result
 }
@@ -10074,6 +10218,99 @@ mod tests {
     }
 
     #[test]
+    fn isotonic_regression_extreme_weight_scales_preserve_kkt() {
+        let y = [3.0, 1.0, 4.0, 0.0, 6.0, 5.0];
+        let weights = [1.0, 3.0, 2.0, 2.0, 1.0, 1.0];
+        let expected = [1.5, 1.5, 2.0, 2.0, 5.5, 5.5];
+        for reversed in [false, true] {
+            let (y, weights, expected): (Vec<f64>, Vec<f64>, Vec<f64>) = if reversed {
+                (
+                    y.iter().rev().map(|value| -value).collect(),
+                    weights.iter().rev().copied().collect(),
+                    expected.iter().rev().map(|value| -value).collect(),
+                )
+            } else {
+                (y.to_vec(), weights.to_vec(), expected.to_vec())
+            };
+            for factor in [1e-300, 1e-200, 1.0, 1e200, 1e300] {
+                let scaled_weights: Vec<f64> =
+                    weights.iter().map(|weight| weight * factor).collect();
+                let fit = isotonic_regression(&y, Some(&scaled_weights));
+                assert_close(&fit, &expected);
+                assert!(fit.iter().all(|value| value.is_finite()));
+                assert!(fit.windows(2).all(|pair| pair[0] <= pair[1]));
+
+                // The prefix residuals are the nonnegative KKT multipliers.
+                // Use the original weights, since a common positive scale
+                // leaves the minimizer and the signs of these conditions intact.
+                let mut prefix = 0.0;
+                for i in 0..fit.len() {
+                    prefix += weights[i] * (y[i] - fit[i]);
+                    assert!(prefix >= -2e-13, "factor {factor:e}: {fit:?}");
+                    if i + 1 < fit.len() {
+                        assert!(
+                            (prefix * (fit[i + 1] - fit[i])).abs() <= 2e-13,
+                            "complementarity at {i}, factor {factor:e}: {fit:?}"
+                        );
+                    }
+                }
+                assert!(prefix.abs() <= 2e-13, "factor {factor:e}: {fit:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn isotonic_regression_finite_near_maximum_responses() {
+        let largest = f64::MAX;
+        for weights in [None, Some([largest, largest])] {
+            let fit = isotonic_regression(
+                &[largest, 0.5 * largest],
+                weights.as_ref().map(|values| values.as_slice()),
+            );
+            assert!(fit.iter().all(|value| value.is_finite()));
+            for value in fit {
+                assert!((value / largest - 0.75).abs() <= 2.0 * f64::EPSILON);
+            }
+        }
+        assert_eq!(
+            isotonic_regression(&[largest; 8], Some(&[largest; 8])),
+            vec![largest; 8]
+        );
+
+        let y = [-largest, -1e-300, 0.0, 1e-300, largest];
+        let weights = [
+            largest,
+            f64::from_bits(1),
+            1.0,
+            f64::MIN_POSITIVE,
+            largest,
+        ];
+        assert_eq!(isotonic_regression(&y, Some(&weights)), y.to_vec());
+    }
+
+    #[test]
+    fn isotonic_regression_retains_tiny_positive_weight_effects() {
+        let large = f64::from_bits(2046_u64 << 52);
+        for tiny in [f64::MIN_POSITIVE, f64::from_bits(1)] {
+            // Normalizing the weights by their maximum would turn tiny into
+            // zero, although the pooled mean tiny*large/(tiny+large) is tiny.
+            assert_eq!(tiny / large, 0.0);
+            let fit = isotonic_regression(&[large, 0.0], Some(&[tiny, large]));
+            assert_eq!(fit, vec![tiny; 2]);
+        }
+    }
+
+    #[test]
+    fn isotonic_regression_preserves_cancellation_across_merges() {
+        // The middle observation must survive the first pool with f64::MAX
+        // and the later cancellation against -f64::MAX.
+        let fit = isotonic_regression(&[f64::MAX, 1.0, -f64::MAX], None);
+        assert_eq!(fit, vec![1.0 / 3.0; 3]);
+        let fit = isotonic_regression(&[f64::MAX, -1.0, -f64::MAX], None);
+        assert_eq!(fit, vec![-1.0 / 3.0; 3]);
+    }
+
+    #[test]
     fn isotonic_regression_already_monotone_is_identity() {
         let r = isotonic_regression(&[1.0, 2.0, 3.0], None);
         assert_close(&r, &[1.0, 2.0, 3.0]);
@@ -10119,6 +10356,18 @@ mod tests {
                 .iter()
                 .all(|v| v.is_nan())
         );
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                isotonic_regression(&[1.0, 2.0], Some(&[1.0, invalid]))
+                    .iter()
+                    .all(|value| value.is_nan())
+            );
+            assert!(
+                isotonic_regression(&[1.0, invalid], None)
+                    .iter()
+                    .all(|value| value.is_nan())
+            );
+        }
         // Empty input returns empty.
         assert!(isotonic_regression(&[], None).is_empty());
     }
