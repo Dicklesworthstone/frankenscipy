@@ -396,12 +396,19 @@ impl Covariance {
                 let mut y = vec![0.0; self.dim];
                 for i in 0..self.dim {
                     let sum: f64 = (0..i).map(|j| lower[i][j] * y[j]).sum();
-                    y[i] = (x[i] - sum) / lower[i][i];
+                    y[i] = covariance_dot_result(
+                        (x[i] - sum) / lower[i][i],
+                        std::iter::once((x[i], 1.0)).chain((0..i).map(|j| (-lower[i][j], y[j]))),
+                        lower[i][i],
+                    );
                 }
                 Ok(y)
             }
             CovarianceTransform::Precision(lower) => Ok((0..self.dim)
-                .map(|j| (j..self.dim).map(|i| x[i] * lower[i][j]).sum())
+                .map(|j| {
+                    let ordinary = (j..self.dim).map(|i| x[i] * lower[i][j]).sum();
+                    covariance_dot_result(ordinary, (j..self.dim).map(|i| (x[i], lower[i][j])), 1.0)
+                })
                 .collect()),
             CovarianceTransform::Spectral {
                 vectors, scales, ..
@@ -410,11 +417,16 @@ impl Covariance {
                     if scales[j] == 0.0 {
                         0.0
                     } else {
-                        x.iter()
+                        let projection = x
+                            .iter()
                             .enumerate()
                             .map(|(i, &v)| v * vectors[i][j])
-                            .sum::<f64>()
-                            / scales[j]
+                            .sum::<f64>();
+                        covariance_dot_result(
+                            projection / scales[j],
+                            x.iter().enumerate().map(|(i, &v)| (v, vectors[i][j])),
+                            scales[j],
+                        )
                     }
                 })
                 .collect()),
@@ -437,14 +449,22 @@ impl Covariance {
             CovarianceTransform::Cholesky => {
                 let lower = self.cholesky_factor.as_ref().ok_or("No Cholesky factor")?;
                 Ok((0..self.dim)
-                    .map(|i| (0..=i).map(|j| lower[i][j] * x[j]).sum())
+                    .map(|i| {
+                        let ordinary = (0..=i).map(|j| lower[i][j] * x[j]).sum();
+                        covariance_dot_result(ordinary, (0..=i).map(|j| (lower[i][j], x[j])), 1.0)
+                    })
                     .collect())
             }
             CovarianceTransform::Precision(lower) => {
                 let mut y = vec![0.0; self.dim];
                 for i in (0..self.dim).rev() {
                     let sum: f64 = ((i + 1)..self.dim).map(|j| lower[j][i] * y[j]).sum();
-                    y[i] = (x[i] - sum) / lower[i][i];
+                    y[i] = covariance_dot_result(
+                        (x[i] - sum) / lower[i][i],
+                        std::iter::once((x[i], 1.0))
+                            .chain(((i + 1)..self.dim).map(|j| (-lower[j][i], y[j]))),
+                        lower[i][i],
+                    );
                 }
                 Ok(y)
             }
@@ -452,9 +472,14 @@ impl Covariance {
                 vectors, scales, ..
             } => Ok((0..self.dim)
                 .map(|i| {
-                    (0..self.dim)
+                    let ordinary = (0..self.dim)
                         .map(|j| x[j] * (vectors[i][j] * scales[j]))
-                        .sum()
+                        .sum();
+                    covariance_dot_result(
+                        ordinary,
+                        (0..self.dim).map(|j| (x[j], vectors[i][j] * scales[j])),
+                        1.0,
+                    )
                 })
                 .collect()),
         }
@@ -488,6 +513,11 @@ impl Covariance {
                     if is_null {
                         let component: f64 =
                             x.iter().enumerate().map(|(i, &v)| v * vectors[i][j]).sum();
+                        let component = covariance_dot_result(
+                            component,
+                            x.iter().enumerate().map(|(i, &v)| (v, vectors[i][j])),
+                            1.0,
+                        );
                         residual = residual.hypot(component);
                     }
                 }
@@ -495,6 +525,166 @@ impl Covariance {
             }
             CovarianceTransform::Cholesky | CovarianceTransform::Precision(_) => Ok(true),
         }
+    }
+}
+
+// Ordinary finite transforms keep their original arithmetic. Only a non-finite
+// result with finite operands takes the exact-product recovery path.
+#[inline]
+fn covariance_dot_result<I>(ordinary: f64, products: I, divisor: f64) -> f64
+where
+    I: IntoIterator<Item = (f64, f64)>,
+{
+    if ordinary.is_finite() {
+        ordinary
+    } else {
+        covariance_dot_fallback(ordinary, products, divisor)
+    }
+}
+
+// Binary64 products occupy exponents -2148 through 2047. The extra limbs
+// cover the carry bits of any vector addressable by usize. Separate unsigned
+// sums permit cancellation without overflowing or losing tiny residuals.
+const COVARIANCE_DOT_WORDS: usize = 68;
+const COVARIANCE_PRODUCT_EXPONENT: i32 = -2148;
+
+#[cold]
+fn covariance_dot_fallback<I>(ordinary: f64, products: I, divisor: f64) -> f64
+where
+    I: IntoIterator<Item = (f64, f64)>,
+{
+    if !divisor.is_finite() || divisor <= 0.0 {
+        return ordinary;
+    }
+    let mut positive = [0_u64; COVARIANCE_DOT_WORDS];
+    let mut negative = [0_u64; COVARIANCE_DOT_WORDS];
+    for (left, right) in products {
+        if !left.is_finite() || !right.is_finite() {
+            return ordinary;
+        }
+        let (left_mantissa, left_exponent) = covariance_float_parts(left);
+        let (right_mantissa, right_exponent) = covariance_float_parts(right);
+        let product = u128::from(left_mantissa) * u128::from(right_mantissa);
+        if product == 0 {
+            continue;
+        }
+        let offset = (left_exponent + right_exponent - COVARIANCE_PRODUCT_EXPONENT) as usize;
+        let word = offset / 64;
+        let shift = offset % 64;
+        let accumulator = if left.is_sign_negative() == right.is_sign_negative() {
+            &mut positive
+        } else {
+            &mut negative
+        };
+        let shifted = product << shift;
+        covariance_add_word(accumulator, word, shifted as u64);
+        covariance_add_word(accumulator, word + 1, (shifted >> 64) as u64);
+        if shift != 0 {
+            covariance_add_word(accumulator, word + 2, (product >> (128 - shift)) as u64);
+        }
+    }
+    let is_negative = match positive.iter().rev().cmp(negative.iter().rev()) {
+        std::cmp::Ordering::Less => true,
+        std::cmp::Ordering::Equal => return 0.0,
+        std::cmp::Ordering::Greater => false,
+    };
+    let (mut magnitude, subtract) = if is_negative {
+        (negative, positive)
+    } else {
+        (positive, negative)
+    };
+    let mut borrow = false;
+    for (word, subtrahend) in magnitude.iter_mut().zip(subtract) {
+        let (difference, first_borrow) = word.overflowing_sub(subtrahend);
+        let (difference, second_borrow) = difference.overflowing_sub(u64::from(borrow));
+        *word = difference;
+        borrow = first_borrow || second_borrow;
+    }
+
+    // Divide the exact integer before rounding, including its remainder.
+    // Rounding a normalized dot first and then dividing could round twice at
+    // the subnormal or overflow boundary.
+    let (divisor_mantissa, divisor_exponent) = covariance_float_parts(divisor);
+    let divisor_mantissa = u128::from(divisor_mantissa);
+    let mut remainder = 0_u128;
+    for word in magnitude.iter_mut().rev() {
+        let dividend = (remainder << 64) | u128::from(*word);
+        *word = (dividend / divisor_mantissa) as u64;
+        remainder = dividend % divisor_mantissa;
+    }
+    let exponent = COVARIANCE_PRODUCT_EXPONENT - divisor_exponent;
+    let highest = magnitude
+        .iter()
+        .rposition(|&word| word != 0)
+        .map_or(0, |word| {
+            64 * word + 63 - magnitude[word].leading_zeros() as usize
+        });
+    // Retain 53 significand bits for normals, or round directly to the
+    // fixed 2^-1074 lattice for subnormals.
+    let shift = highest.saturating_sub(52).max((-1074 - exponent) as usize);
+    let word = shift / 64;
+    let bit = shift % 64;
+    let mut significand = magnitude[word] >> bit;
+    if bit != 0 && word + 1 < COVARIANCE_DOT_WORDS {
+        significand |= magnitude[word + 1] << (64 - bit);
+    }
+    let round_up = if shift == 0 {
+        let doubled = 2 * remainder;
+        doubled > divisor_mantissa || (doubled == divisor_mantissa && significand & 1 != 0)
+    } else {
+        let guard = shift - 1;
+        let guard_word = guard / 64;
+        let guard_bit = guard % 64;
+        let halfway = magnitude[guard_word] & (1_u64 << guard_bit) != 0;
+        let sticky = remainder != 0
+            || magnitude[..guard_word].iter().any(|&word| word != 0)
+            || magnitude[guard_word] & ((1_u64 << guard_bit) - 1) != 0;
+        halfway && (sticky || significand & 1 != 0)
+    };
+    significand += u64::from(round_up);
+    let sign = u64::from(is_negative) << 63;
+    if significand == 0 {
+        return f64::from_bits(sign);
+    }
+    let highest = 63 - significand.leading_zeros() as i32;
+    let exponent = exponent + shift as i32 + highest;
+    let bits = if exponent > 1023 {
+        f64::INFINITY.to_bits()
+    } else if exponent >= -1022 {
+        // A rounding carry is the only way the significand reaches 54 bits.
+        let normalized = if highest > 52 {
+            significand >> (highest - 52)
+        } else {
+            significand << (52 - highest)
+        };
+        ((exponent + 1023) as u64) << 52 | (normalized & ((1_u64 << 52) - 1))
+    } else {
+        significand
+    };
+    f64::from_bits(sign | bits)
+}
+
+fn covariance_float_parts(value: f64) -> (u64, i32) {
+    let bits = value.to_bits();
+    let exponent = ((bits >> 52) & 0x7ff) as i32;
+    let mantissa = bits & ((1_u64 << 52) - 1);
+    if exponent == 0 {
+        (mantissa, -1074)
+    } else {
+        (mantissa | (1_u64 << 52), exponent - 1075)
+    }
+}
+
+fn covariance_add_word(
+    accumulator: &mut [u64; COVARIANCE_DOT_WORDS],
+    mut index: usize,
+    mut value: u64,
+) {
+    while value != 0 {
+        let (sum, carry) = accumulator[index].overflowing_add(value);
+        accumulator[index] = sum;
+        value = u64::from(carry);
+        index += 1;
     }
 }
 
@@ -1009,5 +1199,149 @@ mod tests {
         for value in whitened {
             assert!((value - 1.0).abs() < 1e-14);
         }
+    }
+    #[test]
+    fn covariance_triangular_transforms_preserve_overflowed_cancellation() {
+        let mut lower = vec![vec![0.0; 5]; 5];
+        for (i, row) in lower.iter_mut().enumerate() {
+            row[i] = 1.0;
+        }
+        lower[4] = vec![1.0, 1.0, -1.0, -1.0, 1.0];
+        let covariance = Covariance::from_cholesky(&lower).expect("moderate Cholesky factor");
+        let large = 1.2e308;
+        for residual in [
+            0.0,
+            f64::MIN_POSITIVE,
+            -f64::MIN_POSITIVE,
+            f64::from_bits(1),
+        ] {
+            let x = [large, large, large, large, residual];
+            let ordinary: f64 = lower[4].iter().zip(x).map(|(&a, b)| a * b).sum();
+            assert!(
+                ordinary.is_infinite(),
+                "control must overflow before cancellation"
+            );
+            assert_eq!(covariance.colorize(&x).expect("colorize"), x);
+            assert_eq!(covariance.whiten(&x).expect("whiten"), x);
+        }
+    }
+
+    #[test]
+    fn covariance_precision_transforms_preserve_overflowed_cancellation() {
+        // Its Cholesky factor has ones down the first column and unit
+        // diagonal. No entry of the precision or covariance is extreme.
+        let mut precision = vec![vec![1.0; 5]; 5];
+        for (i, row) in precision.iter_mut().enumerate().skip(1) {
+            row[i] = 2.0;
+        }
+        let covariance = Covariance::from_precision(&precision).expect("moderate precision");
+        let large = 1.2e308;
+        for residual in [
+            0.0,
+            f64::MIN_POSITIVE,
+            -f64::MIN_POSITIVE,
+            f64::from_bits(1),
+        ] {
+            let x = [residual, large, large, -large, -large];
+            assert_eq!(covariance.whiten(&x).expect("precision whiten"), x);
+            assert_eq!(covariance.colorize(&x).expect("precision colorize"), x);
+        }
+    }
+
+    #[test]
+    fn covariance_spectral_whitening_divides_before_range_rounding() {
+        let q = 0.5_f64.sqrt();
+        let eigen =
+            Covariance::from_eigendecomposition(&[1e308, 1e308], &[vec![q, -q], vec![q, q]])
+                .expect("large finite covariance");
+        let x = [1.3e308, 1.3e308];
+        assert!((x[0] * q + x[1] * q).is_infinite());
+        let whitened = eigen.whiten(&x).expect("finite whitened coordinates");
+        let expected = (x[0] / 1e154) * (2.0 * q);
+        assert!(whitened[0].is_finite());
+        assert!((whitened[0] / expected - 1.0).abs() <= 4.0 * f64::EPSILON);
+        assert_eq!(whitened[1], 0.0);
+    }
+
+    #[test]
+    fn covariance_spectral_transforms_and_support_recover_cancellation() {
+        let q = 1.0 / 8.0_f64.sqrt();
+        let basis: Vec<Vec<f64>> = (0_usize..8)
+            .map(|i| {
+                (0_usize..8)
+                    .map(|j| {
+                        if (i & j).count_ones().is_multiple_of(2) {
+                            q
+                        } else {
+                            -q
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let large = 1.4e308;
+        let x = [large, large, large, large, -large, -large, -large, -large];
+        let ordinary: f64 = x.iter().map(|&value| q * value).sum();
+        assert!(
+            ordinary.is_infinite(),
+            "control must overflow before cancellation"
+        );
+
+        let covariance =
+            Covariance::from_eigendecomposition(&[1.0; 8], &basis).expect("orthonormal basis");
+        // Other transformed coordinates may genuinely exceed f64::MAX.
+        // The zero coordinate must still be recovered independently.
+        assert_eq!(covariance.whiten(&x).expect("spectral whiten")[0], 0.0);
+        assert_eq!(covariance.colorize(&x).expect("spectral colorize")[0], 0.0);
+
+        let mut eigenvalues = [1.0; 8];
+        eigenvalues[0] = 0.0;
+        let singular =
+            Covariance::from_eigendecomposition(&eigenvalues, &basis).expect("one null direction");
+        assert!(
+            singular
+                .in_support(&x)
+                .expect("exact null-space cancellation")
+        );
+    }
+
+    #[test]
+    fn covariance_dot_recovery_rounds_subnormal_and_overflow_boundaries() {
+        let tiny = f64::from_bits(1);
+        for (factor, expected) in [(0.5, 0.0), (1.5, 2.0 * tiny), (2.5, 2.0 * tiny)] {
+            let actual = covariance_dot_fallback(f64::INFINITY, [(tiny, factor)], 1.0);
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+        assert_eq!(
+            covariance_dot_fallback(f64::INFINITY, [(tiny, tiny)], tiny).to_bits(),
+            tiny.to_bits()
+        );
+        assert_eq!(
+            covariance_dot_fallback(f64::NEG_INFINITY, [(-tiny, 0.5)], 1.0).to_bits(),
+            (-0.0_f64).to_bits()
+        );
+        let half_ulp_at_max = f64::from_bits((970_u64 + 1023) << 52);
+        assert_eq!(
+            covariance_dot_fallback(
+                f64::INFINITY,
+                [(f64::MAX, 1.0), (0.5 * half_ulp_at_max, 1.0)],
+                1.0,
+            ),
+            f64::MAX
+        );
+        assert_eq!(
+            covariance_dot_fallback(
+                f64::INFINITY,
+                [(f64::MAX, 1.0), (half_ulp_at_max, 1.0)],
+                1.0,
+            ),
+            f64::INFINITY
+        );
+        assert!(covariance_dot_result(f64::NAN, [(f64::INFINITY, 0.0)], 1.0).is_nan());
+        let unit = Covariance::from_cholesky(&[vec![1.0]]).expect("unit covariance");
+        assert_eq!(
+            unit.colorize(&[-0.0]).expect("signed zero")[0].to_bits(),
+            (-0.0_f64).to_bits()
+        );
     }
 }
