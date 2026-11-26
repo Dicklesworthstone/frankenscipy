@@ -9,13 +9,13 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use fsci_runtime::{AuditAction, RuntimeMode};
+use fsci_stats::audit::sync_audit_ledger;
 use fsci_stats::{
     PermutationAlternative, PermutationMethod, PermutationTestOptions, PermutationTestResult,
-    PermutationType, StatsError, StatsOptions, active_stats_mode, monte_carlo_test, permutation_test,
-    permutation_test_samples, permutation_test_with_options, with_hardened_max_resamples,
-    with_hardened_stats_caps,
+    PermutationType, StatsError, StatsOptions, active_stats_mode, monte_carlo_test,
+    permutation_test, permutation_test_samples, permutation_test_with_options,
+    with_hardened_max_resamples, with_hardened_stats_caps,
 };
-use fsci_stats::audit::sync_audit_ledger;
 
 fn mean(sample: &[f64]) -> f64 {
     sample.iter().sum::<f64>() / sample.len() as f64
@@ -77,7 +77,9 @@ fn exact_two_sided_test_uses_smaller_tail_and_is_translation_invariant() {
     assert_eq!(legacy, (8.0, 1.0 / 3.0));
     let method = PermutationMethod::new(99, Some(8), 7).unwrap();
     assert_eq!(
-        method.test(data[0], data[1], |x, y| mean(x) - mean(y) + 10.0).unwrap(),
+        method
+            .test(data[0], data[1], |x, y| mean(x) - mean(y) + 10.0)
+            .unwrap(),
         legacy
     );
 }
@@ -130,11 +132,17 @@ fn exact_independent_test_supports_unequal_and_multiple_samples() {
         |samples| {
             assert_eq!(samples.len(), 3);
             assert!(samples.iter().all(|sample| sample.len() == 2));
-            let all: Vec<_> = samples.iter().flat_map(|sample| sample.iter().copied()).collect();
+            let all: Vec<_> = samples
+                .iter()
+                .flat_map(|sample| sample.iter().copied())
+                .collect();
             assert_eq!(sorted(all), vec![1.0, 2.0, 3.0, 4.0, 5.0, 8.0]);
             mean(samples[0]) - 2.0 * mean(samples[1]) + 3.0 * mean(samples[2])
         },
-        options(PermutationType::Independent, PermutationAlternative::TwoSided),
+        options(
+            PermutationType::Independent,
+            PermutationAlternative::TwoSided,
+        ),
     )
     .unwrap();
     assert!(result.exact);
@@ -191,13 +199,22 @@ fn exact_pairings_permute_every_sample_and_allow_one_sample() {
     let one: &[&[f64]] = &[&[1.0, 3.0, 2.0]];
     let result = permutation_test_samples(
         one,
-        |samples| samples[0].iter().enumerate().map(|(i, x)| (i + 1) as f64 * x).sum(),
+        |samples| {
+            samples[0]
+                .iter()
+                .enumerate()
+                .map(|(i, x)| (i + 1) as f64 * x)
+                .sum()
+        },
         options(PermutationType::Pairings, PermutationAlternative::Greater),
     )
     .unwrap();
     assert!(result.exact);
     assert_eq!(result.null_distribution.len(), 6);
-    assert_eq!(sorted(result.null_distribution), vec![10.0, 11.0, 11.0, 13.0, 13.0, 14.0]);
+    assert_eq!(
+        sorted(result.null_distribution),
+        vec![10.0, 11.0, 11.0, 13.0, 13.0, 14.0]
+    );
     assert_eq!(result.pvalue, 0.5);
     let two: &[&[f64]] = &[&[1.0, 2.0, 3.0], &[4.0, 8.0, 5.0]];
     let result = permutation_test_samples(
@@ -231,7 +248,12 @@ fn floating_point_ties_use_scipy_relative_tolerance() {
         )
         .unwrap();
         assert_eq!(result.statistic, 1.0);
-        assert!(result.null_distribution.iter().any(|&value| value > result.statistic));
+        assert!(
+            result
+                .null_distribution
+                .iter()
+                .any(|&value| value > result.statistic)
+        );
         assert_eq!(result.pvalue, 1.0);
     }
 }
@@ -245,30 +267,62 @@ fn check_random_pvalues(data: &[&[f64]], kind: PermutationType) {
     };
     let statistic = |samples: &[&[f64]]| {
         if kind == PermutationType::Independent {
-            return samples.iter().enumerate().map(|(row, sample)| (row + 1) as f64 * mean(sample)).sum();
+            return samples
+                .iter()
+                .enumerate()
+                .map(|(row, sample)| (row + 1) as f64 * mean(sample))
+                .sum();
         }
-        samples.iter().enumerate().map(|(row, sample)| {
-            sample.iter().enumerate().map(|(column, &value)| {
-                (row + 1) as f64 * (column + 1) as f64 * value
-            }).sum::<f64>()
-        }).sum::<f64>()
+        samples
+            .iter()
+            .enumerate()
+            .map(|(row, sample)| {
+                sample
+                    .iter()
+                    .enumerate()
+                    .map(|(column, &value)| (row + 1) as f64 * (column + 1) as f64 * value)
+                    .sum::<f64>()
+            })
+            .sum::<f64>()
     };
     let first = permutation_test_samples(data, statistic, base).unwrap();
     let second = permutation_test_samples(data, statistic, base).unwrap();
-    assert_eq!(first, second, "same seed must reproduce the complete null distribution");
+    assert_eq!(
+        first, second,
+        "same seed must reproduce the complete null distribution"
+    );
     assert!(!first.exact);
     assert_eq!(first.null_distribution.len(), 5);
     let tolerance = 100.0 * f64::EPSILON * first.statistic.abs();
-    let less = first.null_distribution.iter().filter(|&&value| value <= first.statistic + tolerance).count();
-    let greater = first.null_distribution.iter().filter(|&&value| value >= first.statistic - tolerance).count();
+    let less = first
+        .null_distribution
+        .iter()
+        .filter(|&&value| value <= first.statistic + tolerance)
+        .count();
+    let greater = first
+        .null_distribution
+        .iter()
+        .filter(|&&value| value >= first.statistic - tolerance)
+        .count();
     let less_p = (less + 1) as f64 / 6.0;
     let greater_p = (greater + 1) as f64 / 6.0;
     for (alternative, expected) in [
         (PermutationAlternative::Less, less_p),
         (PermutationAlternative::Greater, greater_p),
-        (PermutationAlternative::TwoSided, (2.0 * less_p.min(greater_p)).min(1.0)),
+        (
+            PermutationAlternative::TwoSided,
+            (2.0 * less_p.min(greater_p)).min(1.0),
+        ),
     ] {
-        let result = permutation_test_samples(data, statistic, PermutationTestOptions { alternative, ..base }).unwrap();
+        let result = permutation_test_samples(
+            data,
+            statistic,
+            PermutationTestOptions {
+                alternative,
+                ..base
+            },
+        )
+        .unwrap();
         assert_eq!(result.null_distribution, first.null_distribution);
         assert_eq!(result.pvalue, expected);
         assert!(result.pvalue > 0.0 && result.pvalue <= 1.0);
@@ -279,26 +333,45 @@ fn check_random_pvalues(data: &[&[f64]], kind: PermutationType) {
 fn randomized_tests_are_reproducible_and_use_the_plus_one_correction() {
     check_random_pvalues(&[&[1.0, 2.0], &[3.0, 4.0]], PermutationType::Independent);
     check_random_pvalues(&[&[1.0, 2.0, 4.0]], PermutationType::Samples);
-    check_random_pvalues(&[&[1.0, 2.0, 3.0], &[2.0, 4.0, 8.0]], PermutationType::Samples);
+    check_random_pvalues(
+        &[&[1.0, 2.0, 3.0], &[2.0, 4.0, 8.0]],
+        PermutationType::Samples,
+    );
     check_random_pvalues(&[&[1.0, 3.0, 2.0]], PermutationType::Pairings);
-    check_random_pvalues(&[&[1.0, 2.0, 3.0], &[4.0, 8.0, 5.0]], PermutationType::Pairings);
+    check_random_pvalues(
+        &[&[1.0, 2.0, 3.0], &[4.0, 8.0, 5.0]],
+        PermutationType::Pairings,
+    );
 }
 
 #[test]
 fn randomized_modes_preserve_their_exchangeability_constraints() {
     let data: &[&[f64]] = &[&[1.0, 2.0, 3.0, 4.0], &[10.0, 20.0, 30.0, 40.0]];
-    for kind in [PermutationType::Independent, PermutationType::Samples, PermutationType::Pairings] {
+    for kind in [
+        PermutationType::Independent,
+        PermutationType::Samples,
+        PermutationType::Pairings,
+    ] {
         let result = permutation_test_samples(
             data,
             |samples| {
                 match kind {
                     PermutationType::Independent => {
-                        let pooled: Vec<_> = samples.iter().flat_map(|sample| sample.iter().copied()).collect();
-                        assert_eq!(sorted(pooled), vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0]);
+                        let pooled: Vec<_> = samples
+                            .iter()
+                            .flat_map(|sample| sample.iter().copied())
+                            .collect();
+                        assert_eq!(
+                            sorted(pooled),
+                            vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0]
+                        );
                     }
                     PermutationType::Samples => {
                         for index in 0..4 {
-                            assert_eq!(sorted(vec![samples[0][index], samples[1][index]]), vec![data[0][index], data[1][index]]);
+                            assert_eq!(
+                                sorted(vec![samples[0][index], samples[1][index]]),
+                                vec![data[0][index], data[1][index]]
+                            );
                         }
                     }
                     PermutationType::Pairings => {
@@ -330,7 +403,14 @@ fn invalid_inputs_fail_before_invoking_the_statistic() {
     };
     let valid: &[&[f64]] = &[&[1.0, 2.0], &[3.0, 4.0]];
     assert!(matches!(
-        permutation_test_samples(valid, statistic, PermutationTestOptions { n_resamples: 0, ..PermutationTestOptions::default() }),
+        permutation_test_samples(
+            valid,
+            statistic,
+            PermutationTestOptions {
+                n_resamples: 0,
+                ..PermutationTestOptions::default()
+            }
+        ),
         Err(StatsError::InvalidArgument(_))
     ));
     for data in [&[][..], &[&[1.0, 2.0][..]][..]] {
@@ -340,23 +420,45 @@ fn invalid_inputs_fail_before_invoking_the_statistic() {
         ));
     }
     assert!(matches!(
-        permutation_test_samples(&[&[1.0], &[2.0, 3.0]], statistic, PermutationTestOptions::default()),
+        permutation_test_samples(
+            &[&[1.0], &[2.0, 3.0]],
+            statistic,
+            PermutationTestOptions::default()
+        ),
         Err(StatsError::DataTooSmall { .. })
     ));
     for kind in [PermutationType::Samples, PermutationType::Pairings] {
         assert!(matches!(
-            permutation_test_samples(&[], statistic, options(kind, PermutationAlternative::TwoSided)),
+            permutation_test_samples(
+                &[],
+                statistic,
+                options(kind, PermutationAlternative::TwoSided)
+            ),
             Err(StatsError::InvalidArgument(_))
         ));
         assert!(matches!(
-            permutation_test_samples(&[&[1.0, 2.0], &[3.0, 4.0, 5.0]], statistic, options(kind, PermutationAlternative::TwoSided)),
-            Err(StatsError::ShapeMismatch { expected: 2, actual: 3 })
+            permutation_test_samples(
+                &[&[1.0, 2.0], &[3.0, 4.0, 5.0]],
+                statistic,
+                options(kind, PermutationAlternative::TwoSided)
+            ),
+            Err(StatsError::ShapeMismatch {
+                expected: 2,
+                actual: 3
+            })
         ));
     }
     for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
         for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
             assert!(matches!(
-                permutation_test_samples(&[&[1.0, value], &[3.0, 4.0]], statistic, PermutationTestOptions { mode, ..PermutationTestOptions::default() }),
+                permutation_test_samples(
+                    &[&[1.0, value], &[3.0, 4.0]],
+                    statistic,
+                    PermutationTestOptions {
+                        mode,
+                        ..PermutationTestOptions::default()
+                    }
+                ),
                 Err(StatsError::NonFiniteInput { .. })
             ));
         }
@@ -400,13 +502,27 @@ fn resource_preflight_rejects_limits_and_unrepresentable_output_without_callback
         0.0
     };
     let data: &[&[f64]] = &[&[1.0, 2.0], &[3.0, 4.0]];
-    let hardened = PermutationTestOptions { mode: RuntimeMode::Hardened, ..PermutationTestOptions::default() };
-    let capped = with_hardened_max_resamples(4, || permutation_test_samples(data, statistic, hardened));
+    let hardened = PermutationTestOptions {
+        mode: RuntimeMode::Hardened,
+        ..PermutationTestOptions::default()
+    };
+    let capped =
+        with_hardened_max_resamples(4, || permutation_test_samples(data, statistic, hardened));
     assert!(matches!(capped, Err(StatsError::ResourceExhausted { .. })));
-    let pairwise = with_hardened_stats_caps(100, 1, || permutation_test_samples(data, statistic, hardened));
-    assert!(matches!(pairwise, Err(StatsError::ResourceExhausted { .. })));
-    let combined = with_hardened_stats_caps(3, 100, || permutation_test_samples(data, statistic, hardened));
-    assert!(matches!(combined, Err(StatsError::ResourceExhausted { .. })));
+    let pairwise = with_hardened_stats_caps(100, 1, || {
+        permutation_test_samples(data, statistic, hardened)
+    });
+    assert!(matches!(
+        pairwise,
+        Err(StatsError::ResourceExhausted { .. })
+    ));
+    let combined = with_hardened_stats_caps(3, 100, || {
+        permutation_test_samples(data, statistic, hardened)
+    });
+    assert!(matches!(
+        combined,
+        Err(StatsError::ResourceExhausted { .. })
+    ));
     let long = [1.0; 30];
     let overflow = permutation_test_samples(
         &[&long],
@@ -417,7 +533,10 @@ fn resource_preflight_rejects_limits_and_unrepresentable_output_without_callback
             ..PermutationTestOptions::default()
         },
     );
-    assert!(matches!(overflow, Err(StatsError::ResourceExhausted { .. })));
+    assert!(matches!(
+        overflow,
+        Err(StatsError::ResourceExhausted { .. })
+    ));
     assert_eq!(calls.load(Ordering::Relaxed), 0);
     for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
         permutation_test_samples(
@@ -426,7 +545,11 @@ fn resource_preflight_rejects_limits_and_unrepresentable_output_without_callback
                 assert_eq!(active_stats_mode(), mode);
                 difference(samples)
             },
-            PermutationTestOptions { mode, n_resamples: 6, ..PermutationTestOptions::default() },
+            PermutationTestOptions {
+                mode,
+                n_resamples: 6,
+                ..PermutationTestOptions::default()
+            },
         )
         .unwrap();
     }
@@ -439,12 +562,21 @@ fn audited_wrapper_reports_failures_once_and_preserves_projection() {
     for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
         let ledger = sync_audit_ledger();
         let error = permutation_test_with_options(
-            &x, &y, |_, _| f64::NAN, 6, 0, StatsOptions::new(mode), Some(&ledger),
+            &x,
+            &y,
+            |_, _| f64::NAN,
+            6,
+            0,
+            StatsOptions::new(mode),
+            Some(&ledger),
         );
         assert!(matches!(error, Err(StatsError::Arithmetic { .. })));
         let guard = ledger.lock().unwrap();
         assert_eq!(guard.len(), 1);
-        assert!(matches!(guard.entries()[0].action, AuditAction::FailClosed { .. }));
+        assert!(matches!(
+            guard.entries()[0].action,
+            AuditAction::FailClosed { .. }
+        ));
     }
     let calls = AtomicUsize::new(0);
     for capped in [false, true] {
@@ -467,7 +599,10 @@ fn audited_wrapper_reports_failures_once_and_preserves_projection() {
         assert!(error.is_err());
         let guard = ledger.lock().unwrap();
         assert_eq!(guard.len(), 1);
-        assert!(matches!(guard.entries()[0].action, AuditAction::FailClosed { .. }));
+        assert!(matches!(
+            guard.entries()[0].action,
+            AuditAction::FailClosed { .. }
+        ));
     }
     assert_eq!(calls.load(Ordering::Relaxed), 0);
     let ledger = sync_audit_ledger();
@@ -483,13 +618,25 @@ fn audited_wrapper_reports_failures_once_and_preserves_projection() {
         StatsOptions::new(RuntimeMode::Hardened).with_non_finite_projection(true),
         Some(&ledger),
     );
-    assert!(matches!(projected_error, Err(StatsError::DataTooSmall { required: 2, got: 1 })));
+    assert!(matches!(
+        projected_error,
+        Err(StatsError::DataTooSmall {
+            required: 2,
+            got: 1
+        })
+    ));
     assert_eq!(calls.load(Ordering::Relaxed), 0);
     {
         let guard = ledger.lock().unwrap();
         assert_eq!(guard.len(), 2);
-        assert!(matches!(guard.entries()[0].action, AuditAction::BoundedRecovery { .. }));
-        assert!(matches!(guard.entries()[1].action, AuditAction::FailClosed { .. }));
+        assert!(matches!(
+            guard.entries()[0].action,
+            AuditAction::BoundedRecovery { .. }
+        ));
+        assert!(matches!(
+            guard.entries()[1].action,
+            AuditAction::FailClosed { .. }
+        ));
     }
     let ledger = sync_audit_ledger();
     let projected = permutation_test_with_options(
@@ -505,11 +652,17 @@ fn audited_wrapper_reports_failures_once_and_preserves_projection() {
     assert_eq!(projected, (-2.0, 1.0 / 3.0));
     let guard = ledger.lock().unwrap();
     assert_eq!(guard.len(), 1);
-    assert!(matches!(guard.entries()[0].action, AuditAction::BoundedRecovery { .. }));
+    assert!(matches!(
+        guard.entries()[0].action,
+        AuditAction::BoundedRecovery { .. }
+    ));
 }
 
 fn monte_carlo_draw(seed: u64) -> Vec<f64> {
-    vec![((seed >> 16) % 11) as f64 - 5.0, ((seed >> 32) % 13) as f64 - 6.0]
+    vec![
+        ((seed >> 16) % 11) as f64 - 5.0,
+        ((seed >> 32) % 13) as f64 - 6.0,
+    ]
 }
 
 #[test]
@@ -530,13 +683,20 @@ fn monte_carlo_tails_are_translation_invariant_and_keep_the_existing_seed_stream
         }
     }
     let mut seed = 37_u64;
-    let expected: Vec<f64> = (0..23).map(|_| {
-        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-        mean(&monte_carlo_draw(seed)) + 10.0
-    }).collect();
+    let expected: Vec<f64> = (0..23)
+        .map(|_| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            mean(&monte_carlo_draw(seed)) + 10.0
+        })
+        .collect();
     for alternative in ["less", "greater", "two-sided"] {
         let result = monte_carlo_test(
-            &[-3.0, -1.0], monte_carlo_draw, |data| mean(data) + 10.0, 23, 37, alternative,
+            &[-3.0, -1.0],
+            monte_carlo_draw,
+            |data| mean(data) + 10.0,
+            23,
+            37,
+            alternative,
         );
         assert_eq!(result.null_distribution, expected);
     }
@@ -549,7 +709,12 @@ fn monte_carlo_tails_are_translation_invariant_and_keep_the_existing_seed_stream
             0,
             alternative,
         );
-        assert!(result.null_distribution.iter().all(|&value| value > result.statistic));
+        assert!(
+            result
+                .null_distribution
+                .iter()
+                .all(|&value| value > result.statistic)
+        );
         assert_eq!(result.pvalue, 1.0);
     }
 }
@@ -596,7 +761,10 @@ for case in range(5):
 fn scipy_monte_carlo_distributions_and_tails_match() {
     let required = std::env::var("FSCI_REQUIRE_SCIPY_ORACLE").as_deref() == Ok("1");
     let python = std::env::var("FSCI_PYTHON").unwrap_or_else(|_| "python3".into());
-    let output = match Command::new(&python).args(["-c", MONTE_CARLO_ORACLE]).output() {
+    let output = match Command::new(&python)
+        .args(["-c", MONTE_CARLO_ORACLE])
+        .output()
+    {
         Ok(output) => output,
         Err(error) if !required => {
             eprintln!("SKIP Monte Carlo SciPy oracle: cannot start {python}: {error}");
@@ -606,8 +774,9 @@ fn scipy_monte_carlo_distributions_and_tails_match() {
     };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if !required && (stderr.contains("ModuleNotFoundError: No module named 'scipy'")
-            || stderr.contains("ModuleNotFoundError: No module named 'numpy'"))
+        if !required
+            && (stderr.contains("ModuleNotFoundError: No module named 'scipy'")
+                || stderr.contains("ModuleNotFoundError: No module named 'numpy'"))
         {
             eprintln!("SKIP Monte Carlo SciPy oracle: {stderr}");
             return;
@@ -627,15 +796,39 @@ fn scipy_monte_carlo_distributions_and_tails_match() {
         let expected_statistic: f64 = fields[2].parse().unwrap();
         let expected_pvalue: f64 = fields[3].parse().unwrap();
         let count: usize = fields[4].parse().unwrap();
-        let expected_null: Vec<f64> = lines.next().expect("oracle null distribution")
-            .split_whitespace().map(|value| value.parse().unwrap()).collect();
+        let expected_null: Vec<f64> = lines
+            .next()
+            .expect("oracle null distribution")
+            .split_whitespace()
+            .map(|value| value.parse().unwrap())
+            .collect();
         assert_eq!(expected_null.len(), count);
-        let data = if case == 4 { [0.0, 0.0] } else if case < 2 { [-2.0, -2.0] } else { [-3.0, -1.0] };
+        let data = if case == 4 {
+            [0.0, 0.0]
+        } else if case < 2 {
+            [-2.0, -2.0]
+        } else {
+            [-3.0, -1.0]
+        };
         let offset = if case == 1 || case == 3 { 10.0 } else { 0.0 };
         let actual = monte_carlo_test(
             &data,
-            |seed| if case < 2 { vec![0.0, 0.0] } else if case == 4 { vec![1.0, 1.0] } else { monte_carlo_draw(seed) },
-            |data| if case == 4 { 1.0 + f64::EPSILON * data.iter().sum::<f64>() } else { mean(data) + offset },
+            |seed| {
+                if case < 2 {
+                    vec![0.0, 0.0]
+                } else if case == 4 {
+                    vec![1.0, 1.0]
+                } else {
+                    monte_carlo_draw(seed)
+                }
+            },
+            |data| {
+                if case == 4 {
+                    1.0 + f64::EPSILON * data.iter().sum::<f64>()
+                } else {
+                    mean(data) + offset
+                }
+            },
             count,
             37,
             fields[1],
@@ -657,16 +850,56 @@ struct Case {
 
 fn oracle_cases() -> Vec<Case> {
     vec![
-        Case { kind: PermutationType::Independent, data: vec![vec![1.0, 2.0], vec![3.0, 4.0]], permutations: 6 },
-        Case { kind: PermutationType::Independent, data: vec![vec![1.0, 2.0], vec![3.0, 5.0, 8.0]], permutations: 10 },
-        Case { kind: PermutationType::Independent, data: vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 8.0]], permutations: 90 },
-        Case { kind: PermutationType::Samples, data: vec![vec![1.0, 2.0, 3.0], vec![2.0, 4.0, 8.0]], permutations: 8 },
-        Case { kind: PermutationType::Samples, data: vec![vec![1.0, 2.0], vec![3.0, 5.0], vec![7.0, 11.0]], permutations: 36 },
-        Case { kind: PermutationType::Samples, data: vec![vec![1.0, 2.0, 4.0]], permutations: 8 },
-        Case { kind: PermutationType::Pairings, data: vec![vec![1.0, 3.0, 2.0]], permutations: 6 },
-        Case { kind: PermutationType::Pairings, data: vec![vec![1.0, 2.0, 3.0], vec![4.0, 8.0, 5.0]], permutations: 36 },
-        Case { kind: PermutationType::Pairings, data: vec![vec![1.0, 2.0, 3.0], vec![4.0, 8.0, 5.0]], permutations: 36 },
-        Case { kind: PermutationType::Independent, data: vec![vec![0.0, 0.0], vec![1.0, 1.0]], permutations: 6 },
+        Case {
+            kind: PermutationType::Independent,
+            data: vec![vec![1.0, 2.0], vec![3.0, 4.0]],
+            permutations: 6,
+        },
+        Case {
+            kind: PermutationType::Independent,
+            data: vec![vec![1.0, 2.0], vec![3.0, 5.0, 8.0]],
+            permutations: 10,
+        },
+        Case {
+            kind: PermutationType::Independent,
+            data: vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 8.0]],
+            permutations: 90,
+        },
+        Case {
+            kind: PermutationType::Samples,
+            data: vec![vec![1.0, 2.0, 3.0], vec![2.0, 4.0, 8.0]],
+            permutations: 8,
+        },
+        Case {
+            kind: PermutationType::Samples,
+            data: vec![vec![1.0, 2.0], vec![3.0, 5.0], vec![7.0, 11.0]],
+            permutations: 36,
+        },
+        Case {
+            kind: PermutationType::Samples,
+            data: vec![vec![1.0, 2.0, 4.0]],
+            permutations: 8,
+        },
+        Case {
+            kind: PermutationType::Pairings,
+            data: vec![vec![1.0, 3.0, 2.0]],
+            permutations: 6,
+        },
+        Case {
+            kind: PermutationType::Pairings,
+            data: vec![vec![1.0, 2.0, 3.0], vec![4.0, 8.0, 5.0]],
+            permutations: 36,
+        },
+        Case {
+            kind: PermutationType::Pairings,
+            data: vec![vec![1.0, 2.0, 3.0], vec![4.0, 8.0, 5.0]],
+            permutations: 36,
+        },
+        Case {
+            kind: PermutationType::Independent,
+            data: vec![vec![0.0, 0.0], vec![1.0, 1.0]],
+            permutations: 6,
+        },
     ]
 }
 
@@ -676,11 +909,19 @@ fn oracle_statistic(case: usize, samples: &[&[f64]]) -> f64 {
         1 | 3 => difference(samples),
         2 | 4 => mean(samples[0]) - 2.0 * mean(samples[1]) + 3.0 * mean(samples[2]),
         5 => samples[0].iter().sum(),
-        6 => samples[0].iter().enumerate().map(|(i, &value)| (i + 1) as f64 * value).sum(),
+        6 => samples[0]
+            .iter()
+            .enumerate()
+            .map(|(i, &value)| (i + 1) as f64 * value)
+            .sum(),
         7 => {
             let mx = mean(samples[0]);
             let my = mean(samples[1]);
-            let numerator: f64 = samples[0].iter().zip(samples[1]).map(|(&x, &y)| (x - mx) * (y - my)).sum();
+            let numerator: f64 = samples[0]
+                .iter()
+                .zip(samples[1])
+                .map(|(&x, &y)| (x - mx) * (y - my))
+                .sum();
             let xx: f64 = samples[0].iter().map(|&x| (x - mx).powi(2)).sum();
             let yy: f64 = samples[1].iter().map(|&y| (y - my).powi(2)).sum();
             numerator / (xx * yy).sqrt()
@@ -758,8 +999,9 @@ fn scipy_exact_permutation_distributions_and_tails_match() {
     };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if !required && (stderr.contains("ModuleNotFoundError: No module named 'scipy'")
-            || stderr.contains("ModuleNotFoundError: No module named 'numpy'"))
+        if !required
+            && (stderr.contains("ModuleNotFoundError: No module named 'scipy'")
+                || stderr.contains("ModuleNotFoundError: No module named 'numpy'"))
         {
             eprintln!("SKIP permutation SciPy oracle: {stderr}");
             return;
@@ -786,8 +1028,12 @@ fn scipy_exact_permutation_distributions_and_tails_match() {
         let expected_statistic: f64 = fields[2].parse().unwrap();
         let expected_pvalue: f64 = fields[3].parse().unwrap();
         let count: usize = fields[4].parse().unwrap();
-        let expected_null: Vec<f64> = lines.next().expect("oracle null distribution")
-            .split_whitespace().map(|value| value.parse().unwrap()).collect();
+        let expected_null: Vec<f64> = lines
+            .next()
+            .expect("oracle null distribution")
+            .split_whitespace()
+            .map(|value| value.parse().unwrap())
+            .collect();
         let case = &cases[index];
         assert_eq!(count, case.permutations);
         assert_eq!(expected_null.len(), count);
@@ -796,14 +1042,20 @@ fn scipy_exact_permutation_distributions_and_tails_match() {
             let actual: PermutationTestResult = permutation_test_samples(
                 &data,
                 |samples| oracle_statistic(index, samples),
-                PermutationTestOptions { mode, ..options(case.kind, alternative) },
+                PermutationTestOptions {
+                    mode,
+                    ..options(case.kind, alternative)
+                },
             )
             .unwrap();
             assert!(actual.exact, "case {index} {alternative:?}");
             assert_eq!(actual.null_distribution.len(), count);
             close(actual.statistic, expected_statistic, 2e-14);
             close(actual.pvalue, expected_pvalue, 2e-14);
-            for (actual, expected) in sorted(actual.null_distribution).into_iter().zip(sorted(expected_null.clone())) {
+            for (actual, expected) in sorted(actual.null_distribution)
+                .into_iter()
+                .zip(sorted(expected_null.clone()))
+            {
                 close(actual, expected, 2e-13);
             }
         }
