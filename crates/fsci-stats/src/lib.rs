@@ -10820,29 +10820,28 @@ impl VonMisesFisher {
     ///
     /// # Panics
     ///
-    /// Panics when [`Self::try_rvs`] rejects the distribution's parameters or
-    /// sampling regime. Use that method to handle the refusal without panicking.
+    /// Panics when [`Self::try_rvs`] rejects the distribution's parameters.
+    /// Use that method to handle the refusal without panicking.
     pub fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<Vec<f64>> {
-        self.try_rvs(n, rng).expect(
-            "VonMisesFisher::rvs requires valid parameters and a supported sampling regime; use try_rvs to handle errors",
-        )
+        self.try_rvs(n, rng)
+            .expect("VonMisesFisher::rvs requires valid parameters; use try_rvs to handle errors")
     }
 
     /// Draw samples after validating the current public `mu` and `kappa` fields.
     ///
     /// A zero sample count returns an empty vector without validating parameters
     /// or consuming randomness. Otherwise `mu` must have at least two finite
-    /// entries and a norm within `1e-10` of one; `kappa` must be finite and
-    /// nonnegative. Zero concentration retains this API's uniform-sphere limit.
-    /// For dimension four and higher, concentrations above `1e6` are refused
-    /// pending a numerically robust rejection envelope; see
-    /// <https://github.com/Dicklesworthstone/frankenscipy/issues/4>.
+    /// entries and a norm within `1e-10` of one, and samples are drawn around
+    /// `mu / |mu|`; `kappa` must be finite and nonnegative. Zero concentration
+    /// retains this API's uniform-sphere limit. Every finite concentration is
+    /// sampled in every dimension: the samplers carry `1 - mu·x` rather than
+    /// `mu·x`, so a concentrated sample keeps its offset from the mean down to
+    /// the resolution of its `f64` coordinates instead of collapsing onto it.
     ///
     /// # Errors
     ///
-    /// Returns [`StatsError`] for invalid parameters or the unsupported
-    /// higher-dimensional concentration regime, before allocating samples or
-    /// consuming randomness.
+    /// Returns [`StatsError`] for invalid parameters, before allocating samples
+    /// or consuming randomness.
     pub fn try_rvs(&self, n: usize, rng: &mut impl Rng) -> Result<Vec<Vec<f64>>, StatsError> {
         if n == 0 {
             return Ok(Vec::new());
@@ -10874,12 +10873,6 @@ impl VonMisesFisher {
                 "mu must be a unit vector".to_string(),
             ));
         }
-        if p >= 4 && self.kappa > 1e6 {
-            return Err(StatsError::Unsupported {
-                operation: "rvs with dimension >= 4 and kappa > 1e6",
-                distribution: "von Mises-Fisher",
-            });
-        }
         if self.kappa <= 1e-12 {
             let mut samples = Vec::with_capacity(n);
             for _ in 0..n {
@@ -10897,59 +10890,66 @@ impl VonMisesFisher {
             return Ok(samples);
         }
         let mut samples = Vec::with_capacity(n);
-        let e1_dot_mu = self.mu[0];
-        let reflect_v: Option<Vec<f64>> = if (e1_dot_mu - 1.0).abs() < 1e-12 {
-            None
-        } else if (e1_dot_mu + 1.0).abs() < 1e-12 {
-            let mut v = vec![0.0; p];
-            v[0] = 1.0;
-            Some(v)
-        } else {
-            let mut v = vec![0.0; p];
-            v[0] = 1.0 - self.mu[0];
-            for i in 1..p {
-                v[i] = -self.mu[i];
-            }
-            let norm: f64 = v.iter().map(|&x| x * x).sum::<f64>().sqrt();
-            for vi in v.iter_mut() {
-                *vi /= norm;
-            }
-            Some(v)
-        };
+        // gh#4: rotate onto the NORMALIZED mean. `e1 - mu` for a mean that passes the norm
+        // tolerance without being unit, such as `[1 + 5e-11, 0, 0]`, points along `-e1`, and the
+        // reflection then sent every sample to the antipode of the mean.
+        let unit_mu: Vec<f64> = self.mu.iter().map(|&value| value / norm).collect();
+        let reflect_v = vmf_householder_from_e1(&unit_mu);
+
+        // gh#4: every coordinate below is carried as `t = 1 - w`, where `w = y·mu`, and the
+        // perpendicular radius as `sqrt(t (2 - t))`. At large kappa `w` rounds to 1 and
+        // `sqrt(1 - w²)` to 0, which collapsed every sample onto the mean.
+        let kappa = self.kappa;
+        // Wood (1994), as SciPy's `_rejection_sampling` runs it, for p >= 4 with d = p - 1:
+        // b = (sqrt(4 kappa² + d²) - 2 kappa) / d, x0 = (1 - b) / (1 + b), z ~ Beta(d/2, d/2),
+        // w = (1 - (1 + b) z) / (1 - (1 - b) z), accepted when
+        // kappa (w - x0) + d ln((1 - x0 w) / (1 - x0²)) > ln u. The direct forms cancel
+        // (`sqrt(4 kappa² + d²) - 2 kappa`, `kappa w - kappa x0`) or overflow (`4 kappa²`),
+        // which is why concentrations above 1e6 used to be refused. Here
+        // b = (d / kappa) / (2 + hypot(2, d / kappa)) and kappa b = d / (2 + hypot(2, d / kappa));
+        // t = 2 b z / (1 - z + b z), so kappa t = 2 (kappa b) z / (1 - z + b z);
+        // kappa (w - x0) = kappa (1 - x0) - kappa t with kappa (1 - x0) = 2 kappa b / (1 + b);
+        // (1 - x0 w) / (1 - x0²) = (1 + x0 t / (1 - x0)) / (1 + x0).
+        // Every term is O(1) at any finite kappa, and the algorithm is unchanged.
+        let d = (p - 1) as f64;
+        let ratio = d / kappa;
+        let spread = 2.0 + 2.0_f64.hypot(ratio);
+        let b = ratio / spread;
+        let kappa_b = d / spread;
+        let x0 = (1.0 - b) / (1.0 + b);
+        let kappa_one_minus_x0 = 2.0 * kappa_b / (1.0 + b);
+        let ln1p_x0 = x0.ln_1p();
+        let gamma_dist = GammaDist::new(0.5 * d, 1.0);
 
         for _ in 0..n {
-            let (x, temp) = if p == 3 {
+            let t = if p == 3 {
+                // Inverse CDF of w: t = -ln(u + (1 - u) e^{-2 kappa}) / kappa, rewritten as
+                // 2 - ln(1 + u (e^{2 kappa} - 1)) / kappa below kappa = 1 where the direct form
+                // loses the 2 kappa (1 - u) it is made of.
                 let u: f64 = rng.random();
-                let x_val = (1.0 + (u + (1.0 - u) * (-2.0 * self.kappa).exp()).ln() / self.kappa)
-                    .clamp(-1.0, 1.0);
-                let temp = (1.0 - x_val * x_val).max(0.0).sqrt();
-                (x_val, temp)
+                let t = if kappa < 1.0 {
+                    2.0 - (u * (2.0 * kappa).exp_m1()).ln_1p() / kappa
+                } else {
+                    -(u + (1.0 - u) * (-2.0 * kappa).exp()).ln() / kappa
+                };
+                t.clamp(0.0, 2.0)
             } else {
-                let dim_m1 = (p - 1) as f64;
-                let sqrt_val = (4.0 * self.kappa * self.kappa + dim_m1 * dim_m1).sqrt();
-                let mut b = (-2.0 * self.kappa + sqrt_val) / dim_m1;
-                if b <= 0.0 {
-                    b = dim_m1 / (4.0 * self.kappa) - dim_m1.powi(3) / (64.0 * self.kappa.powi(3));
-                }
-                let x0 = (1.0 - b) / (1.0 + b);
-                let c = self.kappa * x0 + dim_m1 * (4.0_f64.ln() + b.ln() - 2.0 * (1.0 + b).ln());
-                let halfdim = 0.5 * dim_m1;
-                let gamma_dist = GammaDist::new(halfdim, 1.0);
-                let x_val = loop {
+                loop {
                     let g1 = gamma_dist.rvs(1, rng)[0].max(1e-300);
                     let g2 = gamma_dist.rvs(1, rng)[0].max(1e-300);
-                    let z = (g1 / (g1 + g2)).clamp(1e-12, 1.0 - 1e-12);
-                    let w = (1.0 - (1.0 + b) * z) / (1.0 - (1.0 - b) * z);
+                    let z = g1 / (g1 + g2);
+                    let denominator = (1.0 - z) + b * z;
+                    let kappa_t = 2.0 * kappa_b * z / denominator;
                     let u: f64 = rng.random();
-                    let crit =
-                        self.kappa * w + dim_m1 * ((1.0 + b - w + w * b) / (1.0 + b)).ln() - c;
+                    let crit = (kappa_one_minus_x0 - kappa_t)
+                        + d * ((x0 * kappa_t / kappa_one_minus_x0).ln_1p() - ln1p_x0);
                     if crit > u.ln() {
-                        break w.clamp(-1.0, 1.0);
+                        break (2.0 * b * z / denominator).clamp(0.0, 2.0);
                     }
-                };
-                let temp = (1.0 - x_val * x_val).max(0.0).sqrt();
-                (x_val, temp)
+                }
             };
+            let x = 1.0 - t;
+            let temp = (t * (2.0 - t)).max(0.0).sqrt();
 
             let sphere_rest = uniform_direction::rvs_with_rng(p - 1, rng);
             let mut y = vec![0.0; p];
@@ -10968,6 +10968,32 @@ impl VonMisesFisher {
         }
         Ok(samples)
     }
+}
+
+/// Unit Householder vector `v` whose reflection `I - 2 v vᵀ` maps `e₁` onto the unit vector
+/// `mu`, or `None` when `mu` is `e₁` itself.
+///
+/// `v` is `e₁ - mu` normalized. For `mu₀ > 0` its first component `1 - mu₀` is formed as
+/// `|mu₁..|² / (1 + mu₀)`, which equals it for a unit `mu` without the cancellation, so a mean
+/// that is only slightly tilted away from `e₁` keeps its tilt.
+fn vmf_householder_from_e1(mu: &[f64]) -> Option<Vec<f64>> {
+    let rest_sq: f64 = mu[1..].iter().map(|&value| value * value).sum();
+    let first = if mu[0] > 0.0 {
+        rest_sq / (1.0 + mu[0])
+    } else {
+        1.0 - mu[0]
+    };
+    let mut v: Vec<f64> = std::iter::once(first)
+        .chain(mu[1..].iter().map(|&value| -value))
+        .collect();
+    let norm = v.iter().fold(0.0_f64, |norm, &value| norm.hypot(value));
+    if norm == 0.0 {
+        return None;
+    }
+    for value in &mut v {
+        *value /= norm;
+    }
+    Some(v)
 }
 
 /// Draw a sample from the von Mises circular distribution using the Best & Fisher (1979) algorithm.
@@ -72895,16 +72921,59 @@ mod tests {
         );
     }
 
+    /// `1 - mu·y` of a unit sample `y` around `mu = e₁`, from the coordinates
+    /// orthogonal to the mean (`|y₁..|² / (1 + y₀)`) so it survives where
+    /// `1 - y₀` rounds to zero.
+    fn vmf_offset_from_e1(y: &[f64]) -> f64 {
+        let perpendicular: f64 = y[1..].iter().map(|value| value * value).sum();
+        if y[0] >= 0.0 {
+            perpendicular / (1.0 + y[0])
+        } else {
+            1.0 - y[0]
+        }
+    }
+
     #[test]
-    fn vonmises_fisher_try_rvs_refuses_extreme_high_dimensional_regime() {
-        let mut rng = VmfUnusedRng;
-        let above_limit = f64::from_bits(1e6_f64.to_bits() + 1);
-        for mu in [vec![0.5; 4], vec![1.0, 0.0, 0.0, 0.0, 0.0]] {
-            for kappa in [above_limit, 1e20, 1e308] {
-                assert!(matches!(
-                    VonMisesFisher::new(&mu, kappa).try_rvs(1, &mut rng),
-                    Err(StatsError::Unsupported { .. })
-                ));
+    fn vonmises_fisher_concentration_moments_in_every_dimension() {
+        // gh#4: for p >= 4 the sampler refused kappa > 1e6, because its Wood envelope
+        // cancelled and overflowed, and p = 3 collapsed every concentrated sample onto the
+        // mean. The mean of kappa (1 - mu·y) is checked against kappa (1 - A_p(kappa)),
+        // A_p = I_{p/2} / I_{p/2-1}, and above kappa = 1e6 against its limit (p - 1) / 2,
+        // the mean of Gamma((p - 1) / 2): the next term is O(1 / kappa).
+        let mut rng = VmfBudgetRng {
+            inner: StdRng::seed_from_u64(0x564d_463a),
+            remaining: 20_000_000,
+        };
+        let n = 2000;
+        for p in [3_usize, 4, 7] {
+            let mut mu = vec![0.0; p];
+            mu[0] = 1.0;
+            let half = 0.5 * p as f64;
+            for kappa in [10.0, 1e3, 1e8, 1e20, 1e150, 1e308] {
+                let samples = VonMisesFisher::new(&mu, kappa)
+                    .try_rvs(n, &mut rng)
+                    .expect("every finite concentration is sampled");
+                assert_vmf_finite_unit_samples(&samples, p, n);
+                let scaled: Vec<f64> = samples
+                    .iter()
+                    .map(|y| kappa * vmf_offset_from_e1(y))
+                    .collect();
+                let mean = scaled.iter().sum::<f64>() / n as f64;
+                let var =
+                    scaled.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / (n - 1) as f64;
+                let expected = if kappa <= 1e6 {
+                    let ratio = fsci_special::ive_scalar(half, kappa)
+                        / fsci_special::ive_scalar(half - 1.0, kappa);
+                    kappa * (1.0 - ratio)
+                } else {
+                    0.5 * (p - 1) as f64
+                };
+                let standard_error = (var / n as f64).sqrt();
+                assert!(
+                    var > 0.0 && (mean - expected).abs() < 5.0 * standard_error,
+                    "p={p} kappa={kappa}: mean kappa(1 - mu.y) = {mean} (se {standard_error}), \
+                     expected {expected}"
+                );
             }
         }
     }
@@ -72981,9 +73050,57 @@ mod tests {
     }
 
     #[test]
+    fn vonmises_fisher_near_unit_mean_keeps_its_direction() {
+        // gh#4: a mean inside the 1e-10 unit-norm tolerance but not exactly unit made the
+        // reflection vector point along -e1, so every sample landed on the antipode of the mean.
+        let mut rng = VmfBudgetRng::seeded(0x564d_4636);
+        for p in [3_usize, 5] {
+            for sign in [1.0, -1.0] {
+                let mut mu = vec![0.0; p];
+                mu[0] = sign * (1.0 + 5e-11);
+                let samples = VonMisesFisher::new(&mu, 50.0)
+                    .try_rvs(64, &mut rng)
+                    .expect("a mean within the unit-norm tolerance is accepted");
+                assert_vmf_finite_unit_samples(&samples, p, 64);
+                let mean_first = samples.iter().map(|sample| sample[0]).sum::<f64>() / 64.0;
+                assert!(
+                    sign * mean_first > 0.9,
+                    "p={p} sign={sign}: mean first coordinate {mean_first} is not near mu"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vonmises_fisher_slightly_tilted_mean_is_not_snapped_to_an_axis() {
+        // The rotation used to treat a mean whose first coordinate was within 1e-12 of +-1 as
+        // +-e1 itself, dropping a tilt of up to ~1.4e-6 rad. At kappa = 1e16 a p = 3 sample sits
+        // within sqrt(2 * 36.8 / kappa) < 1e-7 of the mean, so each one carries its tilt.
+        let mut rng = VmfBudgetRng::seeded(0x564d_4638);
+        let tilt = 1e-6_f64;
+        for sign in [1.0, -1.0] {
+            let mu = [sign * tilt.cos(), tilt.sin(), 0.0];
+            let samples = VonMisesFisher::new(&mu, 1e16)
+                .try_rvs(32, &mut rng)
+                .expect("p = 3 has no concentration limit");
+            assert_vmf_finite_unit_samples(&samples, 3, 32);
+            for sample in &samples {
+                assert!(
+                    (sample[1] - tilt.sin()).abs() < 2e-7,
+                    "sign={sign}: sample {sample:?} lost the mean's tilt"
+                );
+                assert!(
+                    sign * sample[0] > 0.0,
+                    "sample {sample:?} left the mean's side"
+                );
+            }
+        }
+    }
+
+    #[test]
     #[should_panic(expected = "VonMisesFisher::rvs requires valid parameters")]
-    fn vonmises_fisher_legacy_rvs_documents_unsupported_regime_panic() {
-        let _ = VonMisesFisher::new(&[0.5; 4], 1e308).rvs(1, &mut VmfUnusedRng);
+    fn vonmises_fisher_legacy_rvs_documents_invalid_parameter_panic() {
+        let _ = VonMisesFisher::new(&[0.5; 4], -1.0).rvs(1, &mut VmfUnusedRng);
     }
 
     #[test]
