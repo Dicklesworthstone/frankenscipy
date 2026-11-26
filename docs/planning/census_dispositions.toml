@@ -91,13 +91,6 @@ reason = "interactive documentation printer"
 bead = "frankenscipy-8dndw.1"
 
 [[entry]]
-module = "scipy.stats"
-name = "make_distribution"
-disposition = "missing"
-reason = "needs a generic user-defined distribution mechanism"
-bead = "frankenscipy-1ksfv"
-
-[[entry]]
 module = "scipy.integrate"
 name = "IntegrationWarning"
 disposition = "adapted"

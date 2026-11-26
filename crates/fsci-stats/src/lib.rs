@@ -14,11 +14,14 @@
 pub mod audit;
 pub mod censored;
 pub mod covariance;
+mod custom;
 mod landau;
 mod levy_stable;
 pub mod mle;
 mod permutation;
 pub mod qmc;
+
+pub use custom::{ContinuousDistributionSpec, CustomDistribution, make_distribution};
 
 pub use audit::{
     SyncSharedAuditLedger, record_bounded_recovery, record_fail_closed, sync_audit_ledger,
@@ -24462,10 +24465,6 @@ where
     let power = rejections as f64 / n_resamples as f64;
     PowerResult { power, pvalues }
 }
-
-// `scipy.stats.make_distribution` builds a distribution from a user-supplied specification; it
-// is MISSING until a generic user-defined distribution mechanism exists (bead frankenscipy-1ksfv).
-// An identity function used to stand in for it and was counted as covered (frankenscipy-8dndw.1).
 
 /// Random orthogonal matrix generator, matching `scipy.stats.ortho_group`.
 #[allow(non_camel_case_types)]
