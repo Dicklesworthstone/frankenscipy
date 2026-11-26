@@ -422,7 +422,7 @@ impl LeastSquaresMatrix {
             }
             Self::Operator(operator) => operator.matvec_into(vector, result)?,
         }
-        Ok(())
+        finite_product(result)
     }
 
     pub(crate) fn transpose_product(&self, vector: &[f64]) -> SparseResult<Vec<f64>> {
@@ -454,11 +454,12 @@ impl LeastSquaresMatrix {
             }
             Self::Operator(operator) => operator.rmatvec_into(vector, result)?,
         }
-        Ok(())
+        finite_product(result)
     }
 
     /// Column norms in the same summation order as the dense trust-region
-    /// implementation. Sparse inputs have been canonicalized at the API boundary.
+    /// implementation, with a range-safe fallback for overflowed or subnormal
+    /// sums of squares. Sparse inputs are canonicalized at the API boundary.
     pub(crate) fn column_norms(&self) -> SparseResult<Vec<f64>> {
         let mut norms = vec![0.0; self.shape().cols];
         match self {
@@ -480,8 +481,45 @@ impl LeastSquaresMatrix {
                 });
             }
         }
-        for value in &mut norms {
-            *value = value.sqrt();
+        if norms.iter().any(|value| !value.is_normal()) {
+            // Only exceptional columns use hypot: preserve the ordinary
+            // summation and rounding of every normal sum of squares.
+            let mut stable = vec![0.0_f64; norms.len()];
+            match self {
+                Self::Dense(rows) => {
+                    for row in rows {
+                        for (column, &value) in row.iter().enumerate() {
+                            if !norms[column].is_normal() {
+                                stable[column] = stable[column].hypot(value);
+                            }
+                        }
+                    }
+                }
+                Self::Sparse(matrix) => {
+                    for (&column, &value) in matrix.indices().iter().zip(matrix.data()) {
+                        if !norms[column].is_normal() {
+                            stable[column] = stable[column].hypot(value);
+                        }
+                    }
+                }
+                Self::Operator(_) => unreachable!("operator column norms were rejected above"),
+            }
+            for (value, fallback) in norms.iter_mut().zip(stable) {
+                *value = if value.is_normal() {
+                    value.sqrt()
+                } else {
+                    fallback
+                };
+            }
+        } else {
+            for value in &mut norms {
+                *value = value.sqrt();
+            }
+        }
+        if norms.iter().any(|value| !value.is_finite()) {
+            return Err(SparseError::NonFiniteInput {
+                message: String::from("least-squares Jacobian column norm is not finite"),
+            });
         }
         Ok(norms)
     }
@@ -632,6 +670,72 @@ mod tests {
         assert_eq!(sparse.as_sparse().unwrap().nnz(), 4);
         assert!(sparse.as_dense().is_none());
         assert!(sparse.all_finite());
+    }
+
+    #[test]
+    fn column_norms_preserve_extreme_ranges_and_ordinary_rounding() {
+        let rows = vec![
+            vec![3e200, 3e-200, 3e-160, 0.1, 0.0],
+            vec![4e200, 4e-200, 4e-160, 0.2, 0.0],
+        ];
+        let dense = LeastSquaresMatrix::Dense(rows);
+        let sparse = LeastSquaresMatrix::Sparse(
+            CsrMatrix::from_components(
+                Shape2D::new(2, 5),
+                vec![3e200, 3e-200, 3e-160, 0.1, 4e200, 4e-200, 4e-160, 0.2],
+                vec![0, 1, 2, 3, 0, 1, 2, 3],
+                vec![0, 4, 8],
+                true,
+            )
+            .unwrap(),
+        );
+        for matrix in [dense, sparse] {
+            let actual = matrix.column_norms().unwrap();
+            for (column, expected) in [5e200, 5e-200, 5e-160].into_iter().enumerate() {
+                assert!(
+                    (actual[column] / expected - 1.0).abs() < 4.0 * f64::EPSILON,
+                    "column {column}: {actual:?}"
+                );
+            }
+            let ordinary = (0.1_f64 * 0.1 + 0.2 * 0.2).sqrt();
+            assert_eq!(actual[3].to_bits(), ordinary.to_bits());
+            assert_eq!(actual[4], 0.0);
+        }
+
+        let overflowing = LeastSquaresMatrix::Dense(vec![vec![f64::MAX], vec![f64::MAX]]);
+        assert!(matches!(
+            overflowing.column_norms(),
+            Err(SparseError::NonFiniteInput { .. })
+        ));
+    }
+
+    #[test]
+    fn explicit_matrix_products_reject_nonfinite_accumulation() {
+        for coefficient in [1e150, 1e308] {
+            let dense = LeastSquaresMatrix::Dense(vec![vec![coefficient; 2]; 2]);
+            let sparse = LeastSquaresMatrix::Sparse(
+                CsrMatrix::from_components(
+                    Shape2D::new(2, 2),
+                    vec![coefficient; 4],
+                    vec![0, 1, 0, 1],
+                    vec![0, 2, 4],
+                    true,
+                )
+                .unwrap(),
+            );
+            for matrix in [dense, sparse] {
+                for product in [
+                    matrix.product(&[2.0, -2.0]),
+                    matrix.transpose_product(&[2.0, -2.0]),
+                ] {
+                    if coefficient == 1e150 {
+                        assert_eq!(product.unwrap(), vec![0.0; 2]);
+                    } else {
+                        assert!(matches!(product, Err(SparseError::NonFiniteInput { .. })));
+                    }
+                }
+            }
+        }
     }
 
     #[test]

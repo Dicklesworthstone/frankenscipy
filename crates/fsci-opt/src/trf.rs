@@ -388,7 +388,12 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
 }
 
 fn norm(a: &[f64]) -> f64 {
-    dot(a, a).sqrt()
+    let squared = dot(a, a);
+    if squared.is_normal() {
+        squared.sqrt()
+    } else {
+        a.iter().fold(0.0_f64, |value, &entry| value.hypot(entry))
+    }
 }
 
 /// Half the sum of residual squares. Preserve the ordinary sum order, but do
@@ -438,7 +443,17 @@ fn dense_exact_jacobian(j: &LeastSquaresMatrix) -> Result<&[Vec<f64>], fsci_spar
 
 /// `Jᵀ·f`.
 fn compute_grad(j: &LeastSquaresMatrix, f: &[f64]) -> fsci_sparse::SparseResult<Vec<f64>> {
-    j.transpose_product(f)
+    j.transpose_product(f).map_err(|error| match error {
+        fsci_sparse::SparseError::NonFiniteInput { .. } if !j.all_finite() => {
+            // Preserve the SciPy-compatible error for an invalid numerical
+            // Jacobian; finite entries with overflowing products retain the
+            // more specific arithmetic error from the shared matrix wrapper.
+            fsci_sparse::SparseError::NonFiniteInput {
+                message: String::from("array must not contain infs or NaNs"),
+            }
+        }
+        error => error,
+    })
 }
 
 /// `compute_jac_scale`: `(scale, scale_inv)` with `scale_inv` the column norms of J.
@@ -461,7 +476,17 @@ fn compute_jac_scale(
             }
         }
     }
-    Ok((scale_inv.iter().map(|s| 1.0 / s).collect(), scale_inv))
+    let scale: Vec<f64> = scale_inv.iter().map(|s| 1.0 / s).collect();
+    if scale
+        .iter()
+        .zip(&scale_inv)
+        .any(|(&s, &inverse)| !s.is_finite() || s <= 0.0 || !inverse.is_finite() || inverse <= 0.0)
+    {
+        return Err(fsci_sparse::SparseError::NonFiniteInput {
+            message: String::from("least-squares Jacobian scaling is not representable"),
+        });
+    }
+    Ok((scale, scale_inv))
 }
 
 /// `scale_for_robust_loss_function`: rows of J and entries of f scaled in place.
@@ -1354,20 +1379,31 @@ fn rectangular_dogleg(
     x: &[f64],
     newton: &[f64],
     g: &[f64],
-    a: f64,
-    b: f64,
+    j: &LeastSquaresMatrix,
+    quadratic: &mut Option<(f64, f64)>,
     radius: &[f64],
     lb: &[f64],
     ub: &[f64],
-) -> (Vec<f64>, Vec<i8>, bool) {
+) -> fsci_sparse::SparseResult<(Vec<f64>, Vec<i8>, bool)> {
     let n = x.len();
     let lower: Vec<f64> = (0..n).map(|i| (lb[i] - x[i]).max(-radius[i])).collect();
     let upper: Vec<f64> = (0..n).map(|i| (ub[i] - x[i]).min(radius[i])).collect();
     if in_bounds(newton, &lower, &upper) {
-        return (newton.to_vec(), vec![0; n], false);
+        return Ok((newton.to_vec(), vec![0; n], false));
     }
 
     let anti_gradient: Vec<f64> = g.iter().map(|v| -v).collect();
+    // A finite Newton step needs no Cauchy model. Its unused J*(-g)
+    // product can overflow for a large, but perfectly usable, Jacobian.
+    // Cache the model only when needed, including across rejected trials.
+    let (a, b) = match *quadratic {
+        Some(coefficients) => coefficients,
+        None => {
+            let (a, b, _) = build_quadratic_1d(j, g, &anti_gradient, None, None)?;
+            *quadratic = Some((a, b));
+            (a, b)
+        }
+    };
     let (to_bounds, _) = step_size_to_bound(&vec![0.0; n], &anti_gradient, &lower, &upper);
     let (cauchy_length, _) = minimize_quadratic_1d(a, b, 0.0, to_bounds, 0.0);
     let cauchy: Vec<f64> = anti_gradient.iter().map(|v| cauchy_length * v).collect();
@@ -1393,7 +1429,7 @@ fn rectangular_dogleg(
         .zip(&difference)
         .map(|(a, b)| a + length * b)
         .collect();
-    (step, bound_hits, trust_hit)
+    Ok((step, bound_hits, trust_hit))
 }
 
 /// Voglis–Lagaris rectangular trust-region dogleg, as in SciPy's `_lsq/dogbox.py`.
@@ -1517,8 +1553,7 @@ where
                 trf_lsmr::dogbox_step(&j_free, &f, &scales, options, mode)?
             }
         };
-        let anti_gradient: Vec<f64> = g_free.iter().map(|v| -v).collect();
-        let (a, b, _) = build_quadratic_1d(&j_free, &g_free, &anti_gradient, None, None)?;
+        let mut cauchy_model = None;
         let x_free: Vec<f64> = free.iter().map(|&i| x[i]).collect();
         let lb_free: Vec<f64> = free.iter().map(|&i| lb[i]).collect();
         let ub_free: Vec<f64> = free.iter().map(|&i| ub[i]).collect();
@@ -1530,8 +1565,16 @@ where
 
         while actual_reduction <= 0.0 && nfev < max_nfev {
             let radius: Vec<f64> = free.iter().map(|&i| delta * scale[i]).collect();
-            let (step_free, bound_hits, trust_hit) =
-                rectangular_dogleg(&x_free, &newton, &g_free, a, b, &radius, &lb_free, &ub_free);
+            let (step_free, bound_hits, trust_hit) = rectangular_dogleg(
+                &x_free,
+                &newton,
+                &g_free,
+                &j_free,
+                &mut cauchy_model,
+                &radius,
+                &lb_free,
+                &ub_free,
+            )?;
             hits = bound_hits;
             let predicted_reduction = -evaluate_quadratic(&j_free, &g_free, &step_free, None)?;
             let mut step = vec![0.0; n];
@@ -1651,6 +1694,144 @@ mod tests {
     };
     use fsci_runtime::RuntimeMode;
     use fsci_sparse::{CsrMatrix, DenseLinearOperator, Shape2D};
+
+    #[test]
+    fn trust_region_norms_preserve_representable_extreme_values() {
+        for magnitude in [1e-200, 1e-160, 1.0, 1e160, 1e200] {
+            let actual = super::norm(&[3.0 * magnitude, 4.0 * magnitude]);
+            assert!(
+                (actual / (5.0 * magnitude) - 1.0).abs() < 4.0 * f64::EPSILON,
+                "magnitude={magnitude}: {actual}"
+            );
+        }
+        let ordinary = [0.1, 0.2, 0.3];
+        assert_eq!(
+            super::norm(&ordinary).to_bits(),
+            super::dot(&ordinary, &ordinary).sqrt().to_bits()
+        );
+        assert_eq!(super::norm(&[0.0, -0.0]), 0.0);
+    }
+
+    #[test]
+    fn jacobian_scaling_solves_extreme_units_for_dense_and_sparse_jacobians() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            for sparse in [false, true] {
+                for solver in [
+                    TrustRegionSolver::Auto,
+                    TrustRegionSolver::Lsmr(TrustRegionLsmrOptions::default()),
+                ] {
+                    for magnitude in [1e-200, 1e-160, 1.0, 1e160, 1e200] {
+                        let jac = if sparse {
+                            LeastSquaresJacobian::new_sparse(move |_| {
+                                CsrMatrix::from_components(
+                                    Shape2D::new(1, 1),
+                                    vec![magnitude],
+                                    vec![0],
+                                    vec![0, 1],
+                                    true,
+                                )
+                                .unwrap()
+                            })
+                        } else {
+                            LeastSquaresJacobian::new(move |_| vec![vec![magnitude]])
+                        };
+                        let result = least_squares(
+                            |x| vec![magnitude * x[0] - 1.0],
+                            &[0.0],
+                            LeastSquaresOptions {
+                                method: Some(method),
+                                jac: Some(jac),
+                                tr_solver: solver,
+                                x_scale: Some(XScale::Jac),
+                                // The absolute gradient is small for small units,
+                                // even at x0. Test progress, not that stopping rule.
+                                gtol: 0.0,
+                                ftol: 1e-12,
+                                xtol: 1e-12,
+                                max_nfev: Some(8),
+                                ..LeastSquaresOptions::default()
+                            },
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("{method:?}/{sparse}/{solver:?}/{magnitude}: {error}")
+                        });
+                        assert!(
+                            result.success
+                                && result.x[0].is_finite()
+                                && (magnitude * result.x[0] - 1.0).abs() < 2e-14
+                                && result.cost.is_finite()
+                                && result.cost < 1e-28,
+                            "{method:?}/{sparse}/{solver:?}/{magnitude}: {result:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn jacobian_scaling_rejects_unrepresentable_reciprocals_but_keeps_zero_columns() {
+        for magnitude in [0.0, 1e-320] {
+            let dense = LeastSquaresMatrix::Dense(vec![vec![magnitude]]);
+            let sparse = LeastSquaresMatrix::Sparse(
+                CsrMatrix::from_components(
+                    Shape2D::new(1, 1),
+                    vec![magnitude],
+                    vec![0],
+                    vec![0, 1],
+                    true,
+                )
+                .unwrap(),
+            );
+            for matrix in [dense, sparse] {
+                let result = super::compute_jac_scale(&matrix, None);
+                if magnitude == 0.0 {
+                    assert_eq!(result.unwrap(), (vec![1.0], vec![1.0]));
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(fsci_sparse::SparseError::NonFiniteInput { .. })
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn trust_region_rejects_overflowing_dense_and_sparse_gradient_products() {
+        for method in [LeastSquaresMethod::Trf, LeastSquaresMethod::Dogbox] {
+            for sparse in [false, true] {
+                let jac = if sparse {
+                    LeastSquaresJacobian::new_sparse(|_| {
+                        CsrMatrix::from_components(
+                            Shape2D::new(2, 1),
+                            vec![1e308; 2],
+                            vec![0, 0],
+                            vec![0, 1, 2],
+                            true,
+                        )
+                        .unwrap()
+                    })
+                } else {
+                    LeastSquaresJacobian::new(|_| vec![vec![1e308]; 2])
+                };
+                // Finite residuals and entries still produce infinity-infinity
+                // in the unscaled transpose product. Do not return diagnostics
+                // containing NaN or accept a rounded zero step as convergence.
+                let error = least_squares(
+                    |x| vec![1e308 * x[0] + 2.0, 1e308 * x[0] - 3.0],
+                    &[0.0],
+                    LeastSquaresOptions {
+                        method: Some(method),
+                        jac: Some(jac),
+                        ..LeastSquaresOptions::default()
+                    },
+                )
+                .expect_err("nonfinite gradient arithmetic must be reported");
+                assert!(matches!(error, OptError::NonFiniteInput { .. }));
+            }
+        }
+    }
 
     #[test]
     fn robust_loss_preserves_cost_and_score_across_extreme_scales() {
