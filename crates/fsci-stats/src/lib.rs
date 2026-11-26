@@ -8551,18 +8551,8 @@ impl MultivariateNormal {
             )));
         }
 
-        let chol = if let Some(chol_ref) = cov.cholesky_factor() {
-            for (i, row) in chol_ref.iter().enumerate() {
-                if i >= row.len() || row[i] <= 1e-15 || !row[i].is_finite() {
-                    return Err(StatsError::InvalidArgument(
-                        "covariance matrix must be symmetric positive definite".to_string(),
-                    ));
-                }
-            }
-            chol_ref.to_vec()
-        } else {
-            cholesky_decompose(cov.covariance())?
-        };
+        let chol =
+            covariance_cholesky(cov, "covariance matrix must be symmetric positive definite")?;
 
         let log_det = 2.0 * (0..chol.len()).map(|i| chol[i][i].ln()).sum::<f64>();
         Ok(Self {
@@ -9540,18 +9530,7 @@ impl MultivariateT {
             )));
         }
 
-        let chol = if let Some(chol_ref) = cov.cholesky_factor() {
-            for (i, row) in chol_ref.iter().enumerate() {
-                if i >= row.len() || row[i] <= 1e-15 || !row[i].is_finite() {
-                    return Err(StatsError::InvalidArgument(
-                        "shape matrix must be symmetric positive definite".to_string(),
-                    ));
-                }
-            }
-            chol_ref.to_vec()
-        } else {
-            cholesky_decompose(cov.covariance())?
-        };
+        let chol = covariance_cholesky(cov, "shape matrix must be symmetric positive definite")?;
 
         let log_det = 2.0 * (0..chol.len()).map(|i| chol[i][i].ln()).sum::<f64>();
         Ok(Self {
@@ -9887,16 +9866,14 @@ impl MatrixNormal {
                 colcov.dim()
             )));
         }
-        let chol_u = if let Some(c) = rowcov.cholesky_factor() {
-            c.to_vec()
-        } else {
-            cholesky_decompose(rowcov.covariance())?
-        };
-        let chol_v = if let Some(c) = colcov.cholesky_factor() {
-            c.to_vec()
-        } else {
-            cholesky_decompose(colcov.covariance())?
-        };
+        let chol_u = covariance_cholesky(
+            rowcov,
+            "covariance matrix must be symmetric positive definite",
+        )?;
+        let chol_v = covariance_cholesky(
+            colcov,
+            "covariance matrix must be symmetric positive definite",
+        )?;
         let log_det_u = 2.0 * (0..nrow).map(|i| chol_u[i][i].ln()).sum::<f64>();
         let log_det_v = 2.0 * (0..ncol).map(|i| chol_v[i][i].ln()).sum::<f64>();
         Ok(Self {
@@ -10163,18 +10140,7 @@ impl Wishart {
             )));
         }
 
-        let chol_v = if let Some(chol_ref) = cov.cholesky_factor() {
-            for (i, row) in chol_ref.iter().enumerate() {
-                if i >= row.len() || row[i] <= 1e-15 || !row[i].is_finite() {
-                    return Err(StatsError::InvalidArgument(
-                        "scale matrix must be symmetric positive definite".to_string(),
-                    ));
-                }
-            }
-            chol_ref.to_vec()
-        } else {
-            cholesky_decompose(cov.covariance())?
-        };
+        let chol_v = covariance_cholesky(cov, "scale matrix must be symmetric positive definite")?;
 
         let ln_det_v = 2.0 * (0..p).map(|i| chol_v[i][i].ln()).sum::<f64>();
         Ok(Self {
@@ -10427,18 +10393,7 @@ impl InvWishart {
             )));
         }
 
-        let chol_v = if let Some(chol_ref) = cov.cholesky_factor() {
-            for (i, row) in chol_ref.iter().enumerate() {
-                if i >= row.len() || row[i] <= 1e-15 || !row[i].is_finite() {
-                    return Err(StatsError::InvalidArgument(
-                        "scale matrix must be symmetric positive definite".to_string(),
-                    ));
-                }
-            }
-            chol_ref.to_vec()
-        } else {
-            cholesky_decompose(cov.covariance())?
-        };
+        let chol_v = covariance_cholesky(cov, "scale matrix must be symmetric positive definite")?;
 
         let ln_det_v = 2.0 * (0..p).map(|i| chol_v[i][i].ln()).sum::<f64>();
         Ok(Self {
@@ -11184,16 +11139,14 @@ impl MatrixT {
                 col_spread.dim()
             )));
         }
-        let chol_u = if let Some(c) = row_spread.cholesky_factor() {
-            c.to_vec()
-        } else {
-            cholesky_decompose(row_spread.covariance())?
-        };
-        let chol_v = if let Some(c) = col_spread.cholesky_factor() {
-            c.to_vec()
-        } else {
-            cholesky_decompose(col_spread.covariance())?
-        };
+        let chol_u = covariance_cholesky(
+            row_spread,
+            "covariance matrix must be symmetric positive definite",
+        )?;
+        let chol_v = covariance_cholesky(
+            col_spread,
+            "covariance matrix must be symmetric positive definite",
+        )?;
         let ln_det_u = 2.0 * (0..m).map(|i| chol_u[i][i].ln()).sum::<f64>();
         let ln_det_v = 2.0 * (0..n).map(|i| chol_v[i][i].ln()).sum::<f64>();
         Ok(Self {
@@ -17657,6 +17610,28 @@ fn cholesky_decompose(matrix: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, StatsError> 
         }
     }
     Ok(lower)
+}
+
+/// The lower Cholesky factor of a positive-definite [`Covariance`]: the representation's own
+/// factor when it carries one, otherwise a factorization of its matrix.
+///
+/// gh#3: a carried factor is accepted when every diagonal entry is positive and finite, the
+/// same test `cholesky_decompose` applies, rather than above an absolute `1e-15`. That cutoff
+/// refused `Covariance::from_diagonal(&[1e-40])` although its variance is positive and the
+/// factor is exact, and a factor with a zero diagonal entry (a singular diagonal covariance)
+/// is refused instead of turning the log-determinant into `-inf`.
+fn covariance_cholesky(cov: &Covariance, message: &str) -> Result<Vec<Vec<f64>>, StatsError> {
+    let Some(factor) = cov.cholesky_factor() else {
+        return cholesky_decompose(cov.covariance());
+    };
+    let positive = factor
+        .iter()
+        .enumerate()
+        .all(|(i, row)| row.get(i).is_some_and(|&d| d > 0.0 && d.is_finite()));
+    if !positive {
+        return Err(StatsError::InvalidArgument(message.to_string()));
+    }
+    Ok(factor.to_vec())
 }
 
 fn solve_lower_triangular(lower: &[Vec<f64>], rhs: &[f64]) -> Result<Vec<f64>, StatsError> {
@@ -76724,6 +76699,77 @@ mod tests {
 
         // Rejection of empty mean
         assert!(MultivariateNormal::from_covariance(&[], &cov_diag).is_err());
+    }
+
+    #[test]
+    fn covariance_callers_accept_tiny_scales_and_refuse_singular_factors() {
+        // gh#3: the from_covariance constructors refused a carried Cholesky factor whose
+        // diagonal fell below an absolute 1e-15, so a positive covariance at a small scale was
+        // rejected, while MatrixNormal and MatrixT took a zero factor diagonal and returned a
+        // -inf log-determinant. Each constructor must agree with `new` on the same matrix.
+        let tiny = Covariance::from_diagonal(&[1e-40, 4e-40]).expect("positive variances");
+        let tiny_matrix = vec![vec![1e-40, 0.0], vec![0.0, 4e-40]];
+        let tiny_row = Covariance::from_diagonal(&[1e-40]).expect("positive variance");
+        let tiny_row_matrix = vec![vec![1e-40]];
+        let mean = [0.0, 0.0];
+        let x = [1e-20, -1e-20];
+        let x_matrix = vec![vec![2e-40, 0.0], vec![0.0, 3e-40]];
+        let m = vec![vec![0.0, 0.0]];
+        // A deviation on the scale of the row and column spreads' product, so that matrix t's
+        // `V + A` stays well conditioned.
+        let xm = vec![vec![1e-40, -2e-40]];
+        let same = |got: f64, want: f64, what: &str| {
+            assert!(want.is_finite(), "{what}: reference {want} is not finite");
+            assert_close(got, want, 1e-12 * want.abs().max(1.0), what);
+        };
+
+        let mvn = MultivariateNormal::from_covariance(&mean, &tiny).expect("mvn tiny scale");
+        let mvn_raw = MultivariateNormal::new(&mean, &tiny_matrix).expect("mvn raw");
+        same(mvn.logpdf(&x).unwrap(), mvn_raw.logpdf(&x).unwrap(), "mvn");
+        let mvt = MultivariateT::from_covariance(&mean, &tiny, 5.0).expect("mvt tiny scale");
+        let mvt_raw = MultivariateT::new(&mean, &tiny_matrix, 5.0).expect("mvt raw");
+        same(mvt.logpdf(&x).unwrap(), mvt_raw.logpdf(&x).unwrap(), "mvt");
+        let w = Wishart::from_covariance(5.0, &tiny).expect("wishart tiny scale");
+        let w_raw = Wishart::new(5.0, &tiny_matrix).expect("wishart raw");
+        same(
+            w.logpdf(&x_matrix).unwrap(),
+            w_raw.logpdf(&x_matrix).unwrap(),
+            "wishart",
+        );
+        let iw = InvWishart::from_covariance(5.0, &tiny).expect("invwishart tiny scale");
+        let iw_raw = InvWishart::new(5.0, &tiny_matrix).expect("invwishart raw");
+        same(
+            iw.logpdf(&x_matrix).unwrap(),
+            iw_raw.logpdf(&x_matrix).unwrap(),
+            "invwishart",
+        );
+        let mn = MatrixNormal::from_covariance(&m, &tiny_row, &tiny).expect("matrix normal");
+        let mn_raw = MatrixNormal::new(&m, &tiny_row_matrix, &tiny_matrix).expect("mn raw");
+        same(
+            mn.logpdf(&xm).unwrap(),
+            mn_raw.logpdf(&xm).unwrap(),
+            "matrix normal",
+        );
+        let mt = MatrixT::from_covariance(&m, &tiny_row, &tiny, 5.0).expect("matrix t");
+        let mt_raw = MatrixT::new(&m, &tiny_row_matrix, &tiny_matrix, 5.0).expect("mt raw");
+        same(
+            mt.logpdf(&xm).unwrap(),
+            mt_raw.logpdf(&xm).unwrap(),
+            "matrix t",
+        );
+
+        // A singular diagonal covariance carries a factor with a zero diagonal entry. These
+        // densities need a positive-definite matrix, as `new` does for the same matrix.
+        let singular = Covariance::from_diagonal(&[1.0, 0.0]).expect("nonnegative variances");
+        let unit_row = Covariance::from_diagonal(&[1.0]).expect("unit variance");
+        assert!(MultivariateNormal::from_covariance(&mean, &singular).is_err());
+        assert!(MultivariateT::from_covariance(&mean, &singular, 5.0).is_err());
+        assert!(Wishart::from_covariance(5.0, &singular).is_err());
+        assert!(InvWishart::from_covariance(5.0, &singular).is_err());
+        assert!(MatrixNormal::from_covariance(&m, &unit_row, &singular).is_err());
+        assert!(MatrixT::from_covariance(&m, &unit_row, &singular, 5.0).is_err());
+        let singular_matrix = vec![vec![1.0, 0.0], vec![0.0, 0.0]];
+        assert!(MatrixNormal::new(&m, &[vec![1.0]], &singular_matrix).is_err());
     }
 
     #[test]
