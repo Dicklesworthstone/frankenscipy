@@ -8,6 +8,8 @@
 //! callback list. Only roots encountered before termination may be reported, and a terminal
 //! root must not be appended to a user-specified output grid. A second grid includes times
 //! one ULP on either side of termination and samples very near the initial time.
+//! Short-step cases cross the same events within 4e-13 time units: an absolute
+//! root tolerance of 1e-12 would accept a non-root endpoint and truncate the wrong grid.
 //!
 //! SciPy's contracts: `scipy.integrate.solve_ivp` and `scipy.integrate.OdeSolution` in the
 //! version reported by the shared oracle resolver. Dense arrays are transposed from SciPy's
@@ -38,6 +40,7 @@ struct Case {
     name: String,
     method: String,
     terminal: bool,
+    short_step: bool,
     backward: bool,
     t_span: [f64; 2],
     y0: Vec<f64>,
@@ -76,6 +79,7 @@ fn cases() -> Vec<Case> {
                 name: format!("{method}_harmonic_{direction}"),
                 method: method.to_string(),
                 terminal: false,
+                short_step: false,
                 backward,
                 t_span: [t0, 3.0 - t0],
                 y0: vec![t0.cos(), -t0.sin()],
@@ -114,6 +118,7 @@ fn cases() -> Vec<Case> {
                     name: format!("{method}_terminal_{direction}_{grid}"),
                     method: method.to_string(),
                     terminal: true,
+                    short_step: false,
                     backward,
                     t_span: if backward { [1.0, 0.0] } else { [0.0, 1.0] },
                     y0: vec![if backward { 1.0 } else { 0.0 }],
@@ -130,6 +135,27 @@ fn cases() -> Vec<Case> {
                     max_step: 1.0,
                 });
             }
+            cases.push(Case {
+                name: format!("{method}_terminal_{direction}_short_step"),
+                method: method.to_string(),
+                terminal: true,
+                short_step: true,
+                backward,
+                t_span: if backward {
+                    [4.0e-13, 0.0]
+                } else {
+                    [0.0, 4.0e-13]
+                },
+                y0: vec![if backward { 4.0e-13 } else { 0.0 }],
+                t_eval: if backward {
+                    vec![4.0e-13, 3.0e-13, 1.0e-13, 0.0]
+                } else {
+                    vec![0.0, 1.0e-13, 3.0e-13, 4.0e-13]
+                },
+                queries: vec![1.0e-13, 2.0e-13, 3.0e-13, 1.0e-13],
+                first_step: Some(4.0e-13),
+                max_step: 4.0e-13,
+            });
         }
     }
     cases
@@ -146,18 +172,19 @@ except ImportError as exc:
     sys.exit(0)
 
 def low(t, y):
-    return t - 0.2
+    return t - 0.2 * event_scale
 
 def terminal(t, y):
-    return t - 0.5
+    return t - 0.5 * event_scale
 
 def high(t, y):
-    return t - 0.8
+    return t - 0.8 * event_scale
 
 answers = []
 for c in json.load(sys.stdin):
     events = None
     if c["terminal"]:
+        event_scale = max(c["t_span"])
         for event in (low, terminal, high):
             event.direction = -1.0 if c["backward"] else 1.0
         terminal.terminal = True
@@ -239,10 +266,20 @@ fn method_of(name: &str) -> SolverKind {
     }
 }
 
-fn events(backward: bool) -> Vec<EventSpec> {
-    let low = EventSpec::new(|t, _| t - 0.2);
-    let terminal = EventSpec::terminal(|t, _| t - 0.5);
-    let high = EventSpec::new(|t, _| t - 0.8);
+fn events(backward: bool, short_step: bool) -> Vec<EventSpec> {
+    let (low, terminal, high) = if short_step {
+        (
+            EventSpec::new(|t, _| t - 0.2 * 4.0e-13),
+            EventSpec::terminal(|t, _| t - 0.5 * 4.0e-13),
+            EventSpec::new(|t, _| t - 0.8 * 4.0e-13),
+        )
+    } else {
+        (
+            EventSpec::new(|t, _| t - 0.2),
+            EventSpec::terminal(|t, _| t - 0.5),
+            EventSpec::new(|t, _| t - 0.8),
+        )
+    };
     let ordered = if backward {
         [low, terminal, high]
     } else {
@@ -285,7 +322,12 @@ fn compare_states(
             actual.iter().zip(reference).zip(&exact).enumerate()
         {
             let (oracle_tol, exact_tol) = if case.terminal {
-                (EVENT_ABS_TOL, EVENT_ABS_TOL)
+                let tol = if case.short_step {
+                    EVENT_ABS_TOL.min(4.0 * f64::EPSILON)
+                } else {
+                    EVENT_ABS_TOL
+                };
+                (tol, tol)
             } else {
                 (
                     SCIPY_SCALE_FACTOR * (ATOL + RTOL * reference.abs()),
@@ -313,7 +355,7 @@ fn diff_integrate_solve_ivp_dense_events() {
     let Some(answers) = scipy_answers(&cases) else {
         return;
     };
-    assert_eq!(cases.len(), 36);
+    assert_eq!(cases.len(), 48);
     assert_eq!(
         answers.len(),
         cases.len(),
@@ -336,7 +378,9 @@ fn diff_integrate_solve_ivp_dense_events() {
             method: method_of(&case.method),
             t_eval: Some(&case.t_eval),
             dense_output: true,
-            events: case.terminal.then(|| events(case.backward)),
+            events: case
+                .terminal
+                .then(|| events(case.backward, case.short_step)),
             rtol: RTOL,
             atol: ToleranceValue::Scalar(ATOL),
             first_step: case.first_step,
@@ -352,6 +396,11 @@ fn diff_integrate_solve_ivp_dense_events() {
             }
         };
         let mut problems = Vec::new();
+        let event_tol = if case.short_step {
+            EVENT_ABS_TOL.min(4.0 * f64::EPSILON)
+        } else {
+            EVENT_ABS_TOL
+        };
         if !result.success || result.status != answer.status {
             problems.push(format!("status {}/{}", result.status, answer.status));
         }
@@ -394,12 +443,16 @@ fn diff_integrate_solve_ivp_dense_events() {
                 if !matches!(solution.evaluate_many(&[]), Ok(empty) if empty.is_empty()) {
                     problems.push("empty query batch did not return an empty result".to_string());
                 }
-                let terminal_time = if case.terminal { 0.5 } else { case.t_span[1] };
+                let terminal_time = if case.terminal {
+                    0.5 * case.t_span[0].max(case.t_span[1])
+                } else {
+                    case.t_span[1]
+                };
                 if solution.knots.first().copied() != Some(case.t_span[0])
                     || solution
                         .knots
                         .last()
-                        .is_none_or(|end| (end - terminal_time).abs() > EVENT_ABS_TOL)
+                        .is_none_or(|end| (end - terminal_time).abs() > event_tol)
                 {
                     problems.push(format!("dense knot endpoints: {:?}", solution.knots));
                 }
@@ -425,7 +478,7 @@ fn diff_integrate_solve_ivp_dense_events() {
                             .iter()
                             .zip(&reference[i])
                             .any(|(actual, expected)| {
-                                !actual.is_finite() || (actual - expected).abs() > EVENT_ABS_TOL
+                                !actual.is_finite() || (actual - expected).abs() > event_tol
                             })
                     {
                         problems.push(format!("event {i}: {:?} vs {:?}", times[i], reference[i]));
@@ -460,6 +513,6 @@ fn diff_integrate_solve_ivp_dense_events() {
     let counts = ledger.finish(6);
     assert_eq!(
         counts.values().map(|arm| arm.compared_cases).sum::<usize>(),
-        36
+        48
     );
 }

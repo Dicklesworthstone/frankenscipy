@@ -604,8 +604,13 @@ fn solve_event_equation(
         }
     };
 
+    // Event location has its own accuracy contract, independent of the ODE
+    // tolerances. SciPy refines with four machine epsilons in both terms.
+    // A fixed 1e-12 absolute tolerance can accept a non-root step endpoint
+    // immediately, stopping a short integration before the event occurs.
     let options = RootOptions {
-        xtol: 1e-12,
+        xtol: 4.0 * f64::EPSILON,
+        rtol: 4.0 * f64::EPSILON,
         maxiter: 100,
         ..Default::default()
     };
@@ -2614,6 +2619,74 @@ where
 mod tests {
     use super::*;
     use fsci_runtime::AuditAction;
+
+    #[test]
+    fn solve_ivp_event_refinement_preserves_short_step_roots_and_output_grid() {
+        let methods = [
+            SolverKind::Rk23,
+            SolverKind::Rk45,
+            SolverKind::Dop853,
+            SolverKind::Radau,
+            SolverKind::Bdf,
+            SolverKind::Lsoda,
+        ];
+        for method in methods {
+            for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+                for backward in [false, true] {
+                    let (t0, tf, grid) = if backward {
+                        (4.0e-13, 0.0, [4.0e-13, 3.0e-13, 1.0e-13, 0.0])
+                    } else {
+                        (0.0, 4.0e-13, [0.0, 1.0e-13, 3.0e-13, 4.0e-13])
+                    };
+                    let y0 = [t0];
+                    let result = solve_ivp(
+                        &mut |_t, _y| vec![1.0],
+                        &SolveIvpOptions {
+                            t_span: (t0, tf),
+                            y0: &y0,
+                            method,
+                            mode,
+                            t_eval: Some(&grid),
+                            dense_output: true,
+                            events: Some(vec![
+                                EventSpec::terminal(|t, _| t - 2.0e-13)
+                                    .with_direction(if backward { -1.0 } else { 1.0 }),
+                            ]),
+                            first_step: Some(4.0e-13),
+                            max_step: 4.0e-13,
+                            rtol: 1.0e-9,
+                            atol: ToleranceValue::Scalar(1.0e-11),
+                            ..SolveIvpOptions::default()
+                        },
+                    )
+                    .expect("a finite constant-derivative problem must integrate");
+                    assert!(result.success, "{method:?} {mode:?} backward={backward}");
+                    assert_eq!(result.status, 1);
+                    assert_eq!(result.t.as_slice(), &grid[..2]);
+                    let times = result.t_events.as_ref().unwrap();
+                    assert_eq!(times.len(), 1);
+                    assert_eq!(times[0].len(), 1);
+                    let root = times[0][0];
+                    assert!(
+                        root > 0.0 && root < 4.0e-13,
+                        "a non-root endpoint was accepted: {method:?} {root:e}"
+                    );
+                    assert!((root - 2.0e-13).abs() <= 4.0 * f64::EPSILON);
+                    let states = result.y_events.as_ref().unwrap();
+                    assert_eq!(states[0].len(), 1);
+                    assert!((states[0][0][0] - root).abs() <= 1.0e-25);
+                    for (&time, state) in result.t.iter().zip(&result.y) {
+                        assert!((state[0] - time).abs() <= 1.0e-25);
+                    }
+                    let solution = result.sol.as_ref().unwrap();
+                    assert_eq!(solution.knots.first(), Some(&t0));
+                    assert_eq!(solution.knots.last(), Some(&root));
+                    let sampled = solution.evaluate(grid[1]).unwrap();
+                    assert!((sampled[0] - grid[1]).abs() <= 1.0e-25);
+                }
+            }
+        }
+    }
 
     /// A trial step whose right-hand side goes NaN is rejected and shrunk, not a failure.
     /// SciPy 1.17.1 `solve_ivp(f, (0, 1.9), y0, method=..., first_step=0.9)`, default tolerances:

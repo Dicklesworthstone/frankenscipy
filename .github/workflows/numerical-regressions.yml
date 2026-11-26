@@ -21,6 +21,7 @@ on:
       - "crates/fsci-conformance/python_oracle/scipy_fft_oracle.py"
       - "crates/fsci-conformance/tests/diff_stats_truncnorm.rs"
       - "crates/fsci-conformance/tests/diff_integrate.rs"
+      - "crates/fsci-conformance/tests/diff_integrate_solve_ivp_dense_events.rs"
       - "crates/fsci-conformance/tests/diff_integrate_monte_carlo_qmc_quad.rs"
       - "crates/fsci-conformance/tests/diff_linalg_matrix_functions.rs"
       - "crates/fsci-conformance/tests/diff_opt_curve_fit.rs"
@@ -118,6 +119,8 @@ jobs:
               cargo test --locked -p fsci-conformance --no-default-features --test diff_integrate diff_integrate_tanhsinh -- --nocapture
               ;;
             boundary-value)
+              cargo test --locked -p fsci-integrate --lib solve_ivp_event_refinement -- --nocapture
+              cargo test --locked -p fsci-conformance --no-default-features --test diff_integrate_solve_ivp_dense_events -- --nocapture
               cargo test --locked -p fsci-integrate --lib bvp -- --nocapture
               cargo test --locked -p fsci-integrate --lib collocation::tests -- --nocapture
               cargo test --locked -p fsci-conformance --no-default-features --test diff_integrate_solve_bvp_collocation -- --nocapture
