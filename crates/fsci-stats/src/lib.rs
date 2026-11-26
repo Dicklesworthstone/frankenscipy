@@ -29414,7 +29414,7 @@ impl ContinuousDistribution for KsTwoBign {
 /// Support is SciPy's `[1/(2n), 1]`. `cdf`, `sf`, `pdf`, `ppf` and `isf` follow SciPy's
 /// `kolmogn`, `kolmognp` and `kolmogni` branch for branch; the upper tail `sf` stays
 /// accurate where `1 − cdf` would cancel to 0. `mean` integrates `1 − cdf` and `var` the
-/// central moment about the mean, on the same panels (see
+/// central moment about the mean, on the same panels or finer ones (see
 /// [`Kstwo::mean`]). frankenscipy-1ksfv.16
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Kstwo {
@@ -49140,12 +49140,21 @@ fn kstwo_moment_cuts(n: usize, extra: &[f64]) -> Vec<f64> {
 /// E[(D_n − c)²] of the law whose CDF `kolmogn` reports, as the sum of two non-negative
 /// integrals: ∫ 2(c − x)·cdf(x) dx over [1/2n, c] and ∫ 2(x − c)·(1 − cdf(x)) dx over
 /// [c, √(40/n)]. The panels are those of [`kstwo_raw_moments_12`] plus c, where the integrand
-/// has a kink.
+/// has a kink, and for n ≤ 20 also every knot k/2n.
 ///
 /// With c = E[D_n] + δ this is Var[D_n] + δ², so the mean's error enters only at second
 /// order, and the two parts add without cancelling. E[D_n²] − E[D_n]² subtracts two numbers
 /// 12 (large n) to 28 (n = 1) times the variance, so their last-bit errors reach it scaled up
 /// by that factor: at n = 1, a mean 1 ulp above 3/4 put it 53 ulps (8.8e-15) below 1/48.
+///
+/// Between knots the CDF is a polynomial of degree ≤ n, so for n ≤ 20 each knot panel's
+/// integrand has degree ≤ 21, which the 15-point Kronrod rule integrates exactly (degree 22).
+/// Panels that straddle knots have kinks inside, and quad_vec's error estimate does not see
+/// what they cost: without the knot edges var was 151 and 982 ulps from exact at n = 10 and
+/// 20, and a 4x to 5x smaller epsabs moved it by at most 1 ulp. With them it is within 34
+/// ulps of exact at n = 1, 2, 3, 5, 10 and 20, in fewer evaluations. Above 20 the knots
+/// (about 12.6·√n of them) cost more than they gain: 5x the evaluations at n = 50, where var
+/// ends up further from exact (95 ulps against 25), and about as far at n = 100.
 fn kstwo_central_moment_2(n: usize, c: f64) -> f64 {
     let integrand = |x: f64| {
         let lower = kolmogn(n, x, true);
@@ -49155,8 +49164,17 @@ fn kstwo_central_moment_2(n: usize, c: f64) -> f64 {
             2.0 * (x - c) * (1.0 - lower)
         }]
     };
+    let mut extra = vec![c];
+    if n <= 20 {
+        let two_n = (2 * n) as f64;
+        extra.extend((1..2 * n).map(|k| k as f64 / two_n));
+    }
+    let mut edges = kstwo_moment_cuts(n, &extra);
+    // A cut and a knot can be one point rounded two ways, such as 1 − 1/n and (2n − 2)/2n.
+    // Keep one of them: the panel between the two would have no interior node.
+    edges.dedup_by(|later, kept| *later - *kept <= 1e-12 * *later);
     let mut central = 0.0;
-    for w in kstwo_moment_cuts(n, &[c]).windows(2) {
+    for w in edges.windows(2) {
         // The raw moments' rule and panel tolerance; quad_vec cannot fail here either.
         let options = fsci_integrate::QuadOptions {
             epsabs: 1e-15 * (w[1] - w[0]),
