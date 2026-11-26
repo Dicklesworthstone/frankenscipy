@@ -1651,6 +1651,8 @@ impl From<OdeSolverAction> for SolverKind {
 ///    intermediates starting at concentration zero in Robertson kinetics),
 ///    $\delta_j = \text{clamp}(|f_{0,j}| \min(\Delta t, 1) \cdot 10^{-3},\; \sqrt{\varepsilon_{\text{mach}}},\; 10^{-3})$
 ///    samples the Jacobian along the initial transient tangent.
+///    Each quotient uses the actual representable increment; if the forward
+///    perturbation would overflow, the same-sized backward perturbation is used.
 /// 2. Estimates the spectral radius $\rho(J) = \max_i |\lambda_i(J)|$ via $\le 20$ power iterations
 ///    $v_{k+1} = J v_k / \|J v_k\|_2$ starting from a deterministic unit vector.
 /// 3. Computes the dimensionless horizon stiffness indicator:
@@ -1712,6 +1714,28 @@ fn stiffness_probe_norm(values: impl Iterator<Item = f64> + Clone) -> f64 {
         squared.sqrt()
     } else {
         values.fold(0.0, f64::hypot)
+    }
+}
+
+/// Divide a difference of finite RHS samples without first overflowing their
+/// subtraction. An unrepresentable derivative cannot certify a nonstiff system.
+fn stiffness_probe_difference(
+    perturbed: f64,
+    base: f64,
+    delta: f64,
+) -> Result<f64, IntegrateValidationError> {
+    let difference = perturbed - base;
+    let derivative = if difference.is_finite() {
+        difference / delta
+    } else {
+        // If the unscaled difference overflows, a finite quotient requires
+        // |delta| > 1, so halving the denominator cannot underflow here.
+        (0.5 * perturbed - 0.5 * base) / (0.5 * delta)
+    };
+    if derivative.is_finite() {
+        Ok(derivative)
+    } else {
+        Err(IntegrateValidationError::NonFiniteJacobian)
     }
 }
 
@@ -1813,11 +1837,9 @@ where
     } else {
         let f0 = fun(t0, options.y0);
         evaluations.nfev += 1;
-        if f0.len() != n || f0.iter().any(|v| !v.is_finite()) {
-            return Ok(OdeStiffnessProbe {
-                probe_nfev: evaluations.nfev,
-                ..OdeStiffnessProbe::default()
-            });
+        crate::validation::validate_rhs_shape(f0.len(), n)?;
+        if f0.iter().any(|v| !v.is_finite()) {
+            return Err(IntegrateValidationError::NonFiniteF0);
         }
         f0
     };
@@ -1837,21 +1859,27 @@ where
             .collect::<Vec<_>>()
     });
     let mut col_norms = vec![0.0_f64; n];
-    let mut probe_nfev = evaluations.nfev;
 
-    let deltas: Vec<f64> = options
+    let perturbations: Vec<(f64, f64)> = options
         .y0
         .iter()
         .zip(&f0)
         .map(|(&y, &f)| {
             let y_abs = y.abs();
-            if y_abs > 0.0 {
+            let requested = if y_abs > 0.0 {
                 sqrt_eps * y_abs.max(1.0)
             } else if f.abs() > 0.0 {
                 (f.abs() * span.min(1.0) * 1.0e-3).clamp(sqrt_eps, 1.0e-3)
             } else {
                 sqrt_eps
-            }
+            };
+            let forward = y + requested;
+            let perturbed = if forward.is_finite() {
+                forward
+            } else {
+                y - requested
+            };
+            (perturbed, perturbed - y)
         })
         .collect();
 
@@ -1873,50 +1901,38 @@ where
     } else if let (Some(pattern), Some(columns)) = (pattern, sparse_jac.as_mut()) {
         for group in pattern.column_groups() {
             for &j in group {
-                y_pert[j] = options.y0[j] + deltas[j];
+                y_pert[j] = perturbations[j].0;
             }
             let f_pert = fun(t0, &y_pert);
-            probe_nfev += 1;
+            evaluations.nfev += 1;
             for &j in group {
                 y_pert[j] = options.y0[j];
             }
-            if f_pert.len() != n {
-                return Ok(OdeStiffnessProbe {
-                    probe_nfev,
-                    ..OdeStiffnessProbe::default()
-                });
+            crate::validation::validate_rhs_shape(f_pert.len(), n)?;
+            if f_pert.iter().any(|value| !value.is_finite()) {
+                return Err(IntegrateValidationError::NonFiniteJacobian);
             }
             for &j in group {
-                let mut col_sq = 0.0_f64;
                 for (&i, value) in pattern.column_rows[j].iter().zip(&mut columns[j]) {
-                    let df = f_pert[i] - f0[i];
-                    let val = if df.is_finite() { df / deltas[j] } else { 0.0 };
-                    *value = val;
-                    col_sq += val * val;
+                    *value = stiffness_probe_difference(f_pert[i], f0[i], perturbations[j].1)?;
                 }
-                col_norms[j] = col_sq.sqrt();
+                col_norms[j] = stiffness_probe_norm(columns[j].iter().copied());
             }
         }
     } else {
-        for (j, &delta_j) in deltas.iter().enumerate() {
-            y_pert[j] = options.y0[j] + delta_j;
+        for (j, &(perturbed, delta_j)) in perturbations.iter().enumerate() {
+            y_pert[j] = perturbed;
             let f_pert = fun(t0, &y_pert);
-            probe_nfev += 1;
+            evaluations.nfev += 1;
             y_pert[j] = options.y0[j];
-            if f_pert.len() != n {
-                return Ok(OdeStiffnessProbe {
-                    probe_nfev,
-                    ..OdeStiffnessProbe::default()
-                });
+            crate::validation::validate_rhs_shape(f_pert.len(), n)?;
+            if f_pert.iter().any(|value| !value.is_finite()) {
+                return Err(IntegrateValidationError::NonFiniteJacobian);
             }
-            let mut col_sq = 0.0_f64;
             for i in 0..n {
-                let df = f_pert[i] - f0[i];
-                let val = if df.is_finite() { df / delta_j } else { 0.0 };
-                jac[i * n + j] = val;
-                col_sq += val * val;
+                jac[i * n + j] = stiffness_probe_difference(f_pert[i], f0[i], delta_j)?;
             }
-            col_norms[j] = col_sq.sqrt();
+            col_norms[j] = stiffness_probe_norm((0..n).map(|i| jac[i * n + j]));
         }
     }
 
@@ -2035,7 +2051,7 @@ where
         stiffness_indicator,
         step_bound_ratio,
         stiffness_ratio_estimate,
-        probe_nfev,
+        probe_nfev: evaluations.nfev,
         probe_njev: evaluations.njev,
     })
 }
@@ -5399,6 +5415,224 @@ mod tests {
             "Radau vdp final = [{}, {}], want ~[1.939359, -0.070082]",
             vdp.y[last][0],
             vdp.y[last][1]
+        );
+    }
+
+    #[test]
+    fn casp_numerical_probe_preserves_overflowing_rhs_differences() {
+        let base = 2.0_f64.powi(1000);
+        let offset = 2.0_f64.powi(1022);
+        let half_rate = 2.0_f64.powi(49);
+        let pattern = crate::JacobianSparsity::from_rows(&[vec![0]]).unwrap();
+        for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+            for jac_sparsity in [None, Some(&pattern)] {
+                let mut samples = Vec::new();
+                let probe = probe_ode_stiffness(
+                    &mut |_t, y| {
+                        // Exact finite samples +2^1023 and -2^1023. Their
+                        // difference overflows, but the slope -2^50 does not.
+                        let value = 2.0 * (offset - half_rate * (y[0] - base));
+                        assert!(value.is_finite());
+                        samples.push(value);
+                        vec![value]
+                    },
+                    &SolveIvpOptions {
+                        t_span: (0.0, 1.0),
+                        y0: &[base],
+                        jac_sparsity,
+                        mode,
+                        ..SolveIvpOptions::default()
+                    },
+                );
+                assert_eq!(samples, [2.0_f64.powi(1023), -2.0_f64.powi(1023)]);
+                assert!(!(samples[1] - samples[0]).is_finite());
+                assert_eq!(probe.probe_nfev, 2);
+                assert_eq!(probe.spectral_radius, 2.0_f64.powi(50));
+                assert_eq!(probe.stiffness_ratio_estimate, 2.0_f64.powi(50));
+            }
+        }
+    }
+
+    #[test]
+    fn casp_numerical_probe_uses_actual_finite_perturbations() {
+        let pattern = crate::JacobianSparsity::from_rows(&[vec![0]]).unwrap();
+        for base in [1.1, -1.1, f64::MAX, -f64::MAX] {
+            for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+                for jac_sparsity in [None, Some(&pattern)] {
+                    let mut calls = 0;
+                    let probe = probe_ode_stiffness(
+                        &mut |_t, y| {
+                            calls += 1;
+                            assert!(y[0].is_finite(), "probe passed an infinite state");
+                            vec![y[0] - base]
+                        },
+                        &SolveIvpOptions {
+                            t_span: (0.0, 1.0),
+                            y0: &[base],
+                            jac_sparsity,
+                            mode,
+                            ..SolveIvpOptions::default()
+                        },
+                    );
+                    assert_eq!(calls, 2);
+                    assert_eq!(probe.probe_nfev, calls);
+                    assert_eq!(probe.spectral_radius, 1.0, "{base}: {probe:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn casp_numerical_probe_preserves_extreme_column_norms() {
+        let pattern = crate::JacobianSparsity::from_rows(&[vec![0], vec![1]]).unwrap();
+        for scale in [2.0_f64.powi(-1000), 2.0_f64.powi(-660), 2.0_f64.powi(660)] {
+            assert!(
+                scale * scale == 0.0 || !(scale * scale).is_finite(),
+                "fixture must exercise the scaled norm"
+            );
+            for jac_sparsity in [None, Some(&pattern)] {
+                let mut calls = 0;
+                let probe = probe_ode_stiffness(
+                    &mut |_t, y| {
+                        calls += 1;
+                        vec![-scale * y[0], -(scale / 16.0) * y[1]]
+                    },
+                    &SolveIvpOptions {
+                        t_span: (0.0, 1.0),
+                        y0: &[0.0, 0.0],
+                        jac_sparsity,
+                        ..SolveIvpOptions::default()
+                    },
+                );
+                assert_eq!(calls, if jac_sparsity.is_some() { 2 } else { 3 });
+                assert_eq!(probe.probe_nfev, calls);
+                assert!((probe.spectral_radius / scale - 1.0).abs() < 1e-12);
+                if scale > 1.0 {
+                    // An overflowing squared norm formerly erased the 16:1
+                    // column timescale separation from the CASP evidence.
+                    assert!((probe.stiffness_ratio_estimate / scale - 16.0).abs() < 1e-10);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn casp_numerical_probe_rejects_invalid_samples_and_audits_once() {
+        let pattern = crate::JacobianSparsity::from_rows(&[vec![0]]).unwrap();
+        for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+            for jac_sparsity in [None, Some(&pattern)] {
+                for (failure_call, value, error) in [
+                    (
+                        1,
+                        None,
+                        IntegrateValidationError::RhsWrongShape {
+                            expected: 1,
+                            actual: 0,
+                        },
+                    ),
+                    (1, Some(f64::NAN), IntegrateValidationError::NonFiniteF0),
+                    (
+                        2,
+                        None,
+                        IntegrateValidationError::RhsWrongShape {
+                            expected: 1,
+                            actual: 0,
+                        },
+                    ),
+                    (2, Some(f64::NAN), IntegrateValidationError::NonFiniteJacobian),
+                    (
+                        2,
+                        Some(f64::INFINITY),
+                        IntegrateValidationError::NonFiniteJacobian,
+                    ),
+                    // Finite samples can still have an unrepresentable quotient.
+                    (2, Some(f64::MAX), IntegrateValidationError::NonFiniteJacobian),
+                ] {
+                    let options = SolveIvpOptions {
+                        t_span: (0.0, 1.0),
+                        y0: &[0.0],
+                        jac_sparsity,
+                        mode,
+                        ..SolveIvpOptions::default()
+                    };
+                    let mut calls = 0;
+                    let skipped = probe_ode_stiffness(
+                        &mut |_t, _y| {
+                            calls += 1;
+                            if calls == failure_call {
+                                value.into_iter().collect()
+                            } else {
+                                vec![0.0]
+                            }
+                        },
+                        &options,
+                    );
+                    assert_eq!(calls, failure_call);
+                    assert_eq!(
+                        skipped,
+                        OdeStiffnessProbe {
+                            probe_nfev: calls,
+                            ..OdeStiffnessProbe::default()
+                        }
+                    );
+                    let ledger = crate::validation::sync_audit_ledger();
+                    let mut portfolio = OdeSolverPortfolio::new(mode, 4);
+                    let mut solve_calls = 0;
+                    let returned = solve_ivp_with_casp_portfolio_and_audit(
+                        &mut |_t, _y| {
+                            solve_calls += 1;
+                            assert!(solve_calls <= failure_call, "invalid probe reached a solver");
+                            if solve_calls == failure_call {
+                                value.into_iter().collect()
+                            } else {
+                                vec![0.0]
+                            }
+                        },
+                        &options,
+                        &mut portfolio,
+                        0.0,
+                        false,
+                        &ledger,
+                    )
+                    .unwrap_err();
+                    assert_eq!(returned, error);
+                    assert_eq!(solve_calls, failure_call);
+                    assert_eq!(portfolio.evidence_len(), 0);
+                    let guard = ledger.lock().unwrap();
+                    assert_eq!(guard.len(), 1);
+                    assert!(matches!(
+                        &guard.entries()[0].action,
+                        fsci_runtime::AuditAction::FailClosed { reason }
+                            if reason == error.reason_code()
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn casp_numerical_probe_checks_nonfinite_values_outside_sparsity_pattern() {
+        let pattern = crate::JacobianSparsity::from_rows(&[vec![0], vec![]]).unwrap();
+        let mut calls = 0;
+        let skipped = probe_ode_stiffness(
+            &mut |_t, _y| {
+                calls += 1;
+                vec![0.0, if calls == 1 { 0.0 } else { f64::NAN }]
+            },
+            &SolveIvpOptions {
+                t_span: (0.0, 1.0),
+                y0: &[0.0, 0.0],
+                jac_sparsity: Some(&pattern),
+                ..SolveIvpOptions::default()
+            },
+        );
+        assert_eq!(calls, 2);
+        assert_eq!(
+            skipped,
+            OdeStiffnessProbe {
+                probe_nfev: 2,
+                ..OdeStiffnessProbe::default()
+            }
         );
     }
 
