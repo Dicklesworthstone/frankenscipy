@@ -30,6 +30,10 @@
 //! C shares storage (Adams history columns 6-12 overlap the BDF matrix `wm`) is never read before
 //! it is written on either side of a method switch, so the split does not change a result.
 //!
+//! A non-finite RHS or state stops integration. ODEPACK's weighted maximum
+//! norm can skip a NaN component; accepting that step would report a successful
+//! solution containing NaN. Finite inputs retain the original step arithmetic.
+//!
 //! What is deliberately NOT ported, and why:
 //! - `itask` 2, 3 and 4 (only `odeint`'s 1 and `solve_ivp`'s 5 have callers).
 //! - `hmin`: SciPy 1.17.1's `lsoda()` reads `rwork[6]` into a local variable and never stores it
@@ -129,6 +133,9 @@ impl LsodaFailure {
             }
             Self::ZeroErrorWeight => "Error weight became zero during problem.",
             Self::Callback(StepFailure::RuntimeError(message)) => message,
+            Self::Callback(StepFailure::NonFiniteState) => {
+                "LSODA encountered a non-finite state or right-hand side."
+            }
             Self::Callback(_) => "The right-hand side or Jacobian callback failed.",
         }
     }
@@ -143,18 +150,32 @@ impl LsodaFailure {
 }
 
 const RHS_WRONG_SHAPE: &str = "The right-hand side returned an array of the wrong shape.";
+const NONFINITE_JACOBIAN: StepFailure =
+    StepFailure::InvalidJacobian(crate::IntegrateValidationError::NonFiniteJacobian);
 const JAC_WRONG_SHAPE: &str = "The Jacobian returned an array of the wrong shape.";
 
 /// Evaluate the right-hand side into `out` (the C `f(neq, t, y, out)` callback).
-fn eval<F>(f: &mut F, t: f64, y: &[f64], out: &mut [f64]) -> Result<(), LsodaFailure>
+fn eval<F>(
+    f: &mut F,
+    t: f64,
+    y: &[f64],
+    out: &mut [f64],
+    nonfinite: StepFailure,
+) -> Result<(), LsodaFailure>
 where
     F: FnMut(f64, &[f64]) -> Vec<f64>,
 {
+    if !t.is_finite() || y.iter().any(|v| !v.is_finite()) {
+        return Err(LsodaFailure::Callback(nonfinite));
+    }
     let value = f(t, y);
     if value.len() != out.len() {
         return Err(LsodaFailure::Callback(StepFailure::RuntimeError(
             RHS_WRONG_SHAPE,
         )));
+    }
+    if value.iter().any(|v| !v.is_finite()) {
+        return Err(LsodaFailure::Callback(nonfinite));
     }
     out.copy_from_slice(&value);
     Ok(())
@@ -832,6 +853,9 @@ impl Lsoda {
                 }
                 _ => {}
             }
+            if !self.tn.is_finite() || self.yh[..n].iter().any(|v| !v.is_finite()) {
+                return Err(LsodaFailure::Callback(StepFailure::NonFiniteState));
+            }
             // Block F: a successful step; complete a method switch on the next call.
             self.started = true;
             if self.meth != self.mused {
@@ -919,7 +943,7 @@ impl Lsoda {
         self.msbp = 20;
         self.mxncf = 10;
 
-        eval(f, t, y, &mut self.yh[n..2 * n])?;
+        eval(f, t, y, &mut self.yh[n..2 * n], StepFailure::NonFiniteState)?;
         self.nfe = 1;
         self.yh[..n].copy_from_slice(y);
         self.nq = 1;
@@ -1093,7 +1117,13 @@ impl Lsoda {
                     rh = (self.hmin / self.h.abs()).max(rh);
                     self.h *= rh;
                     self.y.copy_from_slice(&self.yh[..n]);
-                    eval(f, self.tn, &self.y, &mut self.savf)?;
+                    eval(
+                        f,
+                        self.tn,
+                        &self.y,
+                        &mut self.savf,
+                        StepFailure::NonFiniteState,
+                    )?;
                     self.nfe += 1;
                     for i in 0..n {
                         self.yh[i + n] = self.h * self.savf[i];
@@ -1467,7 +1497,13 @@ impl Lsoda {
         let mut del;
         let mut delp = 0.0_f64;
         self.y.copy_from_slice(&self.yh[..n]);
-        eval(f, self.tn, &self.y, &mut self.savf)?;
+        eval(
+            f,
+            self.tn,
+            &self.y,
+            &mut self.savf,
+            StepFailure::NonFiniteState,
+        )?;
         self.nfe += 1;
         if self.ipup > 0 {
             self.prja(f)?;
@@ -1539,7 +1575,13 @@ impl Lsoda {
                 return Ok(Corrector::Failed);
             }
             delp = del;
-            eval(f, self.tn, &self.y, &mut self.savf)?;
+            eval(
+                f,
+                self.tn,
+                &self.y,
+                &mut self.savf,
+                StepFailure::NonFiniteState,
+            )?;
             self.nfe += 1;
         }
         self.jcur = false;
@@ -1605,14 +1647,18 @@ impl Lsoda {
                     let r = (srur * yj.abs()).max(r0 / self.ewt[j]);
                     self.y[j] += r;
                     let fac = -hl0 / r;
-                    eval(f, self.tn, &self.y, &mut self.acor)?;
+                    let evaluated = eval(f, self.tn, &self.y, &mut self.acor, NONFINITE_JACOBIAN);
+                    self.y[j] = yj;
+                    evaluated?;
                     for i in 0..n {
                         self.wm[i + j * n] = (self.acor[i] - self.savf[i]) * fac;
                     }
-                    self.y[j] = yj;
                 }
                 self.nfe += n;
             }
+        }
+        if self.wm.iter().any(|v| !v.is_finite()) {
+            return Err(LsodaFailure::Callback(NONFINITE_JACOBIAN));
         }
         self.pdnorm = fnorm(n, &self.wm, &self.ewt) / hl0.abs();
         for i in 0..n {
@@ -1673,24 +1719,13 @@ impl Lsoda {
                     let increment = (srur * self.y[col].abs()).max(r0 / self.ewt[col]);
                     self.y[col] += increment;
                 }
-                if self.y.iter().any(|value| !value.is_finite()) {
-                    self.y.copy_from_slice(&self.yh[..n]);
-                    return Err(LsodaFailure::Callback(StepFailure::InvalidJacobian(
-                        crate::IntegrateValidationError::NonFiniteJacobian,
-                    )));
-                }
-                let evaluated = eval(f, self.tn, &self.y, &mut self.acor);
+                let evaluated = eval(f, self.tn, &self.y, &mut self.acor, NONFINITE_JACOBIAN);
                 // The predicted state is restored even if the callback fails.
                 for col in (group..n).step_by(width) {
                     self.y[col] = self.yh[col];
                 }
                 evaluated?;
                 self.nfe += 1;
-                if self.acor.iter().any(|value| !value.is_finite()) {
-                    return Err(LsodaFailure::Callback(StepFailure::InvalidJacobian(
-                        crate::IntegrateValidationError::NonFiniteJacobian,
-                    )));
-                }
                 for col in (group..n).step_by(width) {
                     let increment = (srur * self.y[col].abs()).max(r0 / self.ewt[col]);
                     let factor = -hl0 / increment;
@@ -1831,6 +1866,37 @@ mod tests {
         band_lu_solve(&tiny, &pivots, 2, 1, 0, &mut rhs);
         assert!((rhs[0] - 1.0).abs() < 1e-12);
         assert!((rhs[1] - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn nonfinite_difference_probes_report_jacobian_failure_and_restore_state() {
+        for bandwidth in [None, Some((0, 0))] {
+            let mut solver = Lsoda::new(
+                2,
+                LsodaSetup {
+                    rtol: vec![1e-6],
+                    atol: vec![1e-9],
+                    h0: 0.0,
+                    hmax: 0.0,
+                    mxstep: 500,
+                    jac: None,
+                    bandwidth,
+                },
+            );
+            solver.h = 0.25;
+            solver.el0 = 1.0;
+            solver.ewt.fill(1.0);
+            solver.y.fill(1.0);
+            solver.yh[..2].fill(1.0);
+            assert_eq!(
+                solver.prja(&mut |_, y| {
+                    assert_ne!(y, &[1.0, 1.0]);
+                    vec![1.0, f64::NAN]
+                }),
+                Err(LsodaFailure::Callback(NONFINITE_JACOBIAN))
+            );
+            assert_eq!(solver.y, vec![1.0, 1.0]);
+        }
     }
 
     #[test]
