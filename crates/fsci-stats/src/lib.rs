@@ -29413,7 +29413,8 @@ impl ContinuousDistribution for KsTwoBign {
 ///
 /// Support is SciPy's `[1/(2n), 1]`. `cdf`, `sf`, `pdf`, `ppf` and `isf` follow SciPy's
 /// `kolmogn`, `kolmognp` and `kolmogni` branch for branch; the upper tail `sf` stays
-/// accurate where `1 − cdf` would cancel to 0. `mean` and `var` integrate `1 − cdf` (see
+/// accurate where `1 − cdf` would cancel to 0. `mean` integrates `1 − cdf` and `var` the
+/// central moment about the mean, on the same panels (see
 /// [`Kstwo::mean`]). frankenscipy-1ksfv.16
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Kstwo {
@@ -29501,10 +29502,11 @@ impl ContinuousDistribution for Kstwo {
         kstwo_raw_moments_12(self.n).0
     }
 
-    /// E[D_n²] − E[D_n]², with E[D_n²] = ∫₀¹ 2x·(1 − cdf(x)) dx (see [`Kstwo::mean`]).
+    /// Var[D_n] = E[(D_n − μ)²] about μ = [`Kstwo::mean`], integrated as a central moment
+    /// (see [`kstwo_central_moment_2`]) rather than as E[D_n²] − μ², which cancels: one
+    /// integration more than [`Kstwo::mean`].
     fn var(&self) -> f64 {
-        let (m1, m2) = kstwo_raw_moments_12(self.n);
-        m2 - m1 * m1
+        kstwo_central_moment_2(self.n, self.mean())
     }
 }
 
@@ -49079,30 +49081,18 @@ fn kolmogni(n: usize, p: f64, q: f64, upper: bool) -> f64 {
 /// 2.2 ≤ n x² < 18 (Pelz–Good vs 2·smirnov), and SciPy's `kstwo.mean` integrates x·pdf with
 /// the pdf taken from the CDF. The 2·smirnov SF is also ~10^4 times dearer to evaluate at
 /// n = 10^5.
+///
+/// [`Kstwo::var`] uses only E[D_n] from here (see [`kstwo_central_moment_2`]); E[D_n²] stays
+/// in the integrand because quad_vec's shared error control over both components picks the
+/// panels, and so the bits of [`Kstwo::mean`].
 fn kstwo_raw_moments_12(n: usize) -> (f64, f64) {
-    let nf = n as f64;
-    let a = 0.5 / nf;
-    let hi = (40.0 / nf).sqrt().min(1.0);
-    let mut cuts = vec![
-        a,
-        hi,
-        1.0 / nf,
-        0.5,
-        1.0 - 1.0 / nf,
-        (0.754_693 / nf).sqrt(),
-        (4.0 / nf).sqrt(),
-        (18.0 / nf).sqrt(),
-        (1.4 / nf).powf(2.0 / 3.0),
-    ];
-    cuts.retain(|&c| c >= a && c <= hi);
-    cuts.sort_by(f64::total_cmp);
-    cuts.dedup();
+    let a = 0.5 / n as f64;
     let integrand = |x: f64| {
         let upper = 1.0 - kolmogn(n, x, true);
         vec![upper, 2.0 * x * upper]
     };
     let (mut m1, mut m2) = (a, a * a);
-    for w in cuts.windows(2) {
+    for w in kstwo_moment_cuts(n, &[]).windows(2) {
         // Global-panel GK15/G7 adaptive quadrature to 1e-15 of the panel width; valid finite
         // bounds and tolerances, so quad_vec cannot fail here.
         let options = fsci_integrate::QuadOptions {
@@ -49120,6 +49110,68 @@ fn kstwo_raw_moments_12(n: usize) -> (f64, f64) {
         m2 += i2;
     }
     (m1, m2)
+}
+
+/// The panel edges of the kstwo moment integrals: the support edge 1/2n, the truncation
+/// point √(40/n), the places where `kolmogn` switches formula (see
+/// [`kstwo_raw_moments_12`]) and `extra`, sorted, deduplicated and inside [1/2n, √(40/n)].
+fn kstwo_moment_cuts(n: usize, extra: &[f64]) -> Vec<f64> {
+    let nf = n as f64;
+    let a = 0.5 / nf;
+    let hi = (40.0 / nf).sqrt().min(1.0);
+    let mut cuts = vec![
+        a,
+        hi,
+        1.0 / nf,
+        0.5,
+        1.0 - 1.0 / nf,
+        (0.754_693 / nf).sqrt(),
+        (4.0 / nf).sqrt(),
+        (18.0 / nf).sqrt(),
+        (1.4 / nf).powf(2.0 / 3.0),
+    ];
+    cuts.extend_from_slice(extra);
+    cuts.retain(|&c| c >= a && c <= hi);
+    cuts.sort_by(f64::total_cmp);
+    cuts.dedup();
+    cuts
+}
+
+/// E[(D_n − c)²] of the law whose CDF `kolmogn` reports, as the sum of two non-negative
+/// integrals: ∫ 2(c − x)·cdf(x) dx over [1/2n, c] and ∫ 2(x − c)·(1 − cdf(x)) dx over
+/// [c, √(40/n)]. The panels are those of [`kstwo_raw_moments_12`] plus c, where the integrand
+/// has a kink.
+///
+/// With c = E[D_n] + δ this is Var[D_n] + δ², so the mean's error enters only at second
+/// order, and the two parts add without cancelling. E[D_n²] − E[D_n]² subtracts two numbers
+/// 12 (large n) to 28 (n = 1) times the variance, so their last-bit errors reach it scaled up
+/// by that factor: at n = 1, a mean 1 ulp above 3/4 put it 53 ulps (8.8e-15) below 1/48.
+fn kstwo_central_moment_2(n: usize, c: f64) -> f64 {
+    let integrand = |x: f64| {
+        let lower = kolmogn(n, x, true);
+        vec![if x < c {
+            2.0 * (c - x) * lower
+        } else {
+            2.0 * (x - c) * (1.0 - lower)
+        }]
+    };
+    let mut central = 0.0;
+    for w in kstwo_moment_cuts(n, &[c]).windows(2) {
+        // The raw moments' rule and panel tolerance; quad_vec cannot fail here either.
+        let options = fsci_integrate::QuadOptions {
+            epsabs: 1e-15 * (w[1] - w[0]),
+            epsrel: 0.0,
+            limit: 256,
+        };
+        let Ok(r) = fsci_integrate::quad_vec(integrand, w[0], w[1], options) else {
+            return f64::NAN;
+        };
+        let [part] = r.integral[..] else {
+            return f64::NAN;
+        };
+        central += part;
+    }
+    central
 }
 
 /// Pelz-Good theta-function approximation to the CDF P(D_n ≤ x). Port of
