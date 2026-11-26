@@ -29413,8 +29413,7 @@ impl ContinuousDistribution for KsTwoBign {
 ///
 /// Support is SciPy's `[1/(2n), 1]`. `cdf`, `sf`, `pdf`, `ppf` and `isf` follow SciPy's
 /// `kolmogn`, `kolmognp` and `kolmogni` branch for branch; the upper tail `sf` stays
-/// accurate where `1 − cdf` would cancel to 0. `mean` integrates `1 − cdf` and `var` the
-/// central moment about the mean, on the same panels or finer ones (see
+/// accurate where `1 − cdf` would cancel to 0. `mean` and `var` (n ≥ 3) integrate `1 − cdf` (see
 /// [`Kstwo::mean`]). frankenscipy-1ksfv.16
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Kstwo {
@@ -29499,14 +29498,20 @@ impl ContinuousDistribution for Kstwo {
     /// 0.3583385977550 where the exact mean is 0.358338666…. The integral of 1 − cdf agrees
     /// with exact (mpmath) moments to 1e-14.
     fn mean(&self) -> f64 {
-        kstwo_raw_moments_12(self.n).0
+        kstwo_raw_moments_12(self.n, false).0
     }
 
-    /// Var[D_n] = E[(D_n − μ)²] about μ = [`Kstwo::mean`], integrated as a central moment
-    /// (see [`kstwo_central_moment_2`]) rather than as E[D_n²] − μ², which cancels: one
-    /// integration more than [`Kstwo::mean`].
+    /// Var[D_n]: the f64 nearest the exact value for n = 1 and 2, else by integration (see
+    /// [`kstwo_var_integrated`]).
     fn var(&self) -> f64 {
-        kstwo_central_moment_2(self.n, self.mean())
+        match self.n {
+            // D_1 = max(U, 1 − U) is uniform on [1/2, 1], so Var = (1/2)²/12 = 1/48.
+            1 => 1.0 / 48.0,
+            // The n = 2 CDF is (4x − 1)²/2 on [1/4, 1/2] and 1 − 2(1 − x)² on [1/2, 1]
+            // (Ruben–Gambino), so E[D_2] = 13/24, E[D_2²] = 61/192 and Var = 7/288.
+            2 => 7.0 / 288.0,
+            n => kstwo_var_integrated(n),
+        }
     }
 }
 
@@ -49074,25 +49079,45 @@ fn kolmogni(n: usize, p: f64, q: f64, upper: bool) -> f64 {
 /// Adaptive Gauss–Kronrod between the places where `kolmogn` switches formula (the
 /// Ruben–Gambino edges, 1/2, n·x² = 0.754693, 4, 18 and n·x^1.5 = 1.4), truncated at
 /// √(40/n): past it Massart's P(D_n ≥ x) ≤ 2 e^(-2n x²) bounds the dropped mass by 4e-35.
-/// The CDF's knots at the multiples of 1/2n need no breakpoints: adding every one of them
-/// moved no mean or variance for n ≤ 140 by more than 5.9e-14 (relative) and cost 6×.
+/// The CDF's knots at the multiples of 1/2n are not breakpoints for [`Kstwo::mean`]. With
+/// `knots`, those inside (1/n, 1 − 1/n) are, as [`kstwo_var_integrated`] uses them: for
+/// n ≤ 140 they move the mean by up to 2.7e-12 (relative, n = 15) and the variance by up to
+/// 5.0e-12 (n = 40), and for n ≤ 21 they put the mean within 4.2 ulps of exact.
 ///
 /// 1 - cdf rather than sf: for n > 140 the two are different approximations on
 /// 2.2 ≤ n x² < 18 (Pelz–Good vs 2·smirnov), and SciPy's `kstwo.mean` integrates x·pdf with
 /// the pdf taken from the CDF. The 2·smirnov SF is also ~10^4 times dearer to evaluate at
 /// n = 10^5.
-///
-/// [`Kstwo::var`] uses only E[D_n] from here (see [`kstwo_central_moment_2`]); E[D_n²] stays
-/// in the integrand because quad_vec's shared error control over both components picks the
-/// panels, and so the bits of [`Kstwo::mean`].
-fn kstwo_raw_moments_12(n: usize) -> (f64, f64) {
-    let a = 0.5 / n as f64;
+fn kstwo_raw_moments_12(n: usize, knots: bool) -> (f64, f64) {
+    let nf = n as f64;
+    let a = 0.5 / nf;
+    let hi = (40.0 / nf).sqrt().min(1.0);
+    let mut cuts = vec![
+        a,
+        hi,
+        1.0 / nf,
+        0.5,
+        1.0 - 1.0 / nf,
+        (0.754_693 / nf).sqrt(),
+        (4.0 / nf).sqrt(),
+        (18.0 / nf).sqrt(),
+        (1.4 / nf).powf(2.0 / 3.0),
+    ];
+    if knots {
+        // The knots that are cuts too (1/2 always, √(4/n) at n = 9 and 16) round to the
+        // same f64, which `dedup` drops; no other knot comes within 0.1% of a cut.
+        let two_n = (2 * n) as f64;
+        cuts.extend((3..(2 * n).saturating_sub(2)).map(|k| k as f64 / two_n));
+    }
+    cuts.retain(|&c| c >= a && c <= hi);
+    cuts.sort_by(f64::total_cmp);
+    cuts.dedup();
     let integrand = |x: f64| {
         let upper = 1.0 - kolmogn(n, x, true);
         vec![upper, 2.0 * x * upper]
     };
     let (mut m1, mut m2) = (a, a * a);
-    for w in kstwo_moment_cuts(n, &[]).windows(2) {
+    for w in cuts.windows(2) {
         // Global-panel GK15/G7 adaptive quadrature to 1e-15 of the panel width; valid finite
         // bounds and tolerances, so quad_vec cannot fail here.
         let options = fsci_integrate::QuadOptions {
@@ -49112,84 +49137,23 @@ fn kstwo_raw_moments_12(n: usize) -> (f64, f64) {
     (m1, m2)
 }
 
-/// The panel edges of the kstwo moment integrals: the support edge 1/2n, the truncation
-/// point √(40/n), the places where `kolmogn` switches formula (see
-/// [`kstwo_raw_moments_12`]) and `extra`, sorted, deduplicated and inside [1/2n, √(40/n)].
-fn kstwo_moment_cuts(n: usize, extra: &[f64]) -> Vec<f64> {
-    let nf = n as f64;
-    let a = 0.5 / nf;
-    let hi = (40.0 / nf).sqrt().min(1.0);
-    let mut cuts = vec![
-        a,
-        hi,
-        1.0 / nf,
-        0.5,
-        1.0 - 1.0 / nf,
-        (0.754_693 / nf).sqrt(),
-        (4.0 / nf).sqrt(),
-        (18.0 / nf).sqrt(),
-        (1.4 / nf).powf(2.0 / 3.0),
-    ];
-    cuts.extend_from_slice(extra);
-    cuts.retain(|&c| c >= a && c <= hi);
-    cuts.sort_by(f64::total_cmp);
-    cuts.dedup();
-    cuts
-}
-
-/// E[(D_n − c)²] of the law whose CDF `kolmogn` reports, as the sum of two non-negative
-/// integrals: ∫ 2(c − x)·cdf(x) dx over [1/2n, c] and ∫ 2(x − c)·(1 − cdf(x)) dx over
-/// [c, √(40/n)]. The panels are those of [`kstwo_raw_moments_12`] plus c, where the integrand
-/// has a kink, and for n ≤ 20 also every knot k/2n.
+/// E[D_n²] − E[D_n]² by [`kstwo_raw_moments_12`], with the CDF's knots as panel edges at the
+/// n where that takes fewer evaluations than the formula-switch panels alone.
 ///
-/// With c = E[D_n] + δ this is Var[D_n] + δ², so the mean's error enters only at second
-/// order, and the two parts add without cancelling. E[D_n²] − E[D_n]² subtracts two numbers
-/// 12 (large n) to 28 (n = 1) times the variance, so their last-bit errors reach it scaled up
-/// by that factor: at n = 1, a mean 1 ulp above 3/4 put it 53 ulps (8.8e-15) below 1/48.
-///
-/// Between knots the CDF is a polynomial of degree ≤ n, so for n ≤ 20 each knot panel's
-/// integrand has degree ≤ 21, which the 15-point Kronrod rule integrates exactly (degree 22).
-/// Panels that straddle knots have kinks inside, and quad_vec's error estimate does not see
-/// what they cost: without the knot edges var was 151 and 982 ulps from exact at n = 10 and
-/// 20, and a 4x to 5x smaller epsabs moved it by at most 1 ulp. With them it is within 34
-/// ulps of exact at n = 1, 2, 3, 5, 10 and 20, in fewer evaluations. Above 20 the knots
-/// (about 12.6·√n of them) cost more than they gain: 5x the evaluations at n = 50, where var
-/// ends up further from exact (95 ulps against 25), and about as far at n = 100.
-fn kstwo_central_moment_2(n: usize, c: f64) -> f64 {
-    let integrand = |x: f64| {
-        let lower = kolmogn(n, x, true);
-        vec![if x < c {
-            2.0 * (c - x) * lower
-        } else {
-            2.0 * (x - c) * (1.0 - lower)
-        }]
-    };
-    let mut extra = vec![c];
-    if n <= 20 {
-        let two_n = (2 * n) as f64;
-        extra.extend((1..2 * n).map(|k| k as f64 / two_n));
-    }
-    let mut edges = kstwo_moment_cuts(n, &extra);
-    // A cut and a knot can be one point rounded two ways, such as 1 − 1/n and (2n − 2)/2n.
-    // Keep one of them: the panel between the two would have no interior node.
-    edges.dedup_by(|later, kept| *later - *kept <= 1e-12 * *later);
-    let mut central = 0.0;
-    for w in edges.windows(2) {
-        // The raw moments' rule and panel tolerance; quad_vec cannot fail here either.
-        let options = fsci_integrate::QuadOptions {
-            epsabs: 1e-15 * (w[1] - w[0]),
-            epsrel: 0.0,
-            limit: 256,
-        };
-        let Ok(r) = fsci_integrate::quad_vec(integrand, w[0], w[1], options) else {
-            return f64::NAN;
-        };
-        let [part] = r.integral[..] else {
-            return f64::NAN;
-        };
-        central += part;
-    }
-    central
+/// Between knots k/2n the CDF is a polynomial of degree ≤ n, so for n ≤ 20 the integrands
+/// on a knot panel (degree ≤ n + 1) are within the 15-point Kronrod rule's exact degree (22),
+/// and E[D_n] and E[D_n²] come out within a few ulps. The subtraction cancels 12 (large n) to
+/// 28 (n = 1) times; with the knots var is within 124 ulps (1.6e-14) of exact at every n
+/// where they are used, against up to 18075 ulps (3.6e-12, n = 15) without, in 0.15x to
+/// 0.70x the time. At n = 3 the knots are edges already. At n = 14, 18 and 19 quad_vec
+/// subdivides the knot panels into 2.2x to 7.9x the evaluations, so those n keep the
+/// formula-switch panels and their error (3.4e-12 at n = 14, 1.9e-13 at 19), as does every
+/// n above 20, where the knots (about 12.6·√n of them) take 8x the evaluations at n = 50 and
+/// 27x at n = 100.
+fn kstwo_var_integrated(n: usize) -> f64 {
+    let knots = matches!(n, 4..=13 | 15..=17 | 20);
+    let (m1, m2) = kstwo_raw_moments_12(n, knots);
+    m2 - m1 * m1
 }
 
 /// Pelz-Good theta-function approximation to the CDF P(D_n ≤ x). Port of
@@ -82332,6 +82296,17 @@ mod tests {
             assert_kstwo_rel(v, sp_var, sp_tol, &format!("scipy kstwo.var({n})"));
         }
         Ok(())
+    }
+
+    /// `Kstwo::var` returns closed forms at n = 1 and 2; the integral it takes for n ≥ 3 must
+    /// still reproduce them, so that the special case cannot hide a broken integral. 1e-13 is
+    /// loose: E[D²] − E[D]² cancels 28 times at n = 1 and lands 8.9e-15 below 1/48.
+    #[test]
+    fn kstwo_var_integral_matches_the_closed_forms() {
+        for (n, exact) in [(1, 1.0 / 48.0), (2, 7.0 / 288.0)] {
+            let var = kstwo_var_integrated(n);
+            assert_kstwo_rel(var, exact, 1e-13, &format!("kstwo var integral, n = {n}"));
+        }
     }
 
     /// What a naive Kstwo gets wrong. (a) The old `Kstwo = KsTwoBign` alias: kstwobign is the
