@@ -156,6 +156,43 @@ const ODEINT_TOL: f64 = 1.49012e-8;
 /// `odeint`'s default `mxstep`: steps allowed per output time.
 const ODEINT_MXSTEP: usize = 500;
 
+/// Error control, step limits, and Jacobian structure for [`odeint_with_options`].
+#[derive(Debug, Clone)]
+pub struct OdeintOptions {
+    /// Scalar or per-component relative tolerance (SciPy's `rtol`).
+    pub rtol: ToleranceValue,
+    /// Scalar or per-component absolute tolerance (SciPy's `atol`).
+    pub atol: ToleranceValue,
+    /// Signed initial step; zero lets LSODA choose one (`h0`).
+    pub h0: f64,
+    /// Largest absolute step; zero means unbounded (`hmax`).
+    pub hmax: f64,
+    /// Internal steps allowed between consecutive output times. Zero selects
+    /// ODEPACK's default of 500 (`mxstep`).
+    pub mxstep: usize,
+    /// Analytic Jacobian in the time-first [`JacFn`] convention. Without one
+    /// LSODA estimates derivatives by finite differences.
+    pub jac: Option<JacFn>,
+    /// Optional (lower, upper) bandwidths (SciPy's `ml`, `mu`). The stiff
+    /// solver uses banded storage and factorization. A supplied Jacobian then
+    /// has `lower + upper + 1` rows, with J[i,j] at `jac[upper + i - j][j]`.
+    pub bandwidth: Option<(usize, usize)>,
+}
+
+impl Default for OdeintOptions {
+    fn default() -> Self {
+        Self {
+            rtol: ToleranceValue::Scalar(ODEINT_TOL),
+            atol: ToleranceValue::Scalar(ODEINT_TOL),
+            h0: 0.0,
+            hmax: 0.0,
+            mxstep: 0,
+            jac: None,
+            bandwidth: None,
+        }
+    }
+}
+
 /// Legacy `odeint`-style interface.
 ///
 /// `scipy.integrate.odeint(func, y0, t)` at its defaults: ODEPACK's LSODA (the port in
@@ -180,6 +217,29 @@ pub fn odeint<F>(
 where
     F: FnMut(&[f64], f64) -> Vec<f64>,
 {
+    odeint_with_options(func, y0, t, &OdeintOptions::default())
+}
+
+/// Integrate at the requested output times with configurable ODEPACK controls.
+///
+/// LSODA advances with the same persistent Adams/BDF history and interpolates
+/// each requested output as in [`odeint`]. For component `i` the local error
+/// weight is `rtol[i] * abs(y[i]) + atol[i]`. Either tolerance can be scalar.
+/// Pure absolute or relative error control is supported provided the weight
+/// stays positive. Decreasing times and repeated outputs are supported.
+///
+/// # Errors
+/// In addition to [`odeint`]'s errors, rejects invalid tolerances, step limits,
+/// bandwidths, and malformed Jacobians.
+pub fn odeint_with_options<F>(
+    func: &mut F,
+    y0: &[f64],
+    t: &[f64],
+    options: &OdeintOptions,
+) -> Result<Vec<Vec<f64>>, IntegrateValidationError>
+where
+    F: FnMut(&[f64], f64) -> Vec<f64>,
+{
     if t.is_empty() {
         return Ok(vec![]);
     }
@@ -198,19 +258,65 @@ where
         return Err(IntegrateValidationError::TEvalNotSorted);
     }
 
+    // ODEPACK accepts pure absolute error control (rtol = 0). Do not apply
+    // solve_ivp's relative-tolerance floor to this driver.
+    let tolerance = |name: &str, value: &ToleranceValue| {
+        let values = match value {
+            ToleranceValue::Scalar(v) => std::slice::from_ref(v),
+            ToleranceValue::Vector(values) => values.as_slice(),
+        };
+        if values.len() != 1 && values.len() != y0.len() {
+            return Err(IntegrateValidationError::IntegrationFailed {
+                message: format!("odeint {name} must have length 1 or {}", y0.len()),
+            });
+        }
+        if values.iter().any(|v| !v.is_finite() || *v < 0.0) {
+            return Err(IntegrateValidationError::IntegrationFailed {
+                message: format!("odeint {name} must be finite and non-negative"),
+            });
+        }
+        Ok(values.to_vec())
+    };
+    let rtol = tolerance("rtol", &options.rtol)?;
+    let atol = tolerance("atol", &options.atol)?;
+    if !options.h0.is_finite() {
+        return Err(IntegrateValidationError::NonFiniteFirstStep);
+    }
+    if !options.hmax.is_finite() || options.hmax < 0.0 {
+        return Err(IntegrateValidationError::IntegrationFailed {
+            message: "odeint hmax must be finite and non-negative".to_owned(),
+        });
+    }
+    if let Some((lower, upper)) = options.bandwidth
+        && (lower >= y0.len() || upper >= y0.len())
+    {
+        return Err(IntegrateValidationError::InvalidJacobianBandwidth {
+            lower,
+            upper,
+            dimension: y0.len(),
+        });
+    }
+
     // SciPy copies y0 into every row whose time equals t[0], then calls LSODA for the rest.
     let t0count = t.iter().take_while(|&&ti| ti == t[0]).count();
     let mut rows = vec![y0.to_vec(); t0count];
+    if t0count == t.len() {
+        return Ok(rows);
+    }
     let mut core = lsoda::Lsoda::new(
         y0.len(),
         lsoda::LsodaSetup {
-            rtol: vec![ODEINT_TOL],
-            atol: vec![ODEINT_TOL],
-            h0: 0.0,
-            hmax: 0.0,
-            mxstep: ODEINT_MXSTEP,
-            jac: None,
-            bandwidth: None,
+            rtol,
+            atol,
+            h0: options.h0,
+            hmax: options.hmax,
+            mxstep: if options.mxstep == 0 {
+                ODEINT_MXSTEP
+            } else {
+                options.mxstep
+            },
+            jac: options.jac,
+            bandwidth: options.bandwidth,
         },
     );
     // odeint's func(y, t) as ODEPACK's f(t, y).
@@ -226,6 +332,9 @@ where
             lsoda::Task::Interpolate,
             tout,
         ) {
+            if let lsoda::LsodaFailure::Callback(StepFailure::InvalidJacobian(err)) = failure {
+                return Err(err);
+            }
             return Err(IntegrateValidationError::IntegrationFailed {
                 message: format!(
                     "{} (reached {} of {} requested times; stopped at t = {t_reached})",
