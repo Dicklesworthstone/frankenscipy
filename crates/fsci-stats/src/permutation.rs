@@ -98,7 +98,9 @@ fn check_allocation<T>(length: usize) -> Result<(), StatsError> {
 fn filled<T: Clone>(length: usize, value: T) -> Result<Vec<T>, StatsError> {
     check_allocation::<T>(length)?;
     let mut values = Vec::new();
-    values.try_reserve_exact(length).map_err(|_| resource_error())?;
+    values
+        .try_reserve_exact(length)
+        .map_err(|_| resource_error())?;
     values.resize(length, value);
     Ok(values)
 }
@@ -165,9 +167,7 @@ fn exact_count(
             }
             Some(count)
         }
-        PermutationType::Samples if data.len() == 1 => {
-            power_bounded(2, data[0].len(), limit)
-        }
+        PermutationType::Samples if data.len() == 1 => power_bounded(2, data[0].len(), limit),
         PermutationType::Samples => {
             let labels = factorial_bounded(data.len(), limit)?;
             power_bounded(labels, data[0].len(), limit)
@@ -179,10 +179,7 @@ fn exact_count(
     }
 }
 
-fn validate(
-    data: &[&[f64]],
-    options: PermutationTestOptions,
-) -> Result<usize, StatsError> {
+fn validate(data: &[&[f64]], options: PermutationTestOptions) -> Result<usize, StatsError> {
     if options.n_resamples == 0 {
         return Err(StatsError::InvalidArgument(
             "n_resamples must be a positive integer".into(),
@@ -198,9 +195,7 @@ fn validate(
             "this permutation type requires at least {minimum_samples} samples"
         )));
     }
-    if options.mode == RuntimeMode::Hardened
-        && options.n_resamples > hardened_max_resamples()
-    {
+    if options.mode == RuntimeMode::Hardened && options.n_resamples > hardened_max_resamples() {
         return Err(StatsError::ResourceExhausted {
             detail: "Hardened mode n_resamples exceeds HARDENED_MAX_RESAMPLES",
         });
@@ -213,8 +208,7 @@ fn validate(
                 got: sample.len(),
             });
         }
-        if options.permutation_type != PermutationType::Independent
-            && sample.len() != data[0].len()
+        if options.permutation_type != PermutationType::Independent && sample.len() != data[0].len()
         {
             return Err(StatsError::ShapeMismatch {
                 expected: data[0].len(),
@@ -223,8 +217,7 @@ fn validate(
         }
         total = total.checked_add(sample.len()).ok_or_else(resource_error)?;
         if options.mode == RuntimeMode::Hardened
-            && (sample.len() > hardened_max_pairwise_len()
-                || total > hardened_max_sample_len())
+            && (sample.len() > hardened_max_pairwise_len() || total > hardened_max_sample_len())
         {
             return Err(StatsError::ResourceExhausted {
                 detail: "Hardened mode permutation sample lengths exceed stats caps",
@@ -235,7 +228,10 @@ fn validate(
     check_allocation::<usize>(total)?;
     check_allocation::<Vec<f64>>(data.len())?;
     check_allocation::<&[f64]>(data.len())?;
-    if data.iter().any(|sample| sample.iter().any(|x| !x.is_finite())) {
+    if data
+        .iter()
+        .any(|sample| sample.iter().any(|x| !x.is_finite()))
+    {
         return Err(StatsError::NonFiniteInput { argument: "data" });
     }
     Ok(total)
@@ -243,7 +239,8 @@ fn validate(
 
 fn sample_buffers(data: &[&[f64]]) -> Result<Vec<Vec<f64>>, StatsError> {
     let mut rows = Vec::new();
-    rows.try_reserve_exact(data.len()).map_err(|_| resource_error())?;
+    rows.try_reserve_exact(data.len())
+        .map_err(|_| resource_error())?;
     for sample in data {
         let mut row = filled(sample.len(), 0.0)?;
         row.copy_from_slice(sample);
@@ -276,8 +273,12 @@ fn enumeration(
         PermutationType::Independent => {
             let mut remaining = Vec::new();
             let mut selections = Vec::new();
-            remaining.try_reserve_exact(data.len()).map_err(|_| resource_error())?;
-            selections.try_reserve_exact(data.len()).map_err(|_| resource_error())?;
+            remaining
+                .try_reserve_exact(data.len())
+                .map_err(|_| resource_error())?;
+            selections
+                .try_reserve_exact(data.len())
+                .map_err(|_| resource_error())?;
             let mut length = total;
             for sample in data {
                 remaining.push(filled(length, 0)?);
@@ -287,12 +288,17 @@ fn enumeration(
             for (index, value) in remaining[0].iter_mut().enumerate() {
                 *value = index;
             }
-            Ok(Enumeration::Independent { remaining, selections })
+            Ok(Enumeration::Independent {
+                remaining,
+                selections,
+            })
         }
         PermutationType::Samples if data.len() == 1 => Ok(Enumeration::Signs),
         PermutationType::Samples => {
             let mut orders = Vec::new();
-            orders.try_reserve_exact(data[0].len()).map_err(|_| resource_error())?;
+            orders
+                .try_reserve_exact(data[0].len())
+                .map_err(|_| resource_error())?;
             for _ in 0..data[0].len() {
                 orders.push(indices(data.len())?);
             }
@@ -300,7 +306,9 @@ fn enumeration(
         }
         PermutationType::Pairings => {
             let mut orders = Vec::new();
-            orders.try_reserve_exact(data.len()).map_err(|_| resource_error())?;
+            orders
+                .try_reserve_exact(data.len())
+                .map_err(|_| resource_error())?;
             for sample in data {
                 orders.push(indices(sample.len())?);
             }
@@ -318,7 +326,9 @@ struct NullDistribution<'a, F> {
 impl<F: Fn(&[&[f64]]) -> f64> NullDistribution<'_, F> {
     fn record(&mut self, rows: &[Vec<f64>]) -> Result<(), StatsError> {
         let mut views = Vec::new();
-        views.try_reserve_exact(rows.len()).map_err(|_| resource_error())?;
+        views
+            .try_reserve_exact(rows.len())
+            .map_err(|_| resource_error())?;
         views.extend(rows.iter().map(Vec::as_slice));
         let value = (self.statistic)(&views);
         if !value.is_finite() {
@@ -351,7 +361,10 @@ fn next_combination(chosen: &mut [usize], n: usize) -> bool {
 }
 
 fn next_permutation(order: &mut [usize]) -> bool {
-    let Some(pivot) = (0..order.len() - 1).rev().find(|&i| order[i] < order[i + 1]) else {
+    let Some(pivot) = (0..order.len() - 1)
+        .rev()
+        .find(|&i| order[i] < order[i + 1])
+    else {
         return false;
     };
     let successor = (pivot + 1..order.len())
@@ -511,7 +524,8 @@ where
 
     // Resource checks precede both user callbacks and resampling allocation.
     let mut null = Vec::new();
-    null.try_reserve_exact(draws).map_err(|_| resource_error())?;
+    null.try_reserve_exact(draws)
+        .map_err(|_| resource_error())?;
     let mut rows = sample_buffers(data)?;
     let mut plan = enumeration(data, total, options.permutation_type, exact)?;
     let mut pooled = if options.permutation_type == PermutationType::Independent {
@@ -550,7 +564,10 @@ where
             expected: draws,
         };
         match &mut plan {
-            Enumeration::Independent { remaining, selections } => {
+            Enumeration::Independent {
+                remaining,
+                selections,
+            } => {
                 enumerate_independent(0, &pooled, &mut rows, remaining, selections, &mut output)?;
             }
             Enumeration::Samples(orders) => {
@@ -562,7 +579,11 @@ where
             Enumeration::Signs => {
                 for mask in 0..draws {
                     for (index, &value) in data[0].iter().enumerate() {
-                        rows[0][index] = if (mask >> index) & 1 == 0 { value } else { -value };
+                        rows[0][index] = if (mask >> index) & 1 == 0 {
+                            value
+                        } else {
+                            -value
+                        };
                     }
                     output.record(&rows)?;
                 }
@@ -571,9 +592,9 @@ where
                 for draw in 0..draws {
                     // Each draw has its own stream: its values never depend on
                     // callback behavior or how draws might later be partitioned.
-                    let seed = options.rng.wrapping_add(
-                        (draw as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
-                    );
+                    let seed = options
+                        .rng
+                        .wrapping_add((draw as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
                     let mut rng = StdRng::seed_from_u64(seed);
                     match options.permutation_type {
                         PermutationType::Independent => {
@@ -588,7 +609,11 @@ where
                         }
                         PermutationType::Samples if data.len() == 1 => {
                             for (value, &original) in rows[0].iter_mut().zip(data[0]) {
-                                *value = if rng.random_range(0..2) == 0 { original } else { -original };
+                                *value = if rng.random_range(0..2) == 0 {
+                                    original
+                                } else {
+                                    -original
+                                };
                             }
                         }
                         PermutationType::Samples => {
