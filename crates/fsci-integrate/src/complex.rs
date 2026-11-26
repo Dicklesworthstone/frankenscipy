@@ -50,12 +50,36 @@ pub struct ComplexOdeResult {
 /// Propagates [`IntegrateValidationError`] from the underlying real solver
 /// (e.g. empty initial state or a non-finite span).
 pub fn complex_ode<F>(
+    fun: F,
+    y0: &[Complex64],
+    t_span: (f64, f64),
+    t_eval: Option<&[f64]>,
+    rtol: f64,
+    atol: f64,
+) -> Result<ComplexOdeResult, IntegrateValidationError>
+where
+    F: FnMut(f64, &[Complex64]) -> Vec<Complex64>,
+{
+    complex_ode_with_method(fun, y0, t_span, t_eval, rtol, atol, SolverKind::Rk45)
+}
+
+/// Integrate a complex system with the selected real IVP solver.
+///
+/// BDF and Radau can integrate stiff systems, and LSODA switches between
+/// nonstiff and stiff methods. The solver treats real and imaginary parts as
+/// separate state variables, so the RHS may depend on complex conjugates.
+/// The scalar tolerances apply to each real and imaginary component.
+///
+/// # Errors
+/// Returns the same input and RHS validation errors as [`complex_ode`].
+pub fn complex_ode_with_method<F>(
     mut fun: F,
     y0: &[Complex64],
     t_span: (f64, f64),
     t_eval: Option<&[f64]>,
     rtol: f64,
     atol: f64,
+    method: SolverKind,
 ) -> Result<ComplexOdeResult, IntegrateValidationError>
 where
     F: FnMut(f64, &[Complex64]) -> Vec<Complex64>,
@@ -108,7 +132,7 @@ where
     let opts = SolveIvpOptions {
         t_span,
         y0: &real_y0,
-        method: SolverKind::Rk45,
+        method,
         t_eval,
         rtol,
         atol: ToleranceValue::Scalar(atol),
@@ -255,6 +279,62 @@ mod tests {
         assert!(last[0].1.abs() < 1e-7);
         assert!(last[1].0.abs() < 1e-7);
         assert!((last[1].1 - 1.0_f64.sin()).abs() < 1e-7);
+    }
+
+    #[test]
+    fn stiff_methods_resolve_fast_and_slow_complex_modes() {
+        // Different decay rates for real and imaginary parts make this system
+        // nonholomorphic. A second state also checks the packing order.
+        let times = [0.0, 0.001, 0.01, 0.5, 1.0];
+        for method in [SolverKind::Bdf, SolverKind::Radau, SolverKind::Lsoda] {
+            let result = complex_ode_with_method(
+                |_, y| vec![(-1000.0 * y[0].0, -y[0].1), (-y[1].0, -1000.0 * y[1].1)],
+                &[(2.0, 3.0), (-4.0, -5.0)],
+                (0.0, 1.0),
+                Some(&times),
+                1e-8,
+                1e-11,
+                method,
+            )
+            .unwrap();
+            assert!(result.success, "{method:?}: {}", result.message);
+            assert_eq!(result.t, times);
+            assert_eq!(result.y.len(), times.len());
+            for (&t, row) in times.iter().zip(&result.y) {
+                let fast = (-1000.0 * t).exp();
+                let slow = (-t).exp();
+                for (value, expected) in [
+                    (row[0].0, 2.0 * fast),
+                    (row[0].1, 3.0 * slow),
+                    (row[1].0, -4.0 * slow),
+                    (row[1].1, -5.0 * fast),
+                ] {
+                    assert!(
+                        (value - expected).abs() < 2e-7,
+                        "{method:?} t={t}: {value} vs {expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_method_preserves_rk45_default_in_reverse_time() {
+        let rhs = |_: f64, y: &[Complex64]| vec![cmul((0.0, 1.0), y[0])];
+        let times = [1.0, 0.75, 0.0];
+        let initial = [(1.0, 0.5)];
+        let default = complex_ode(rhs, &initial, (1.0, 0.0), Some(&times), 1e-8, 1e-11).unwrap();
+        let selected = complex_ode_with_method(
+            rhs,
+            &initial,
+            (1.0, 0.0),
+            Some(&times),
+            1e-8,
+            1e-11,
+            SolverKind::Rk45,
+        )
+        .unwrap();
+        assert_eq!(default, selected);
     }
 
     #[test]

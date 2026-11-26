@@ -25,7 +25,7 @@ pub use api::{
 };
 pub use bdf::{BdfSolver, BdfSolverConfig, SparseJacFn};
 pub use bvp::{BvpBcJac, BvpError, BvpFunJac, BvpOptions, BvpResult, solve_bvp, solve_bvp_many};
-pub use complex::{ComplexOdeResult, complex_ode};
+pub use complex::{ComplexOdeResult, complex_ode, complex_ode_with_method};
 pub use fsci_runtime::{StiffnessConditionState, StiffnessDetector};
 pub use lebedev::{LebedevRule, lebedev_rule};
 pub use lsoda::{JacFn, LsodaMethod};
