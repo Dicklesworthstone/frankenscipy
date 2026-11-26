@@ -687,6 +687,15 @@ worker lottery, not as a broken checkout — see `frankenscipy-118g9`.
 
 ### The clippy gate is a per-worker lottery — pin the worker (frankenscipy-a3rgs)
 
+**Status 2026-11-26: resolved; the rest of this section is history.** Every
+reachable worker's capability probe (`rch workers capabilities --json`, field
+`rustup_components`) lists `clippy` and `rustfmt` for `nightly-2026-08-31`, and
+the running `rch` checks a command's pinned component during admission, so a
+worker without it is refused with
+`capability_missing:rustup_component:<toolchain>:<component>` instead of being
+scheduled and failing. Keep naming the worker in every clippy verdict, and
+re-check the probe when the toolchain pin moves.
+
 `rust-toolchain.toml` pins `nightly-2026-08-31` and declares
 `components = ["rustfmt", "clippy"]`, but **rustup does not install a
 toolchain's declared components on first use**, and `rch` admission does not
