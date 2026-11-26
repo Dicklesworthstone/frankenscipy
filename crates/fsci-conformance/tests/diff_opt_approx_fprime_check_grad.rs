@@ -161,6 +161,12 @@ fn generate_query() -> OracleQuery {
         ("quad_sum", vec![-1.0, 0.5, 2.5, -2.0]),
         ("dot_const", vec![0.0, 0.0, 0.0]),
         ("dot_const", vec![1.0, 2.0, 3.0, 4.0]),
+        // The requested absolute step rounds away here. Both approx_fprime
+        // and check_grad must substitute a representable relative increment.
+        ("dot_const", vec![1e16]),
+        ("dot_const", vec![-1e16]),
+        ("dot_const", vec![1e100]),
+        ("dot_const", vec![-1e100]),
         ("shifted_quad", vec![0.5, 1.5, 2.5]),
         ("shifted_quad", vec![0.0, 0.0, 0.0, 0.0]),
     ];

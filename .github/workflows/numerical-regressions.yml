@@ -27,6 +27,7 @@ on:
       - "crates/fsci-conformance/tests/diff_opt_curve_fit.rs"
       - "crates/fsci-conformance/tests/diff_opt_nnls_isotonic_lsa.rs"
       - "crates/fsci-conformance/tests/diff_opt_lm_root.rs"
+      - "crates/fsci-conformance/tests/diff_opt_approx_fprime_check_grad.rs"
       - ".github/workflows/numerical-regressions.yml"
   workflow_dispatch:
 
@@ -80,6 +81,8 @@ jobs:
         run: |
           case "$LANE" in
             least-squares)
+              cargo test --locked -p fsci-opt --lib approx_ -- --nocapture
+              cargo test --locked -p fsci-conformance --no-default-features --test diff_opt_approx_fprime_check_grad -- --nocapture
               cargo test --locked -p fsci-opt --lib isotonic_regression -- --nocapture
               cargo test --locked -p fsci-conformance --no-default-features --test diff_opt_nnls_isotonic_lsa -- --nocapture
               cargo test --locked -p fsci-opt --lib fsolve -- --nocapture

@@ -247,6 +247,31 @@ where
         });
     }
 
+    // Use the displacement that is actually representable, as SciPy does.
+    // A fixed epsilon can round away entirely for a large coordinate.
+    let points = xk
+        .iter()
+        .enumerate()
+        .map(|(index, &x)| {
+            let mut step = epsilon;
+            if x + step == x {
+                let sign = if x >= 0.0 { 1.0 } else { -1.0 };
+                step = f64::EPSILON.sqrt() * sign * x.abs().max(1.0);
+            }
+            let mut point = x + step;
+            if !point.is_finite() {
+                point = x - step;
+            }
+            let dx = point - x;
+            if !point.is_finite() || !dx.is_finite() || dx == 0.0 {
+                return Err(OptError::InvalidArgument {
+                    detail: format!("no finite difference step at index {index}"),
+                });
+            }
+            Ok((point, dx))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
     let f0 = f(xk);
     if !f0.is_finite() {
         return Err(OptError::NonFiniteInput {
@@ -254,20 +279,26 @@ where
         });
     }
 
-    // Each component's forward difference perturbs ONLY `xk[index]` and evaluates `f` independently,
-    // so the components fan out across cores (each thread uses a PRIVATE perturbation buffer). Result
-    // is BYTE-IDENTICAL to the serial loop: identical `(f(xk+ε·eᵢ) - f0)/ε` per component in index
-    // order, and the non-finite error reports the SAME (lowest) index the serial loop would hit first.
-    // `f` evaluations dominate a finite-difference gradient; scipy's `approx_fprime` is serial.
+    // Every component owns its perturbation buffer. Collect in coordinate order
+    // so both serial and parallel execution report the lowest-index error.
     let n = xk.len();
-    let component = |index: usize| -> Result<f64, usize> {
+    let component = |index: usize| -> Result<f64, OptError> {
         let mut xp = xk.to_vec();
-        xp[index] += epsilon;
+        let (point, dx) = points[index];
+        xp[index] = point;
         let f_plus = f(&xp);
         if !f_plus.is_finite() {
-            return Err(index);
+            return Err(OptError::NonFiniteInput {
+                detail: format!("objective returned non-finite value at perturbed index {index}"),
+            });
         }
-        Ok((f_plus - f0) / epsilon)
+        let slope = finite_difference_slope(f_plus, f0, dx);
+        if !slope.is_finite() {
+            return Err(OptError::NonFiniteInput {
+                detail: format!("finite-difference gradient is not representable at index {index}"),
+            });
+        }
+        Ok(slope)
     };
     let nthreads =
         if OPT_APPROX_FPRIME_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || n < 2 {
@@ -278,12 +309,12 @@ where
                 .unwrap_or(1)
                 .min(n)
         };
-    let results: Vec<Result<f64, usize>> = if nthreads <= 1 {
+    let results: Vec<Result<f64, OptError>> = if nthreads <= 1 {
         (0..n).map(component).collect()
     } else {
         let chunk = n.div_ceil(nthreads);
         let component = &component;
-        let parts: Vec<Vec<Result<f64, usize>>> = std::thread::scope(|scope| {
+        let parts: Vec<Vec<Result<f64, OptError>>> = std::thread::scope(|scope| {
             (0..n)
                 .step_by(chunk)
                 .map(|i0| {
@@ -297,22 +328,24 @@ where
                 .map(|handle| handle.join().expect("approx_fprime chunk panicked"))
                 .collect()
         });
-        let mut r = Vec::with_capacity(n);
+        let mut results = Vec::with_capacity(n);
         for part in parts {
-            r.extend(part);
+            results.extend(part);
         }
-        r
+        results
     };
-    // Lowest-index non-finite error, matching the serial loop's first-error return.
-    for res in &results {
-        if let &Err(index) = res {
-            return Err(OptError::NonFiniteInput {
-                detail: format!("objective returned non-finite value at perturbed index {index}"),
-            });
-        }
+    results.into_iter().collect()
+}
+
+/// Divide a difference of finite samples without first requiring their
+/// difference to fit in f64. The usual arithmetic is retained when it is finite.
+fn finite_difference_slope(next: f64, base: f64, dx: f64) -> f64 {
+    let difference = next - base;
+    if difference.is_finite() {
+        difference / dx
+    } else {
+        (0.5 * next - 0.5 * base) / (0.5 * dx)
     }
-    let gradient: Vec<f64> = results.into_iter().map(|r| r.unwrap_or(0.0)).collect();
-    Ok(gradient)
 }
 
 /// Finite-difference scheme used by [`approx_derivative`] and
@@ -349,6 +382,10 @@ impl FiniteDiffMethod {
 /// `rel_step`/`abs_step` are scalars broadcast to every component (`None`
 /// selects scipy's default relative step). `bounds` is `None` for the
 /// unconstrained case or `Some((lb, ub))` with per-variable bounds.
+/// Callback outputs must keep their length and contain only finite values.
+/// Invalid controls, an unrepresentable derivative, or bounds too narrow for
+/// distinct stencil points return a typed error. Perturbations remain finite
+/// even at the limits of the floating-point range.
 /// When `true`, force `approx_derivative` onto its ORIG serial per-column loop. Byte-identical either
 /// way. Benchmark knob for the same-binary A/B.
 #[doc(hidden)]
@@ -377,20 +414,30 @@ where
             detail: "x0 must not contain NaN or Inf".to_string(),
         });
     }
+    if rel_step.is_some_and(|step| !step.is_finite())
+        || abs_step.is_some_and(|step| !step.is_finite())
+    {
+        return Err(OptError::InvalidArgument {
+            detail: "finite-difference steps must be finite".to_string(),
+        });
+    }
 
-    let neg_inf = f64::NEG_INFINITY;
-    let pos_inf = f64::INFINITY;
-    let lb: Vec<f64> = match bounds {
-        Some((l, _)) => l.to_vec(),
-        None => vec![neg_inf; n],
+    let mut lb = match bounds {
+        Some((lower, _)) => lower.to_vec(),
+        None => vec![f64::NEG_INFINITY; n],
     };
-    let ub: Vec<f64> = match bounds {
-        Some((_, u)) => u.to_vec(),
-        None => vec![pos_inf; n],
+    let mut ub = match bounds {
+        Some((_, upper)) => upper.to_vec(),
+        None => vec![f64::INFINITY; n],
     };
     if lb.len() != n || ub.len() != n {
         return Err(OptError::InvalidArgument {
             detail: "bounds must match x0 length".to_string(),
+        });
+    }
+    if (0..n).any(|i| lb[i].is_nan() || ub[i].is_nan() || lb[i] >= ub[i]) {
+        return Err(OptError::InvalidArgument {
+            detail: "finite-difference bounds must be ordered and have positive width".to_string(),
         });
     }
     if (0..n).any(|i| x0[i] < lb[i] || x0[i] > ub[i]) {
@@ -398,143 +445,207 @@ where
             detail: "x0 violates bound constraints".to_string(),
         });
     }
+    // The representable range is also a bound. This lets the existing scheme
+    // adjustment select backward differences at +MAX, and forward ones at -MAX.
+    for i in 0..n {
+        lb[i] = lb[i].max(-f64::MAX);
+        ub[i] = ub[i].min(f64::MAX);
+    }
 
-    let f0 = fun(x0);
-    let m = f0.len();
     let rstep = method.rel_eps();
-
-    // Absolute step per component (scipy _compute_absolute_step / abs_step path).
     let mut h = vec![0.0_f64; n];
     for i in 0..n {
         let sign = if x0[i] >= 0.0 { 1.0 } else { -1.0 };
-        match abs_step {
-            None => {
-                h[i] = match rel_step {
-                    None => rstep * sign * x0[i].abs().max(1.0),
-                    Some(rs) => {
-                        let step = rs * sign * x0[i].abs();
-                        if (x0[i] + step) - x0[i] == 0.0 {
-                            rstep * sign * x0[i].abs().max(1.0)
-                        } else {
-                            step
-                        }
-                    }
-                };
-            }
-            Some(abs) => {
-                // Fall back to a relative step if the absolute one underflows.
-                if (x0[i] + abs) - x0[i] == 0.0 {
-                    h[i] = rstep * sign * x0[i].abs().max(1.0);
-                } else {
-                    h[i] = abs;
-                }
-            }
+        let default_step = rstep * sign * x0[i].abs().max(1.0);
+        let requested = match abs_step {
+            Some(step) => step,
+            None => match rel_step {
+                Some(step) => step * sign * x0[i].abs(),
+                None => default_step,
+            },
+        };
+        h[i] = if x0[i] + requested == x0[i] {
+            default_step
+        } else {
+            requested
+        };
+        if !h[i].is_finite() {
+            return Err(OptError::InvalidArgument {
+                detail: format!("finite-difference step is not representable at column {i}"),
+            });
         }
     }
 
-    // Adjust the scheme to the bounds (num_steps = 1 for both methods).
-    let all_unbounded = lb.iter().all(|&v| v == neg_inf) && ub.iter().all(|&v| v == pos_inf);
     let mut use_one_sided = vec![matches!(method, FiniteDiffMethod::TwoPoint); n];
     match method {
         FiniteDiffMethod::TwoPoint => {
-            // '1-sided': use_one_sided already all true.
-            if !all_unbounded {
-                for i in 0..n {
-                    let h_total = h[i];
-                    let lower = x0[i] - lb[i];
-                    let upper = ub[i] - x0[i];
-                    let x = x0[i] + h_total;
-                    let violated = x < lb[i] || x > ub[i];
-                    let fitting = h_total.abs() <= lower.max(upper);
-                    if violated && fitting {
-                        h[i] = -h[i];
-                    } else if !fitting {
-                        if upper >= lower {
-                            h[i] = upper;
-                        } else {
-                            h[i] = -lower;
-                        }
-                    }
+            for i in 0..n {
+                let lower = x0[i] - lb[i];
+                let upper = ub[i] - x0[i];
+                let point = x0[i] + h[i];
+                let violated = point < lb[i] || point > ub[i];
+                let fitting = h[i].abs() <= lower.max(upper);
+                if violated && fitting {
+                    h[i] = -h[i];
+                } else if !fitting {
+                    h[i] = if upper >= lower { upper } else { -lower };
                 }
             }
         }
         FiniteDiffMethod::ThreePoint => {
-            // '2-sided': h = |h|, use_one_sided all false initially.
-            for hi in h.iter_mut() {
+            for hi in &mut h {
                 *hi = hi.abs();
             }
-            for u in use_one_sided.iter_mut() {
-                *u = false;
-            }
-            if !all_unbounded {
-                for i in 0..n {
-                    let h_total = h[i];
-                    let lower = x0[i] - lb[i];
-                    let upper = ub[i] - x0[i];
-                    let central = lower >= h_total && upper >= h_total;
-                    if !central {
-                        if upper >= lower {
-                            h[i] = h[i].min(0.5 * upper);
-                            use_one_sided[i] = true;
-                        } else {
-                            h[i] = -(h[i].min(0.5 * lower));
-                            use_one_sided[i] = true;
-                        }
-                        let min_dist = upper.min(lower);
-                        if h[i].abs() <= min_dist {
-                            h[i] = min_dist;
-                            use_one_sided[i] = false;
-                        }
+            use_one_sided.fill(false);
+            for i in 0..n {
+                let lower = x0[i] - lb[i];
+                let upper = ub[i] - x0[i];
+                if lower < h[i] || upper < h[i] {
+                    h[i] = if upper >= lower {
+                        h[i].min(0.5 * upper)
+                    } else {
+                        -h[i].min(0.5 * lower)
+                    };
+                    use_one_sided[i] = true;
+                    let min_dist = upper.min(lower);
+                    if h[i].abs() <= min_dist {
+                        h[i] = min_dist;
+                        use_one_sided[i] = false;
                     }
                 }
             }
         }
     }
 
-    // Dense difference: `jt[i]` is the i-th Jacobian column. Each column perturbs ONLY component `i`
-    // and evaluates `fun` independently, so the columns fan out across cores — BYTE-IDENTICAL to the
-    // serial loop (identical per-column FD arithmetic, each `jt[i]` written once; only the owning core
-    // changes). The `fun` evaluations are the dominant cost of a finite-difference Jacobian, so this
-    // pays whenever `fun` is non-trivial. `scipy`'s `approx_derivative` is serial.
-    let compute_col = |i: usize| -> Vec<f64> {
+    let f0 = fun(x0);
+    if f0.iter().any(|value| !value.is_finite()) {
+        return Err(OptError::NonFiniteInput {
+            detail: "finite-difference callback returned NaN or infinity at x0".to_string(),
+        });
+    }
+    let m = f0.len();
+
+    // Each column owns its evaluation buffers. Results are collected in index
+    // order, preserving deterministic error selection under parallel execution.
+    let compute_col = |i: usize| -> Result<Vec<f64>, OptError> {
+        let invalid_step = || OptError::InvalidArgument {
+            detail: format!("cannot form a distinct finite-difference stencil at column {i}"),
+        };
+        let valid_point = |point: f64| {
+            point.is_finite() && point >= lb[i] && point <= ub[i]
+        };
+        let evaluate = |x: &[f64]| -> Result<Vec<f64>, OptError> {
+            let values = fun(x);
+            if values.len() != m {
+                return Err(OptError::InvalidArgument {
+                    detail: format!(
+                        "finite-difference callback changed output length at column {i}: expected {m}, got {}",
+                        values.len()
+                    ),
+                });
+            }
+            if values.iter().any(|value| !value.is_finite()) {
+                return Err(OptError::NonFiniteInput {
+                    detail: format!(
+                        "finite-difference callback returned NaN or infinity at column {i}"
+                    ),
+                });
+            }
+            Ok(values)
+        };
         let mut col = vec![0.0_f64; m];
         match method {
             FiniteDiffMethod::TwoPoint => {
                 let mut x1 = x0.to_vec();
                 x1[i] = x0[i] + h[i];
-                let f1 = fun(&x1);
-                let dx = (x0[i] + h[i]) - x0[i];
+                let dx = x1[i] - x0[i];
+                if !valid_point(x1[i]) || !dx.is_finite() || dx == 0.0 {
+                    return Err(invalid_step());
+                }
+                let f1 = evaluate(&x1)?;
                 for k in 0..m {
-                    col[k] = (f1[k] - f0[k]) / dx;
+                    col[k] = finite_difference_slope(f1[k], f0[k], dx);
                 }
             }
             FiniteDiffMethod::ThreePoint => {
+                let mut x1 = x0.to_vec();
+                let mut x2 = x0.to_vec();
                 if use_one_sided[i] {
-                    let mut x1 = x0.to_vec();
-                    let mut x2 = x0.to_vec();
                     x1[i] = x0[i] + h[i];
                     x2[i] = x0[i] + 2.0 * h[i];
-                    let f1 = fun(&x1);
-                    let f2 = fun(&x2);
-                    let dx = (x0[i] + 2.0 * h[i]) - x0[i];
+                    let dx1 = x1[i] - x0[i];
+                    let dx2 = x2[i] - x0[i];
+                    let adjacent = x2[i] - x1[i];
+                    if !valid_point(x1[i])
+                        || !valid_point(x2[i])
+                        || [dx1, dx2, adjacent].iter().any(|dx| !dx.is_finite() || *dx == 0.0)
+                    {
+                        return Err(invalid_step());
+                    }
+                    let f1 = evaluate(&x1)?;
+                    let f2 = evaluate(&x2)?;
                     for k in 0..m {
-                        col[k] = (-3.0 * f0[k] + 4.0 * f1[k] - f2[k]) / dx;
+                        let ordinary = (-3.0 * f0[k] + 4.0 * f1[k] - f2[k]) / dx2;
+                        col[k] = if dx1 == 0.5 * dx2
+                            && ordinary.is_finite()
+                            && (ordinary != 0.0 || (f0[k] == f1[k] && f1[k] == f2[k]))
+                        {
+                            ordinary
+                        } else {
+                            // Divided differences remove a large common offset before
+                            // weighting samples. Actual node distances also account for
+                            // rounding when the first point is not exactly the midpoint.
+                            let first = finite_difference_slope(f1[k], f0[k], dx1);
+                            let second = finite_difference_slope(f2[k], f1[k], adjacent);
+                            let ratio = dx1 / dx2;
+                            let difference = first - second;
+                            let first_difference = f1[k] - f0[k];
+                            let second_difference = f2[k] - f1[k];
+                            let numerator = first_difference
+                                + 0.5 * (first_difference - second_difference);
+                            let before_division = numerator / dx1;
+                            if dx1 == 0.5 * dx2 && before_division.is_finite() {
+                                // Cancel differences before dividing by a tiny
+                                // step; individual slopes may be unrepresentable.
+                                before_division
+                            } else if difference.is_finite() {
+                                first + ratio * difference
+                            } else {
+                                first + (ratio * first - ratio * second)
+                            }
+                        };
                     }
                 } else {
-                    let mut x1 = x0.to_vec();
-                    let mut x2 = x0.to_vec();
                     x1[i] = x0[i] - h[i];
                     x2[i] = x0[i] + h[i];
-                    let f1 = fun(&x1);
-                    let f2 = fun(&x2);
-                    let dx = (x0[i] + h[i]) - (x0[i] - h[i]);
+                    let left = x0[i] - x1[i];
+                    let right = x2[i] - x0[i];
+                    let total = x2[i] - x1[i];
+                    if !valid_point(x1[i])
+                        || !valid_point(x2[i])
+                        || [left, right, total].iter().any(|dx| !dx.is_finite() || *dx == 0.0)
+                    {
+                        return Err(invalid_step());
+                    }
+                    let f1 = evaluate(&x1)?;
+                    let f2 = evaluate(&x2)?;
                     for k in 0..m {
-                        col[k] = (f2[k] - f1[k]) / dx;
+                        col[k] = if left == right {
+                            finite_difference_slope(f2[k], f1[k], total)
+                        } else {
+                            (right / total) * finite_difference_slope(f0[k], f1[k], left)
+                                + (left / total) * finite_difference_slope(f2[k], f0[k], right)
+                        };
                     }
                 }
             }
         }
-        col
+        if col.iter().any(|value| !value.is_finite()) {
+            return Err(OptError::NonFiniteInput {
+                detail: format!("finite-difference Jacobian is not representable at column {i}"),
+            });
+        }
+        Ok(col)
     };
 
     let nthreads =
@@ -546,13 +657,12 @@ where
                 .unwrap_or(1)
                 .min(n)
         };
-
-    let jt: Vec<Vec<f64>> = if nthreads <= 1 {
+    let columns: Vec<Result<Vec<f64>, OptError>> = if nthreads <= 1 {
         (0..n).map(compute_col).collect()
     } else {
         let chunk = n.div_ceil(nthreads);
         let compute_col = &compute_col;
-        let parts: Vec<Vec<Vec<f64>>> = std::thread::scope(|scope| {
+        let parts: Vec<Vec<Result<Vec<f64>, OptError>>> = std::thread::scope(|scope| {
             (0..n)
                 .step_by(chunk)
                 .map(|i0| {
@@ -566,21 +676,21 @@ where
                 .map(|handle| handle.join().expect("approx_derivative chunk panicked"))
                 .collect()
         });
-        let mut jt = Vec::with_capacity(n);
+        let mut columns = Vec::with_capacity(n);
         for part in parts {
-            jt.extend(part);
+            columns.extend(part);
         }
-        jt
+        columns
     };
+    let columns = columns.into_iter().collect::<Result<Vec<_>, _>>()?;
 
-    // Transpose to the m × n Jacobian.
-    let mut j = vec![vec![0.0_f64; n]; m];
-    for (i, col) in jt.iter().enumerate() {
-        for (k, &v) in col.iter().enumerate() {
-            j[k][i] = v;
+    let mut jacobian = vec![vec![0.0_f64; n]; m];
+    for (i, column) in columns.iter().enumerate() {
+        for (k, &value) in column.iter().enumerate() {
+            jacobian[k][i] = value;
         }
     }
-    Ok(j)
+    Ok(jacobian)
 }
 
 /// Compare an analytical gradient to a finite-difference approximation.
@@ -10477,6 +10587,263 @@ mod tests {
         );
         assert!(bounded_x.is_nan());
         assert!(bounded_f.is_nan());
+    }
+
+    #[test]
+    fn approx_fprime_uses_actual_representable_steps() {
+        for x in [1.0, -1.0, 1e16, -1e16, 1e100, -1e100] {
+            let gradient = approx_fprime(&[x], |point| point[0], 1e-8).unwrap();
+            assert_eq!(gradient, vec![1.0], "identity gradient at {x}");
+            let discrepancy = crate::check_grad(|point| point[0], |_| vec![1.0], &[x]).unwrap();
+            assert_eq!(discrepancy, 0.0, "identity gradient check at {x}");
+        }
+    }
+
+    #[test]
+    fn approx_fprime_preserves_finite_extreme_differences() {
+        for x in [f64::MAX, -f64::MAX] {
+            let gradient = approx_fprime(
+                &[x],
+                |point| {
+                    assert!(point[0].is_finite(), "callback received an infinite coordinate");
+                    point[0] - x
+                },
+                1e-8,
+            )
+            .unwrap();
+            assert_eq!(gradient, vec![1.0]);
+        }
+
+        let center = 2.0_f64.powi(1000);
+        let step = 2.0_f64.powi(974);
+        let offset = 2.0_f64.powi(1022);
+        let half_rate = 2.0_f64.powi(49);
+        let gradient = approx_fprime(
+            &[center],
+            |point| {
+                let value = 2.0 * (offset - half_rate * (point[0] - center));
+                assert!(value.is_finite());
+                value
+            },
+            step,
+        )
+        .unwrap();
+        assert_eq!(gradient, vec![-2.0_f64.powi(50)]);
+    }
+
+    #[test]
+    fn approx_derivative_rejects_invalid_controls_before_evaluation() {
+        use crate::{FiniteDiffMethod, approx_derivative};
+        for method in [FiniteDiffMethod::TwoPoint, FiniteDiffMethod::ThreePoint] {
+            for (relative, absolute) in [
+                (Some(f64::NAN), None),
+                (Some(f64::INFINITY), None),
+                (None, Some(f64::NAN)),
+                (None, Some(f64::NEG_INFINITY)),
+            ] {
+                let result = approx_derivative(
+                    |_| panic!("invalid controls must not evaluate the callback"),
+                    &[0.0],
+                    method,
+                    relative,
+                    absolute,
+                    None,
+                );
+                assert!(matches!(result, Err(crate::OptError::InvalidArgument { .. })));
+            }
+            for (lower, upper) in [
+                (f64::NAN, 1.0),
+                (-1.0, f64::NAN),
+                (1.0, -1.0),
+                (0.0, 0.0),
+            ] {
+                let result = approx_derivative(
+                    |_| panic!("invalid bounds must not evaluate the callback"),
+                    &[0.0],
+                    method,
+                    None,
+                    None,
+                    Some((&[lower], &[upper])),
+                );
+                assert!(matches!(result, Err(crate::OptError::InvalidArgument { .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn approx_derivative_rejects_changed_shapes_and_nonfinite_samples() {
+        use crate::{FiniteDiffMethod, approx_derivative};
+        for method in [FiniteDiffMethod::TwoPoint, FiniteDiffMethod::ThreePoint] {
+            for dimensions in [1, 2] {
+                for length in [0, 2] {
+                    let result = approx_derivative(
+                        |point| {
+                            if point.iter().all(|value| *value == 0.0) {
+                                vec![0.0]
+                            } else {
+                                vec![0.0; length]
+                            }
+                        },
+                        &vec![0.0; dimensions],
+                        method,
+                        None,
+                        None,
+                        None,
+                    );
+                    assert!(matches!(result, Err(crate::OptError::InvalidArgument { .. })));
+                }
+            }
+            for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                for at_base in [false, true] {
+                    let result = approx_derivative(
+                        |point| {
+                            vec![if (point[0] == 0.0) == at_base {
+                                invalid
+                            } else {
+                                point[0]
+                            }]
+                        },
+                        &[0.0],
+                        method,
+                        None,
+                        None,
+                        None,
+                    );
+                    assert!(matches!(result, Err(crate::OptError::NonFiniteInput { .. })));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn approx_derivative_keeps_finite_coordinates_and_large_offsets() {
+        use crate::{FiniteDiffMethod, approx_derivative};
+        for method in [FiniteDiffMethod::TwoPoint, FiniteDiffMethod::ThreePoint] {
+            for x in [f64::MAX, -f64::MAX] {
+                let jacobian = approx_derivative(
+                    |point| {
+                        assert!(point[0].is_finite(), "callback received an infinite coordinate");
+                        vec![point[0]]
+                    },
+                    &[x],
+                    method,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(jacobian, vec![vec![1.0]], "{method:?} at {x}");
+            }
+        }
+        // The ordinary one-sided formula overflows its weighted samples,
+        // despite the exact derivative of this constant being zero.
+        let constant = approx_derivative(
+            |_| vec![1e308, -1e308],
+            &[0.0],
+            FiniteDiffMethod::ThreePoint,
+            None,
+            None,
+            Some((&[0.0], &[f64::INFINITY])),
+        )
+        .unwrap();
+        assert_eq!(constant, vec![vec![0.0], vec![0.0]]);
+
+        // Removing a large common offset before weighting retains its slope.
+        let linear = approx_derivative(
+            |point| vec![1e308 * (1.0 + point[0])],
+            &[0.0],
+            FiniteDiffMethod::ThreePoint,
+            None,
+            Some(1e-4),
+            Some((&[0.0], &[f64::INFINITY])),
+        )
+        .unwrap();
+        assert!((linear[0][0] / 1e308 - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn approx_derivative_retains_cancellation_before_tiny_step_division() {
+        let jacobian = crate::approx_derivative(
+            |point| vec![2.0 * (point[0] / 1e-308).powi(2)],
+            &[0.0],
+            crate::FiniteDiffMethod::ThreePoint,
+            None,
+            Some(1e-308),
+            Some((&[0.0], &[f64::INFINITY])),
+        )
+        .unwrap();
+        // The samples are [0, 2, 8]. The quadratic's derivative is zero;
+        // dividing individual sample differences first would overflow.
+        assert_eq!(jacobian, vec![vec![0.0]]);
+    }
+
+    #[test]
+    fn approx_derivative_respects_narrow_bounds_and_distinct_nodes() {
+        use crate::{FiniteDiffMethod, approx_derivative};
+        let lower = 1.0_f64;
+        let upper = f64::from_bits(lower.to_bits() + 1);
+        let jacobian = approx_derivative(
+            |point| {
+                assert!(point[0] >= lower && point[0] <= upper);
+                vec![point[0]]
+            },
+            &[lower],
+            FiniteDiffMethod::TwoPoint,
+            None,
+            None,
+            Some((&[lower], &[upper])),
+        )
+        .unwrap();
+        assert_eq!(jacobian, vec![vec![1.0]]);
+        let result = approx_derivative(
+            |point| vec![point[0]],
+            &[lower],
+            FiniteDiffMethod::ThreePoint,
+            None,
+            None,
+            Some((&[lower], &[upper])),
+        );
+        assert!(matches!(result, Err(crate::OptError::InvalidArgument { .. })));
+
+        // Three nodes near a binade boundary need their actual, unequal gaps.
+        let x = f64::from_bits(1.0_f64.to_bits() - 1);
+        let jacobian = approx_derivative(
+            |point| vec![point[0] * point[0]],
+            &[x],
+            FiniteDiffMethod::ThreePoint,
+            None,
+            Some(f64::EPSILON),
+            Some((&[x], &[2.0])),
+        )
+        .unwrap();
+        assert!((jacobian[0][0] - 2.0 * x).abs() < 1e-14);
+    }
+
+    #[test]
+    fn approx_derivative_rejects_unrepresentable_slopes() {
+        use crate::{FiniteDiffMethod, approx_derivative};
+        let scalar = |point: &[f64]| {
+            if point[0] <= 0.0 {
+                -f64::MAX
+            } else {
+                f64::MAX
+            }
+        };
+        assert!(matches!(
+            approx_fprime(&[0.0], scalar, 1e-8),
+            Err(crate::OptError::NonFiniteInput { .. })
+        ));
+        for method in [FiniteDiffMethod::TwoPoint, FiniteDiffMethod::ThreePoint] {
+            let result = approx_derivative(
+                |point| vec![scalar(point)],
+                &[0.0],
+                method,
+                None,
+                None,
+                None,
+            );
+            assert!(matches!(result, Err(crate::OptError::NonFiniteInput { .. })));
+        }
     }
 
     #[test]
