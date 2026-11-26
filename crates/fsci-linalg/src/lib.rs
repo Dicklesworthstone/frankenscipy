@@ -21542,14 +21542,104 @@ fn sda_iteration_dare(
         let g_sym = (&g_next + g_next.transpose()) * 0.5;
         let h_sym = (&h_next + h_next.transpose()) * 0.5;
         let a_norm_next = a_next.norm();
+        if !a_norm_next.is_finite() || !h_sym.iter().chain(g_sym.iter()).all(|v| v.is_finite()) {
+            break;
+        }
+        if a_norm_next < tol {
+            return Ok(h_sym);
+        }
         a_k = a_next;
         g_k = g_sym;
         h_k = h_sym;
-        if a_norm_next < tol {
-            break;
-        }
     }
-    Ok(h_k)
+    Err(LinalgError::ConvergenceFailure {
+        detail: "Riccati doubling iteration failed to converge".into(),
+    })
+}
+
+/// Deflate the input columns of the extended symplectic pencil with QR, then
+/// extract its stable right deflating subspace (van Dooren's DARE method).
+/// This also works for singular R: only R + BᵀXB must be invertible.
+fn dare_stable_subspace(
+    a: &DMatrix<f64>,
+    b: &DMatrix<f64>,
+    q: &DMatrix<f64>,
+    r: &DMatrix<f64>,
+    options: DecompOptions,
+) -> Result<DMatrix<f64>, LinalgError> {
+    let (n, m) = b.shape();
+    let size = 2 * n + m;
+    hardened_dimension_check(options.mode, size, size)?;
+    let mut h = DMatrix::zeros(size, 2 * n);
+    let mut j = DMatrix::zeros(size, 2 * n);
+    let mut input = DMatrix::zeros(size, m);
+    h.view_mut((0, 0), (n, n)).copy_from(a);
+    h.view_mut((n, 0), (n, n)).copy_from(&(-q));
+    h.view_mut((n, n), (n, n)).fill_diagonal(1.0);
+    j.view_mut((0, 0), (n, n)).fill_diagonal(1.0);
+    j.view_mut((n, n), (n, n)).copy_from(&a.transpose());
+    j.view_mut((2 * n, n), (m, n)).copy_from(&(-b.transpose()));
+    input.view_mut((0, 0), (n, m)).copy_from(b);
+    input.view_mut((2 * n, 0), (m, m)).copy_from(r);
+
+    if m > 0 {
+        let input_qr = input.qr();
+        input_qr.q_tr_mul(&mut h);
+        input_qr.q_tr_mul(&mut j);
+    }
+    let h = rows_from_dmatrix(&h.rows(m, 2 * n).into_owned());
+    let j = rows_from_dmatrix(&j.rows(m, 2 * n).into_owned());
+    let ordered = ordqz(&h, &j, OrdQzSort::InsideUnitCircle, options)?;
+    let stable_dim = generalized_schur::diagonal_blocks(&ordered.aa)
+        .into_iter()
+        .filter(|&(i, len)| {
+            let (re, im, beta) =
+                generalized_schur::block_eigenvalue(&ordered.aa, &ordered.bb, i, len);
+            ordqz_block_selected(re, im, beta, OrdQzSort::InsideUnitCircle)
+        })
+        .map(|(_, len)| len)
+        .sum::<usize>();
+    if stable_dim != n {
+        return Err(LinalgError::ConvergenceFailure {
+            detail: "Riccati pencil has no separated stable subspace of the required dimension".into(),
+        });
+    }
+    let z = dmatrix_from_rows(&ordered.z)?;
+    let top = z.view((0, 0), (n, n));
+    let bottom = z.view((n, 0), (n, n));
+    top.transpose().lu().solve(&bottom.transpose())
+        .map(|xt| xt.transpose())
+        .ok_or(LinalgError::SingularMatrix)
+}
+
+/// The Riccati equation alone cannot distinguish its stabilizing and
+/// anti-stabilizing roots. Certify both the residual and the feedback poles.
+fn dare_stabilizes(
+    a: &DMatrix<f64>,
+    b: &DMatrix<f64>,
+    q: &DMatrix<f64>,
+    r: &DMatrix<f64>,
+    x: &DMatrix<f64>,
+) -> bool {
+    if !x.iter().all(|v| v.is_finite()) {
+        return false;
+    }
+    let btx = b.transpose() * x;
+    let Some(gain) = (r + &btx * b).lu().solve(&(&btx * a)) else {
+        return false;
+    };
+    let closed_loop = a - b * gain;
+    let propagated = a.transpose() * x * &closed_loop;
+    let residual = &propagated + q - x;
+    let scale = propagated.amax().max(q.amax()).max(x.amax());
+    if !closed_loop.iter().chain(residual.iter()).all(|v| v.is_finite())
+        || residual.amax() > (2048.0 * a.nrows() as f64 * f64::EPSILON) * scale
+    {
+        return false;
+    }
+    bounded_schur(closed_loop).is_ok_and(|schur| {
+        schur.complex_eigenvalues().iter().all(|pole| pole.re.hypot(pole.im) < 1.0)
+    })
 }
 
 /// Solve the continuous-time algebraic Riccati equation (CARE).
@@ -21670,10 +21760,9 @@ pub fn solve_continuous_are(
 /// Solves AᵀXA − X − AᵀXB(R + BᵀXB)⁻¹BᵀXA + Q = 0 for the symmetric
 /// stabilizing solution X.
 ///
-/// Method (Anderson 2010 / Chu et al. SDA): structure-preserving
-/// doubling iteration on the triple (A_k, G_k, H_k) initialized from
-/// (A, BR⁻¹Bᵀ, Q). H_k converges quadratically to X. The result is
-/// symmetrized for robustness.
+/// Uses structure-preserving doubling when possible, and the stable subspace
+/// of an ordered symplectic pencil for singular R or failed doubling. Checks
+/// the Riccati residual and stability of the resulting closed-loop system.
 ///
 /// Matches `scipy.linalg.solve_discrete_are(a, b, q, r)` for the
 /// well-conditioned DAREX benchmark set.
@@ -21721,14 +21810,22 @@ pub fn solve_discrete_are(
     let q_mat = dmatrix_from_rows(q)?;
     let r_mat = dmatrix_from_rows(r)?;
 
-    let r_inv = r_mat
-        .clone()
-        .try_inverse()
-        .ok_or(LinalgError::SingularMatrix)?;
-    let g = &b_mat * &r_inv * b_mat.transpose();
-
-    let h_final = sda_iteration_dare(&a_mat, &g, &q_mat, 100, 1e-13)?;
-    let x_sym = (&h_final + h_final.transpose()) * 0.5;
+    let candidate = r_mat.clone().lu().solve(&b_mat.transpose()).and_then(|rinv_bt| {
+        sda_iteration_dare(&a_mat, &(&b_mat * rinv_bt), &q_mat, 100, 1e-13).ok()
+    });
+    let x_sym = match candidate {
+        Some(x) if dare_stabilizes(&a_mat, &b_mat, &q_mat, &r_mat, &x) => x,
+        _ => {
+            let x = dare_stable_subspace(&a_mat, &b_mat, &q_mat, &r_mat, options)?;
+            let x = &x * 0.5 + x.transpose() * 0.5;
+            if !dare_stabilizes(&a_mat, &b_mat, &q_mat, &r_mat, &x) {
+                return Err(LinalgError::ConvergenceFailure {
+                    detail: "failed to find a finite stabilizing Riccati solution".into(),
+                });
+            }
+            x
+        }
+    };
 
     emit_trace(LinalgTrace {
         operation: "solve_discrete_are",
