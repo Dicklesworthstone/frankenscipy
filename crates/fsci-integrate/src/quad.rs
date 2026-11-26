@@ -3247,6 +3247,20 @@ impl CubatureProduct {
             self.exponent += 1;
         }
     }
+
+    /// Divide by a finite, nonzero value without materializing its reciprocal.
+    fn divide(&mut self, value: f64) {
+        if self.mantissa == 0.0 {
+            return;
+        }
+        let (mantissa, exponent) = cubature_frexp(value);
+        self.mantissa /= mantissa;
+        self.exponent -= exponent;
+        if self.mantissa.abs() < 1.0 {
+            self.mantissa *= 2.0;
+            self.exponent -= 1;
+        }
+    }
 }
 
 /// Decompose a finite, nonzero f64 as mantissa * 2^exponent with
@@ -4473,6 +4487,110 @@ where
     nsum_right(f, a, step, atol, rtol)
 }
 
+/// Evaluate one finite-difference correction in series units. Forming a
+/// physical derivative and multiplying it by step^order can overflow or
+/// underflow even though their product is representable.
+fn nsum_scaled_correction<const N: usize>(
+    terms: [(f64, f64); N],
+    step: f64,
+    delta: f64,
+    order: usize,
+    divisor: f64,
+) -> f64 {
+    let mut terms = terms.map(|(value, weight)| {
+        let mut product = CubatureProduct::one();
+        product.multiply(value);
+        product.multiply(weight);
+        product
+    });
+    // Cancel the largest stencil terms before adding tiny survivors. The
+    // integer stencil weights are exact, including twice a near-MAX value.
+    terms.sort_by(|a, b| {
+        b.exponent
+            .cmp(&a.exponent)
+            .then_with(|| b.mantissa.abs().total_cmp(&a.mantissa.abs()))
+    });
+    let mut stencil = CubatureSum::default();
+    for term in terms {
+        stencil.add(term);
+    }
+    let value = stencil.value + stencil.correction;
+    if value == 0.0 {
+        return value;
+    }
+    let (mantissa, exponent) = cubature_frexp(value);
+    let mut correction = CubatureProduct {
+        mantissa,
+        exponent: stencil.exponent + exponent,
+    };
+    for _ in 0..order {
+        correction.multiply(step);
+        correction.divide(delta);
+    }
+    correction.divide(divisor);
+    let mut result = CubatureSum::default();
+    result.add(correction);
+    result.total()
+}
+
+/// Preserve the ordinary Euler–Maclaurin arithmetic when it is safe; use
+/// scaled stencils when physical derivatives or powers leave the normal range.
+/// The caller has already checked every sample and the positive step/delta.
+fn nsum_euler_maclaurin_corrections(
+    fp: f64,
+    fm: f64,
+    fp2: f64,
+    fm2: f64,
+    step: f64,
+    delta: f64,
+) -> (f64, f64) {
+    let numerator1 = fp - fm;
+    let denominator1 = 2.0 * delta;
+    let coefficient1 = step / 12.0;
+    let d1 = numerator1 / denominator1;
+    let first = coefficient1 * d1;
+    let numerator3 = fp2 - 2.0 * fp + 2.0 * fm - fm2;
+    let delta3 = delta.powi(3);
+    let step3 = step.powi(3);
+    let denominator3 = 2.0 * delta3;
+    let coefficient3 = step3 / 720.0;
+    let d3 = numerator3 / denominator3;
+    let third = coefficient3 * d3;
+    // Zero derivatives also use the scaled stencil: a rounded zero can
+    // hide an underflowed physical derivative that survives rescaling.
+    let first = if [numerator1, denominator1, coefficient1, d1, first]
+        .iter()
+        .all(|value| value.is_normal())
+    {
+        first
+    } else {
+        nsum_scaled_correction([(fp, 1.0), (fm, -1.0)], step, delta, 1, 24.0)
+    };
+    let third = if [
+        numerator3,
+        delta3,
+        step3,
+        denominator3,
+        coefficient3,
+        d3,
+        third,
+    ]
+    .iter()
+    .all(|value| value.is_normal())
+    {
+        third
+    } else {
+        nsum_scaled_correction(
+            [(fp2, 1.0), (fp, -2.0), (fm, 2.0), (fm2, -1.0)],
+            step,
+            delta,
+            3,
+            1440.0,
+        )
+    };
+    (first, third)
+}
+
 fn nsum_right<F>(f: F, a: f64, s: f64, atol: f64, rtol: f64) -> NsumResult
 where
     F: Fn(f64) -> f64,
@@ -4543,8 +4661,7 @@ where
                 converged: false,
             };
         }
-        let d1 = (fp - fm) / (2.0 * delta); // f'(n_m)
-        let d3 = (fp2 - 2.0 * fp + 2.0 * fm - fm2) / (2.0 * delta.powi(3)); // f'''(n_m)
+        let (first, third) = nsum_euler_maclaurin_corrections(fp, fm, fp2, fm2, s, delta);
 
         let integral_atol = (atol * s).min(f64::MAX);
         // The lattice term f(n_m) has already been sampled and is finite.
@@ -4568,7 +4685,7 @@ where
             };
         }
 
-        let tail = integ.integral / s + 0.5 * f_nm - (s / 12.0) * d1 + (s.powi(3) / 720.0) * d3;
+        let tail = integ.integral / s + 0.5 * f_nm - first + third;
         // Keep the direct sum's compensation when adding the final tail.
         let mut estimate = direct;
         let tail_roundoff = estimate.add(tail);
@@ -9691,6 +9808,111 @@ mod tests {
     }
 
     #[test]
+    fn nsum_corrections_preserve_normal_arithmetic() {
+        let (fp, fm, fp2, fm2, step, delta): (f64, f64, f64, f64, f64, f64) =
+            (0.9, 1.1, 0.8, 1.25, 0.75, 0.01);
+        let d1 = (fp - fm) / (2.0 * delta);
+        let d3 = (fp2 - 2.0 * fp + 2.0 * fm - fm2) / (2.0 * delta.powi(3));
+        let expected_first = (step / 12.0) * d1;
+        let expected_third = (step.powi(3) / 720.0) * d3;
+        let (first, third) = nsum_euler_maclaurin_corrections(fp, fm, fp2, fm2, step, delta);
+        assert_eq!(first.to_bits(), expected_first.to_bits());
+        assert_eq!(third.to_bits(), expected_third.to_bits());
+    }
+
+    #[test]
+    fn nsum_corrections_cancel_large_stencils_before_scaling() {
+        let large = 1e308_f64;
+        let (first, third) =
+            nsum_euler_maclaurin_corrections(large, large, large, large, 1e110, 1e-4);
+        assert_eq!(first, 0.0);
+        assert_eq!(third, 0.0);
+
+        // The exact four-point stencil is one ulp, although twice any
+        // sample overflows and naive evaluation of the numerator is NaN.
+        let expected = (large - large.next_down()) / 1440.0;
+        let (first, third) =
+            nsum_euler_maclaurin_corrections(large, large, large, large.next_down(), 1.0, 1.0);
+        assert_eq!(first, 0.0);
+        assert!(expected > 0.0 && expected.is_finite());
+        assert_eq!(third.to_bits(), expected.to_bits());
+    }
+
+    #[test]
+    fn nsum_corrections_recover_underflowed_derivatives() {
+        let sample = 1e-300_f64;
+        let step = 1e110_f64;
+        assert_eq!(sample / (2.0 * step), 0.0);
+        let (first, third) =
+            nsum_euler_maclaurin_corrections(sample, 0.0, 0.0, 0.0, step, step);
+        assert!((first / (sample / 24.0) - 1.0).abs() <= 1e-14);
+        assert!((third / (-sample / 720.0) - 1.0).abs() <= 1e-14);
+
+        // Equal step and probe spacing cancel even when their cubes do
+        // not fit in f64, or when the spacing itself is subnormal.
+        for step in [1e-110, 1e110, f64::from_bits(1)] {
+            let (first, third) =
+                nsum_euler_maclaurin_corrections(1.0, 0.0, 0.0, 0.0, step, step);
+            assert!((first - 1.0 / 24.0).abs() <= 1e-15, "step={step}");
+            assert!((third + 1.0 / 720.0).abs() <= 1e-16, "step={step}");
+        }
+    }
+
+    #[test]
+    fn nsum_geometric_tails_survive_extreme_steps_and_translations() {
+        let expected = 1.0 / (1.0 - (-1.0_f64).exp());
+        // The negative shift puts the first correction at n_m = 0,
+        // where an explicit (step / delta)^3 would also overflow.
+        for (step, shift) in [(1e-110, 0.0), (1.0, 3.0), (1e110, -8.0)] {
+            let a = shift * step;
+            let calls = std::cell::Cell::new(0usize);
+            let result = nsum(
+                |x| {
+                    assert!(x.is_finite() && x >= a, "step={step}, x={x}");
+                    calls.set(calls.get() + 1);
+                    assert!(calls.get() <= 250_000, "series kept expanding: {step}");
+                    (-((x - a) / step)).exp()
+                },
+                a,
+                f64::INFINITY,
+                step,
+                0.0,
+                1e-11,
+            );
+            assert!(result.converged, "step={step}, a={a}: {result:?}");
+            assert!((result.sum / expected - 1.0).abs() <= 1e-11);
+            assert!(result.error.is_finite() && result.error <= 1e-11 * result.sum.abs());
+            assert_eq!(result.nfev, calls.get());
+        }
+    }
+
+    #[test]
+    fn nsum_large_finite_gaussian_avoids_stencil_overflow() {
+        // Missing terms beyond this symmetric window are below exp(-81).
+        // Form the reference in unit amplitude so the reference sum is safe.
+        let expected: f64 = (-8..=8).map(|k| (-f64::from(k).powi(2)).exp()).sum();
+        let calls = std::cell::Cell::new(0usize);
+        let result = nsum(
+            |x| {
+                assert!(x.is_finite() && x >= 0.0);
+                calls.set(calls.get() + 1);
+                assert!(calls.get() <= 10_000, "series kept expanding");
+                1e308 * (-(x - 8.0).powi(2)).exp()
+            },
+            0.0,
+            f64::INFINITY,
+            1.0,
+            0.0,
+            1e-11,
+        );
+        assert!(result.converged, "{result:?}");
+        assert!(result.sum.is_finite());
+        assert!((result.sum / 1e308 - expected).abs() <= 1e-11 * expected);
+        assert!(result.error.is_finite() && result.error <= 1e-11 * result.sum.abs());
+        assert_eq!(result.nfev, calls.get());
+    }
+
+    #[test]
     fn nsum_nonfinite_terms_derivatives_and_tails_stop_with_bounded_work() {
         let cases: &[fn(f64) -> f64] = &[
             |_| f64::NAN,
@@ -9720,6 +9942,30 @@ mod tests {
             assert!(!result.converged);
             assert!(!result.sum.is_finite());
             assert_eq!(result.error, f64::INFINITY);
+            assert_eq!(result.nfev, calls.get());
+        }
+        for step in [1e-110, 1e110] {
+            let calls = std::cell::Cell::new(0usize);
+            let result = nsum(
+                |x| {
+                    calls.set(calls.get() + 1);
+                    assert!(calls.get() <= 13, "invalid samples reached the tail integral");
+                    if x == 8.0 * step {
+                        f64::NAN
+                    } else {
+                        (-x / step).exp()
+                    }
+                },
+                0.0,
+                f64::INFINITY,
+                step,
+                0.0,
+                1e-11,
+            );
+            assert!(!result.converged);
+            assert!(result.sum.is_nan());
+            assert_eq!(result.error, f64::INFINITY);
+            assert_eq!(result.nfev, 13);
             assert_eq!(result.nfev, calls.get());
         }
         let finite = nsum(|_| f64::INFINITY, 1.0, 100.0, 1.0, 0.0, 1e-11);
