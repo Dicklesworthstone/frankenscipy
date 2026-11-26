@@ -36,12 +36,80 @@ pub struct QuadResult {
     pub converged: bool,
 }
 
+/// Norm used to control vector quadrature error.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum QuadVecNorm {
+    /// Euclidean norm, matching the SciPy default.
+    #[default]
+    Euclidean,
+    /// Largest absolute component.
+    Max,
+}
+
+impl QuadVecNorm {
+    fn combine(self, acc: f64, value: f64) -> f64 {
+        match self {
+            Self::Max => acc.max(value.abs()),
+            Self::Euclidean => acc.hypot(value),
+        }
+    }
+
+    fn relative_tolerance(self, values: &[f64], rtol: f64) -> f64 {
+        let norm = values.iter().fold(0.0, |acc, &v| self.combine(acc, v));
+        if norm.is_finite() {
+            return rtol * norm;
+        }
+        // A vector of finite components can have an unrepresentable Euclidean
+        // norm even when the requested relative tolerance is representable.
+        values
+            .iter()
+            .fold(0.0, |acc, &v| self.combine(acc, rtol * v))
+    }
+}
+
+/// Embedded Gauss–Kronrod pair for adaptive vector quadrature.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum QuadVecRule {
+    /// GK21 on finite intervals and GK15 when either original bound is infinite.
+    #[default]
+    Auto,
+    Gk15,
+    Gk21,
+}
+
+/// Options for [`quad_vec_with_options`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuadVecOptions {
+    pub epsabs: f64,
+    pub epsrel: f64,
+    /// Maximum number of simultaneously active intervals, including breakpoint panels.
+    pub limit: usize,
+    pub norm: QuadVecNorm,
+    pub rule: QuadVecRule,
+    /// Known discontinuities or singularities in the original coordinate system.
+    /// Repeated and out-of-range points are ignored.
+    pub points: Vec<f64>,
+}
+
+impl Default for QuadVecOptions {
+    fn default() -> Self {
+        Self {
+            epsabs: 1e-200,
+            epsrel: 1e-8,
+            limit: 10_000,
+            norm: QuadVecNorm::Euclidean,
+            rule: QuadVecRule::Auto,
+            points: Vec::new(),
+        }
+    }
+}
+
 /// Result of vector-valued numerical quadrature.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QuadVecResult {
     /// Estimated value of the integral for each output component.
     pub integral: Vec<f64>,
-    /// Estimated absolute error in the maximum-component norm, including roundoff.
+    /// Estimated absolute error in the selected vector norm, including roundoff.
     pub error: f64,
     /// Number of function evaluations.
     pub neval: usize,
@@ -155,6 +223,7 @@ pub struct CubatureScalarResult {
 
 #[derive(Debug)]
 struct QuadVecPanel {
+    transform: BoundTransform,
     a: f64,
     b: f64,
     integral: Vec<f64>,
@@ -832,6 +901,38 @@ pub fn quad_vec<F>(
 where
     F: Fn(f64) -> Vec<f64>,
 {
+    quad_vec_with_options(
+        f,
+        a,
+        b,
+        QuadVecOptions {
+            epsabs: options.epsabs,
+            epsrel: options.epsrel,
+            limit: options.limit,
+            norm: QuadVecNorm::Max,
+            rule: QuadVecRule::Gk15,
+            points: Vec::new(),
+        },
+    )
+}
+
+/// Integrate a vector with a shared error budget across components and breakpoint panels.
+/// Breakpoints split the physical domain before infinite tails are transformed, so
+/// closely spaced breakpoints far from the origin stay distinct. Reversing the bounds
+/// negates each component. Nonzero intervals use only interior nodes.
+///
+/// # Errors
+/// Returns an error for invalid bounds or tolerances, NaN breakpoints, more initial panels
+/// than the panel limit, inconsistent output shapes, or a panel without interior nodes.
+pub fn quad_vec_with_options<F>(
+    f: F,
+    a: f64,
+    b: f64,
+    mut options: QuadVecOptions,
+) -> Result<QuadVecResult, IntegrateValidationError>
+where
+    F: Fn(f64) -> Vec<f64>,
+{
     if a.is_nan() || b.is_nan() || (a == b && !a.is_finite()) {
         return Err(IntegrateValidationError::QuadInvalidBounds {
             detail: "integration bounds must not be NaN or the same infinity".to_string(),
@@ -847,6 +948,12 @@ where
         });
     }
 
+    if options.points.iter().any(|p| p.is_nan()) {
+        return Err(IntegrateValidationError::QuadInvalidBounds {
+            detail: "quadrature breakpoints must not be NaN".to_string(),
+        });
+    }
+
     if a == b {
         let dim = f(a).len();
         return Ok(QuadVecResult {
@@ -859,20 +966,30 @@ where
     }
 
     let (lo, hi, sign) = if a < b { (a, b, 1.0) } else { (b, a, -1.0) };
-    let transform = match (lo.is_finite(), hi.is_finite()) {
-        (true, true) => BoundTransform::Finite,
-        (false, true) => BoundTransform::LowerInfinite { upper: hi },
-        (true, false) => BoundTransform::UpperInfinite { lower: lo },
-        (false, false) => BoundTransform::BothInfinite,
-    };
-    let (left, right) = transform.interval(lo, hi);
-    let mapped = |t| {
-        let (x, jacobian) = transform.map(t);
-        f(x).into_iter().map(|value| value * jacobian).collect()
+    let mut boundaries = std::mem::take(&mut options.points);
+    boundaries.retain(|&p| lo < p && p < hi);
+    boundaries.sort_unstable_by(f64::total_cmp);
+    boundaries.dedup();
+    if boundaries.len() >= options.limit.max(1) {
+        return Err(IntegrateValidationError::QuadInvalidBounds {
+            detail: "breakpoints require more panels than the integration limit".to_string(),
+        });
+    }
+    boundaries.insert(0, lo);
+    boundaries.push(hi);
+    if boundaries.windows(2).any(|w| w[0].next_up() >= w[1]) {
+        return Err(IntegrateValidationError::QuadInvalidBounds {
+            detail: "interval has no representable interior quadrature node".to_string(),
+        });
+    }
+    let rule = match options.rule {
+        QuadVecRule::Gk15 => &GK15_RULE,
+        QuadVecRule::Auto if !lo.is_finite() || !hi.is_finite() => &GK15_RULE,
+        QuadVecRule::Auto | QuadVecRule::Gk21 => &GK21_RULE,
     };
     let mut neval = 0;
     let (mut integral, error, converged) =
-        adaptive_gk15_vec(&mapped, left, right, &mut neval, options)?;
+        adaptive_gk_vec(&f, &boundaries, &mut neval, &options, rule)?;
     for value in &mut integral {
         *value *= sign;
     }
@@ -886,34 +1003,47 @@ where
 }
 
 /// Global error control with at most `limit` active panels and no recursive calls.
-fn adaptive_gk15_vec<F>(
+fn adaptive_gk_vec<F>(
     f: &F,
-    a: f64,
-    b: f64,
+    boundaries: &[f64],
     neval: &mut usize,
-    options: QuadOptions,
+    options: &QuadVecOptions,
+    rule: &NestedRule1d,
 ) -> Result<(Vec<f64>, f64, bool), IntegrateValidationError>
 where
     F: Fn(f64) -> Vec<f64>,
 {
-    let first = gauss_kronrod_15_vec(f, a, b, neval, None)?;
-    let mut integral = first.integral.clone();
-    let mut sums: Vec<_> = integral
-        .iter()
-        .map(|&value| CompensatedSum {
-            value,
-            correction: 0.0,
-        })
-        .collect();
-    let mut error = CompensatedSum {
-        value: first.error,
-        correction: 0.0,
+    let mut integral = Vec::new();
+    let mut sums = Vec::<CompensatedSum>::new();
+    let mut error = CompensatedSum::default();
+    let mut roundoff = CompensatedSum::default();
+    let mut panels = std::collections::BinaryHeap::new();
+    let mut eval = |transform, left, right, dim| {
+        gauss_kronrod_vec(f, transform, left, right, neval, dim, rule, options.norm)
     };
-    let mut roundoff = CompensatedSum {
-        value: first.roundoff,
-        correction: 0.0,
-    };
-    let mut panels = std::collections::BinaryHeap::from([first]);
+    for w in boundaries.windows(2) {
+        let (lo, hi) = (w[0], w[1]);
+        let transform = match (lo.is_finite(), hi.is_finite()) {
+            (true, true) => BoundTransform::Finite,
+            (false, true) => BoundTransform::LowerInfinite { upper: hi },
+            (true, false) => BoundTransform::UpperInfinite { lower: lo },
+            (false, false) => BoundTransform::BothInfinite,
+        };
+        let (a, b) = transform.interval(lo, hi);
+        let dim = (!panels.is_empty()).then_some(integral.len());
+        let panel = eval(transform, a, b, dim)?;
+        if panels.is_empty() {
+            sums.resize_with(panel.integral.len(), CompensatedSum::default);
+            integral.resize(panel.integral.len(), 0.0);
+        }
+        for ((sum, value), &part) in sums.iter_mut().zip(&mut integral).zip(&panel.integral) {
+            sum.add(part);
+            *value = sum.total();
+        }
+        error.add(panel.error);
+        roundoff.add(panel.roundoff);
+        panels.push(panel);
+    }
 
     loop {
         let summed_error = error.total();
@@ -924,7 +1054,7 @@ where
         }
         let tolerance = options
             .epsabs
-            .max(options.epsrel * max_abs_component(&integral));
+            .max(options.norm.relative_tolerance(&integral, options.epsrel));
         // Leave headroom for the accumulated roundoff estimate, as quad_vec does.
         if summed_error <= tolerance / 8.0 && total_error <= tolerance {
             return Ok((integral, total_error, true));
@@ -938,8 +1068,8 @@ where
             return Ok((integral, total_error, false));
         }
         let dim = Some(integral.len());
-        let left = gauss_kronrod_15_vec(f, worst.a, mid, neval, dim)?;
-        let right = gauss_kronrod_15_vec(f, mid, worst.b, neval, dim)?;
+        let left = eval(worst.transform, worst.a, mid, dim)?;
+        let right = eval(worst.transform, mid, worst.b, dim)?;
         for (i, sum) in sums.iter_mut().enumerate() {
             // Cancel the parent separately from the children. Forming a
             // replacement delta can overflow or erase a small component.
@@ -963,60 +1093,37 @@ where
     }
 }
 
-/// Vector-valued Gauss-Kronrod 15-point / 7-point quadrature rule on [a, b].
-fn gauss_kronrod_15_vec<F>(
+/// Embedded Gauss–Kronrod rule on one transformed panel.
+#[allow(clippy::too_many_arguments)]
+fn gauss_kronrod_vec<F>(
     f: &F,
+    transform: BoundTransform,
     a: f64,
     b: f64,
     neval: &mut usize,
     dim: Option<usize>,
+    rule: &NestedRule1d,
+    norm: QuadVecNorm,
 ) -> Result<QuadVecPanel, IntegrateValidationError>
 where
     F: Fn(f64) -> Vec<f64>,
 {
-    const XGK: [f64; 15] = [
-        -0.991_455_371_120_812_6,
-        -0.949_107_912_342_759,
-        -0.864_864_423_359_769_1,
-        -0.741_531_185_599_394_4,
-        -0.586_087_235_467_691_1,
-        -0.405_845_151_377_397_2,
-        -0.207_784_955_007_898_5,
-        0.0,
-        0.207_784_955_007_898_5,
-        0.405_845_151_377_397_2,
-        0.586_087_235_467_691_1,
-        0.741_531_185_599_394_4,
-        0.864_864_423_359_769_1,
-        0.949_107_912_342_759,
-        0.991_455_371_120_812_6,
-    ];
-    const WGK: [f64; 15] = [
-        0.022_935_322_010_529_2,
-        0.063_092_092_629_979,
-        0.104_790_010_322_250_2,
-        0.140_653_259_715_525_9,
-        0.169_004_726_639_267_9,
-        0.190_350_578_064_785_4,
-        0.204_432_940_075_298_9,
-        0.209_482_141_084_728,
-        0.204_432_940_075_298_9,
-        0.190_350_578_064_785_4,
-        0.169_004_726_639_267_9,
-        0.140_653_259_715_525_9,
-        0.104_790_010_322_250_2,
-        0.063_092_092_629_979,
-        0.022_935_322_010_529_2,
-    ];
-    const WG: [f64; 7] = [
-        0.129_484_966_168_869_7,
-        0.279_705_391_489_276_7,
-        0.381_830_050_505_118_9,
-        0.417_959_183_673_469_4,
-        0.381_830_050_505_118_9,
-        0.279_705_391_489_276_7,
-        0.129_484_966_168_869_7,
-    ];
+    let sample = |t: f64| {
+        let (mut x, jac) = transform.map(t);
+        // A transformed interior node can round to the physical breakpoint.
+        match transform {
+            BoundTransform::LowerInfinite { upper } if x >= upper => x = upper.next_down(),
+            BoundTransform::UpperInfinite { lower } if x <= lower => x = lower.next_up(),
+            _ => {}
+        }
+        let mut values = f(x);
+        if jac != 1.0 {
+            for value in &mut values {
+                *value *= jac;
+            }
+        }
+        values
+    };
 
     if a.next_up() >= b {
         return Err(IntegrateValidationError::QuadInvalidBounds {
@@ -1030,13 +1137,13 @@ where
         0.5 * b - 0.5 * a
     };
     let center = a.midpoint(b);
-    let mut center_value = f(center);
+    let mut center_value = sample(center);
     *neval += 1;
     let dim = dim.unwrap_or(center_value.len());
 
-    let mut samples = Vec::with_capacity(XGK.len());
+    let mut samples = Vec::with_capacity(rule.nodes.len());
 
-    for (i, &xgk) in XGK.iter().enumerate() {
+    for &xgk in rule.nodes {
         // Rounding can otherwise move an interior Kronrod node onto a singular
         // endpoint after repeated refinement. Keep representable nodes inside.
         let mut x = center + half_length * xgk;
@@ -1045,11 +1152,11 @@ where
         } else if x >= b && b.next_down() > a {
             x = b.next_down();
         }
-        let fval = if i == 7 {
+        let fval = if xgk == 0.0 {
             std::mem::take(&mut center_value)
         } else {
             *neval += 1;
-            f(x)
+            sample(x)
         };
 
         if fval.len() != dim {
@@ -1074,25 +1181,32 @@ where
     let mut difference = 0.0_f64;
     let mut deviation = 0.0_f64;
     let mut absolute = 0.0_f64;
+    let mut component = vec![0.0; rule.nodes.len()];
     for j in 0..dim {
-        let component = std::array::from_fn(|i| samples[i][j]);
+        for (value, sample) in component.iter_mut().zip(&samples) {
+            *value = sample[j];
+        }
         if component.iter().any(|value| !value.is_finite()) {
             integral.push(f64::NAN);
             nonfinite = true;
             continue;
         }
-        let sums = gauss_kronrod_sums(&component, &WGK, &WG);
+        let sums = gauss_kronrod_sums(
+            &component,
+            rule.kronrod,
+            rule.gauss.iter().skip(1).step_by(2).copied(),
+        );
         // Preserve every output in its own local units. Normalizing the
         // entire vector by its largest sample would erase small components.
         integral.push(de_weighted_term(half_length, sums.scale, sums.kronrod));
         // Combine the error indicators in one common scale before applying
-        // the nonlinear QUADPACK correction, retaining the maximum norm.
+        // the nonlinear QUADPACK correction, using the selected vector norm.
         // A ratio that underflows cannot affect this norm: a component at
         // the maximum scale contributes a strictly positive roundoff bound.
         let ratio = if scale == 0.0 { 0.0 } else { sums.scale / scale };
-        difference = difference.max(sums.difference * ratio);
-        deviation = deviation.max(sums.deviation * ratio);
-        absolute = absolute.max(sums.absolute * ratio);
+        difference = norm.combine(difference, sums.difference * ratio);
+        deviation = norm.combine(deviation, sums.deviation * ratio);
+        absolute = norm.combine(absolute, sums.absolute * ratio);
     }
     let (error, roundoff) = if nonfinite {
         (f64::INFINITY, f64::INFINITY)
@@ -1101,6 +1215,7 @@ where
     };
 
     Ok(QuadVecPanel {
+        transform,
         a,
         b,
         integral,
@@ -4962,9 +5077,9 @@ struct GaussKronrodSums {
 }
 
 fn gauss_kronrod_sums(
-    values: &[f64; 15],
-    kronrod_weights: &[f64; 15],
-    gauss_weights: &[f64; 7],
+    values: &[f64],
+    kronrod_weights: &[f64],
+    gauss_weights: impl Iterator<Item = f64>,
 ) -> GaussKronrodSums {
     let scale = values.iter().fold(0.0_f64, |s, value| s.max(value.abs()));
     if scale == 0.0 {
@@ -4978,8 +5093,9 @@ fn gauss_kronrod_sums(
         kronrod.add(weight * normalized);
         absolute.add(weight * normalized.abs());
     }
-    for (&idx, &weight) in [1, 3, 5, 7, 9, 11, 13].iter().zip(gauss_weights) {
-        gauss.add(weight * (values[idx] / scale));
+    // Both embedded Gauss rules use the odd-indexed Kronrod nodes.
+    for (&value, weight) in values.iter().skip(1).step_by(2).zip(gauss_weights) {
+        gauss.add(weight * (value / scale));
     }
     let mean = 0.5 * kronrod.total();
     let mut deviation = CompensatedSum::default();
@@ -5109,7 +5225,7 @@ fn gauss_kronrod_panel(
         return failed();
     }
 
-    let sums = gauss_kronrod_sums(&fvals, &k_weights, &g_weights);
+    let sums = gauss_kronrod_sums(&fvals, &k_weights, g_weights.iter().copied());
     let (error, roundoff) = gauss_kronrod_bounds(
         half,
         sums.scale,
@@ -7133,6 +7249,143 @@ mod tests {
             "integral should be atan(100)={expected}, got {}",
             result.integral
         );
+    }
+
+    #[test]
+    fn quad_vec_breakpoints_resolve_localized_features_in_physical_coordinates() {
+        for (lo, hi, left, right) in [
+            (0.0, 1.0, 0.125, 0.125 + 1.0 / 65536.0),
+            (
+                f64::NEG_INFINITY,
+                f64::INFINITY,
+                2.0_f64.powi(60),
+                2.0_f64.powi(60) + 4096.0,
+            ),
+        ] {
+            for (a, b, sign) in [(lo, hi, 1.0), (hi, lo, -1.0)] {
+                let calls = std::cell::Cell::new(0);
+                let result = quad_vec_with_options(
+                    |x| {
+                        assert!(x != left && x != right, "sampled breakpoint at {x}");
+                        calls.set(calls.get() + 1);
+                        let height = if left < x && x < right {
+                            (right - left).recip()
+                        } else {
+                            0.0
+                        };
+                        vec![height, -3.0 * height]
+                    },
+                    a,
+                    b,
+                    QuadVecOptions {
+                        points: vec![hi, right, left, left, lo],
+                        limit: 3,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                assert!(result.converged, "{result:?}");
+                assert!((result.integral[0] - sign).abs() < 1e-13);
+                assert!((result.integral[1] + 3.0 * sign).abs() < 1e-13);
+                assert_eq!(result.neval, calls.get());
+                assert_eq!(result.neval, if lo.is_finite() { 63 } else { 45 });
+            }
+        }
+    }
+
+    #[test]
+    fn quad_vec_uses_selected_norm_for_roundoff_and_stopping() {
+        let integrate = |norm, rule| {
+            quad_vec_with_options(
+                |_| vec![1.0; 4],
+                0.0,
+                1.0,
+                QuadVecOptions {
+                    norm,
+                    rule,
+                    epsabs: 1e-13,
+                    epsrel: 0.0,
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+        for (rule, count) in [(QuadVecRule::Gk15, 15), (QuadVecRule::Gk21, 21)] {
+            let max = integrate(QuadVecNorm::Max, rule);
+            let euclidean = integrate(QuadVecNorm::Euclidean, rule);
+            assert!(max.converged);
+            assert!(!euclidean.converged);
+            assert_eq!(max.neval, count);
+            assert!((euclidean.error / max.error - 2.0).abs() < 1e-14);
+        }
+    }
+
+    #[test]
+    fn quad_vec_validates_initial_partition_and_shapes_across_panels() {
+        for points in [
+            vec![0.25, 0.5],
+            vec![0.5, 0.5_f64.next_up()],
+            vec![f64::NAN],
+        ] {
+            let result = quad_vec_with_options(
+                |_| panic!("invalid initial partition must be rejected before sampling"),
+                0.0,
+                1.0,
+                QuadVecOptions {
+                    limit: if points.len() == 2 && points[0] == 0.25 {
+                        2
+                    } else {
+                        4
+                    },
+                    points,
+                    ..Default::default()
+                },
+            );
+            assert!(matches!(
+                result,
+                Err(IntegrateValidationError::QuadInvalidBounds { .. })
+            ));
+        }
+        let result = quad_vec_with_options(
+            |x| if x < 0.5 { vec![] } else { vec![1.0] },
+            0.0,
+            1.0,
+            QuadVecOptions {
+                points: vec![0.5],
+                ..Default::default()
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn quad_vec_breakpoint_rules_preserve_extreme_component_scales() {
+        for rule in [QuadVecRule::Gk15, QuadVecRule::Gk21] {
+            for norm in [QuadVecNorm::Max, QuadVecNorm::Euclidean] {
+                let result = quad_vec_with_options(
+                    |_| vec![1.3e308, -1.3e308, 1e-300],
+                    0.0,
+                    1.0,
+                    QuadVecOptions {
+                        points: vec![0.25, 0.75],
+                        rule,
+                        norm,
+                        epsabs: 0.0,
+                        epsrel: 1e-11,
+                        limit: 3,
+                    },
+                )
+                .unwrap();
+                assert!(result.converged, "{result:?}");
+                assert!(result.error.is_finite() && result.error > 0.0);
+                for (actual, expected) in result.integral.iter().zip([1.3e308, -1.3e308, 1e-300]) {
+                    assert!((actual / expected - 1.0).abs() < 8.0 * f64::EPSILON);
+                }
+            }
+        }
+        let tol = QuadVecNorm::Euclidean.relative_tolerance(&[1.3e308; 2], 1e-12);
+        assert!((tol / (1.3e296 * 2.0_f64.sqrt()) - 1.0).abs() < 4.0 * f64::EPSILON);
     }
 
     #[test]
