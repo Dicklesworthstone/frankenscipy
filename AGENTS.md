@@ -83,6 +83,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 
 - **RaptorQ systematic encoding:** `asupersync::raptorq::systematic::SystematicEncoder` powers artifact durability and decode recovery proofs in `fsci-conformance`
 - **Forbidden crates:** `tokio`, `hyper`, `reqwest`, `axum`, `tower` (tokio adapter), `async-std`, `smol`, or any crate that transitively depends on tokio (`cargo tree -i tokio` must stay empty)
+- **Scope of that check (GH #15):** it must print nothing for every supported target: the host, `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `wasm32-unknown-unknown` and `wasm32-unknown-emscripten` (`cargo tree --locked -i tokio --target <triple>`). `Cargo.lock` still lists tokio because `wasm-bindgen-futures` (asupersync's wasm32 dependency) declares it under `cfg(all(target_os = "emscripten", wasm_bindgen_unstable_tokio))`; `cargo tree --target all` ignores cfg and shows that edge. The opt-in `--cfg wasm_bindgen_unstable_tokio` build is unsupported here. Never hand-edit the lock to hide the entry.
 - **Synchronous public API:** All numerical routines, solvers, and pipelines are synchronous and deterministic
 
 ### Key Dependencies
