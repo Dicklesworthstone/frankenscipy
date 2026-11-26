@@ -8694,7 +8694,7 @@ where
     cg_solve(a, b, Some(&preconditioner), x0, options)
 }
 
-type CgPreconditioner<'a> = dyn Fn(&[f64]) -> SparseResult<Vec<f64>> + 'a;
+type KrylovPreconditioner<'a> = dyn Fn(&[f64]) -> SparseResult<Vec<f64>> + 'a;
 
 /// Preserve the usual ordered dot product. An underflowed product or an
 /// overflowing subtotal instead uses the exponent representation already
@@ -8773,17 +8773,24 @@ fn checked_krylov_residual(a: &dyn LinearOperator, b: &[f64], x: &[f64]) -> Spar
     Ok(residual)
 }
 
-fn cg_precondition<'a>(
-    preconditioner: Option<&CgPreconditioner<'_>>,
+fn krylov_precondition<'a>(
+    preconditioner: Option<&KrylovPreconditioner<'_>>,
     residual: &'a [f64],
 ) -> SparseResult<std::borrow::Cow<'a, [f64]>> {
     let output = match preconditioner {
-        Some(apply) => std::borrow::Cow::Owned(apply_preconditioner(&apply, residual)?),
+        Some(apply) => {
+            if residual.iter().any(|value| !value.is_finite()) {
+                return Err(SparseError::NonFiniteInput {
+                    message: "Krylov preconditioner input is not finite".to_string(),
+                });
+            }
+            std::borrow::Cow::Owned(apply_preconditioner(&apply, residual)?)
+        }
         None => std::borrow::Cow::Borrowed(residual),
     };
     if output.iter().any(|value| !value.is_finite()) {
         return Err(SparseError::NonFiniteInput {
-            message: "CG preconditioner returned NaN or Inf".to_string(),
+            message: "Krylov preconditioner returned NaN or Inf".to_string(),
         });
     }
     Ok(output)
@@ -8836,7 +8843,7 @@ fn cg_direction_scale(direction: &[f64], normalized: &mut [f64]) -> f64 {
 fn cg_solve(
     a: &dyn LinearOperator,
     b: &[f64],
-    preconditioner: Option<&CgPreconditioner<'_>>,
+    preconditioner: Option<&KrylovPreconditioner<'_>>,
     x0: Option<&[f64]>,
     options: IterativeSolveOptions,
 ) -> SparseResult<IterativeSolveResult> {
@@ -8938,7 +8945,7 @@ fn cg_solve(
             }
             restart = true;
         }
-        let z = cg_precondition(preconditioner, &residual)?;
+        let z = krylov_precondition(preconditioner, &residual)?;
         let rho = cg_dot(&residual, &z);
         if rho.mantissa == 0.0 {
             break;
@@ -9754,15 +9761,15 @@ where
     Ok(z)
 }
 
-/// Arnoldi stores these norms in f64. Reject an unrepresentable scale before
+/// These Krylov recurrences store norms in f64. Reject an unrepresentable scale before
 /// it reaches a normalization or a convergence comparison.
-fn gmres_norm(values: &[f64]) -> SparseResult<f64> {
+fn krylov_norm(values: &[f64]) -> SparseResult<f64> {
     let norm = vec_norm(values);
     if norm.is_finite() {
         Ok(norm)
     } else {
         Err(SparseError::NonFiniteInput {
-            message: "GMRES vector or norm is outside the finite floating-point range".to_string(),
+            message: "Krylov vector or norm is outside the finite floating-point range".to_string(),
         })
     }
 }
@@ -9827,7 +9834,7 @@ where
         });
     }
     let n = b.len();
-    let b_norm = gmres_norm(b)?;
+    let b_norm = krylov_norm(b)?;
     if rhs_is_zero(b_norm) {
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
@@ -9846,7 +9853,7 @@ where
     } else {
         b.to_vec()
     };
-    let mut r_norm = gmres_norm(&r)?;
+    let mut r_norm = krylov_norm(&r)?;
     let threshold = ScaledValue::from_f64(b_norm).mul(ScaledValue::from_f64(options.tol));
     let initial_converged = ScaledValue::from_f64(r_norm).abs_le(threshold);
     if initial_converged || max_cycles == 0 {
@@ -9858,7 +9865,7 @@ where
         });
     }
 
-    let mb_norm = gmres_norm(&apply_preconditioner(&preconditioner, b)?)?;
+    let mb_norm = krylov_norm(&apply_preconditioner(&preconditioner, b)?)?;
     let mut ptol_max_factor = 1.0_f64;
     let mut ptol = mb_norm * ptol_max_factor.min(options.tol);
     let mut presid = 0.0_f64;
@@ -9869,7 +9876,7 @@ where
     let mut av = vec![0.0; n];
     for _cycle in 0..max_cycles {
         v[0] = apply_preconditioner(&preconditioner, &r)?;
-        let beta = gmres_norm(&v[0])?;
+        let beta = krylov_norm(&v[0])?;
         if beta == 0.0 {
             // M annihilated a nonconverged residual. There is no Arnoldi direction.
             break;
@@ -9883,13 +9890,13 @@ where
             col = column;
             checked_krylov_matvec(a, &v[col], &mut av)?;
             let mut w = apply_preconditioner(&preconditioner, &av)?;
-            let h0 = gmres_norm(&w)?;
+            let h0 = krylov_norm(&w)?;
             for k in 0..=col {
                 let projection = dot_product(&v[k], &w);
                 h[col][k] = projection;
                 subtract_scaled_basis_vector(&mut w, projection, &v[k]);
             }
-            let h1 = gmres_norm(&w)?;
+            let h1 = krylov_norm(&w)?;
             h[col][col + 1] = h1;
             if h1 <= eps * h0 {
                 h[col][col + 1] = 0.0;
@@ -9940,7 +9947,7 @@ where
             }
         }
         r = checked_krylov_residual(a, b, &x)?;
-        r_norm = gmres_norm(&r)?;
+        r_norm = krylov_norm(&r)?;
         if ScaledValue::from_f64(r_norm).abs_le(threshold) || breakdown {
             break;
         }
@@ -9965,13 +9972,13 @@ where
 }
 
 /// BiCGSTAB with a preconditioner: SciPy 1.17.1's
-/// `scipy.sparse.linalg.bicgstab(A, b, M=M, rtol=tol, atol=0)` ported step for step, including
+/// `scipy.sparse.linalg.bicgstab(A, b, M=M, rtol=tol, atol=0)` recurrence, including
 /// its breakdown tests (`|ρ| < ε²`, `|ω| < ε²`, `r̃ᵀv = 0`) and its half-step exit when
 /// `‖s‖ < tol·‖b‖`. `preconditioner` is SciPy's `M.matvec` (`|r| m.matvec(r)` for a
 /// [`LinearOperator`] `m`); `A` may be any operator.
 ///
 /// `options.max_iter` defaults to 10n as SciPy's does. `iterations` counts the iterations
-/// entered, a half-step exit included (SciPy's callback count plus that last partial one).
+/// completed, including a half-step exit. Convergence is verified against the true residual.
 ///
 /// # Errors
 /// Shape and input errors as [`bicgstab`], and any error the preconditioner or the operator
@@ -9986,99 +9993,7 @@ pub fn bicgstab_preconditioned<M>(
 where
     M: Fn(&[f64]) -> SparseResult<Vec<f64>>,
 {
-    let mut x = preconditioned_krylov_start("BiCGSTAB", a, b, x0, options)?;
-    let n = b.len();
-    let b_norm = vec_norm(b);
-    if rhs_is_zero(b_norm) {
-        return Ok(IterativeSolveResult {
-            solution: vec![0.0; n],
-            // status: ‖b‖ = 0, so x = 0 solves exactly (SciPy returns b)
-            converged: true,
-            iterations: 0,
-            residual_norm: 0.0,
-        });
-    }
-    let atol = options.tol * b_norm;
-    let max_iter = options.max_iter.unwrap_or(n * 10);
-    let breakdown_tol = f64::EPSILON * f64::EPSILON;
-    let mut r: Vec<f64> = if x.iter().any(|&value| value != 0.0) {
-        let ax = a.matvec(&x)?;
-        b.iter().zip(&ax).map(|(bi, axi)| bi - axi).collect()
-    } else {
-        b.to_vec()
-    };
-    let r_tilde = r.clone();
-    let mut p = vec![0.0; n];
-    let mut v = vec![0.0; n];
-    let mut t = vec![0.0; n];
-    let (mut rho_prev, mut omega, mut alpha) = (0.0_f64, 0.0_f64, 0.0_f64);
-    let finish = |x: Vec<f64>, r: &[f64], converged: bool, iterations: usize| {
-        let residual_norm = vec_norm(r) / b_norm;
-        IterativeSolveResult {
-            solution: x,
-            converged,
-            iterations,
-            residual_norm,
-        }
-    };
-    for iteration in 0..max_iter {
-        if vec_norm(&r) < atol {
-            // status: ‖r‖ < tol·‖b‖
-            return Ok(finish(x, &r, true, iteration));
-        }
-        let rho = dot_product(&r_tilde, &r);
-        if rho.abs() < breakdown_tol {
-            // status: ρ breakdown (SciPy info −10)
-            return Ok(finish(x, &r, false, iteration));
-        }
-        if iteration > 0 {
-            if omega.abs() < breakdown_tol {
-                // status: ω breakdown (SciPy info −11)
-                return Ok(finish(x, &r, false, iteration));
-            }
-            let beta = (rho / rho_prev) * (alpha / omega);
-            for i in 0..n {
-                p[i] -= omega * v[i];
-                p[i] *= beta;
-                p[i] += r[i];
-            }
-        } else {
-            p.copy_from_slice(&r);
-        }
-        let p_hat = apply_preconditioner(&preconditioner, &p)?;
-        a.matvec_into(&p_hat, &mut v)?;
-        let rv = dot_product(&r_tilde, &v);
-        if rv == 0.0 {
-            // status: r̃ᵀv = 0 breakdown (SciPy info −11)
-            return Ok(finish(x, &r, false, iteration));
-        }
-        alpha = rho / rv;
-        for (ri, vi) in r.iter_mut().zip(&v) {
-            *ri -= alpha * vi;
-        }
-        if vec_norm(&r) < atol {
-            for (xi, pi) in x.iter_mut().zip(&p_hat) {
-                *xi += alpha * pi;
-            }
-            // status: ‖s‖ < tol·‖b‖ at the half step
-            return Ok(finish(x, &r, true, iteration + 1));
-        }
-        let s_hat = apply_preconditioner(&preconditioner, &r)?;
-        a.matvec_into(&s_hat, &mut t)?;
-        omega = dot_product(&t, &r) / dot_product(&t, &t);
-        for i in 0..n {
-            x[i] += alpha * p_hat[i];
-        }
-        for i in 0..n {
-            x[i] += omega * s_hat[i];
-        }
-        for (ri, ti) in r.iter_mut().zip(&t) {
-            *ri -= omega * ti;
-        }
-        rho_prev = rho;
-    }
-    // status: SciPy returns `info = maxiter` here without re-testing the last residual.
-    Ok(finish(x, &r, false, max_iter))
+    bicgstab_solve(a, b, Some(&preconditioner), x0, options)
 }
 
 /// GMRES (Generalized Minimal Residual) solver for general (non-symmetric) sparse systems.
@@ -10127,7 +10042,7 @@ pub fn gmres(
         None => vec![0.0; n],
     };
 
-    let b_norm = gmres_norm(b)?;
+    let b_norm = krylov_norm(b)?;
     if rhs_is_zero(b_norm) {
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
@@ -10144,7 +10059,7 @@ pub fn gmres(
     let mut inner_tol = options.tol;
 
     let mut residual = checked_krylov_residual(a, b, &x)?;
-    let mut r_norm = gmres_norm(&residual)?;
+    let mut r_norm = krylov_norm(&residual)?;
     let mut converged = ScaledValue::from_f64(r_norm).abs_le(threshold);
     for _ in 0..max_cycles {
         if converged {
@@ -10161,7 +10076,7 @@ pub fn gmres(
         // Reuse this true residual to seed the next cycle. A happy breakdown
         // exhausts the basis even when a singular system has a residual floor.
         residual = checked_krylov_residual(a, b, &x)?;
-        r_norm = gmres_norm(&residual)?;
+        r_norm = krylov_norm(&residual)?;
         converged = ScaledValue::from_f64(r_norm).abs_le(threshold);
         if converged || stop == KrylovCycleStop::Breakdown {
             break;
@@ -10275,7 +10190,7 @@ fn gmres_inner(
         checked_krylov_matvec(a, current_basis, &mut wj)?;
         // Captured before orthogonalization: this is what the breakdown test
         // below is measured against (frankenscipy-4u7vp).
-        let w_norm_before = gmres_norm(&wj)?;
+        let w_norm_before = krylov_norm(&wj)?;
 
         // Modified Gram-Schmidt orthogonalization
         for i in 0..=j {
@@ -10285,7 +10200,7 @@ fn gmres_inner(
             subtract_scaled_basis_vector(&mut wj, coefficient, basis);
         }
 
-        h[j + 1][j] = gmres_norm(&wj)?;
+        h[j + 1][j] = krylov_norm(&wj)?;
 
         if h[j + 1][j].abs() <= arnoldi_breakdown_floor(w_norm_before) {
             // Lucky breakdown — solution is in the current Krylov subspace
@@ -11289,190 +11204,154 @@ pub fn cgs(
 ///
 /// Solves Ax = b for general square A. More stable than BiCG, smoother convergence
 /// than GMRES for many problems. The default recommendation for non-symmetric systems.
-/// Matches `scipy.sparse.linalg.bicgstab(A, b)`. `A` may be any [`LinearOperator`].
+/// Uses SciPy's BiCGSTAB recurrence. `A` may be any [`LinearOperator`]. Both the
+/// convergence flag and reported relative residual refer to the returned iterate.
 pub fn bicgstab(
     a: &dyn LinearOperator,
     b: &[f64],
     x0: Option<&[f64]>,
     options: IterativeSolveOptions,
 ) -> SparseResult<IterativeSolveResult> {
-    let shape = a.shape();
-    if !shape.is_square() {
-        return Err(SparseError::InvalidShape {
-            message: "BiCGSTAB requires a square matrix".to_string(),
-        });
-    }
-    let n = shape.rows;
-    if b.len() != n {
-        return Err(SparseError::IncompatibleShape {
-            message: "rhs length must match matrix rows".to_string(),
-        });
-    }
-    validate_iterative_finite_inputs(a, b, x0, options)?;
+    bicgstab_solve(a, b, None, x0, options)
+}
 
-    let max_iter = options.max_iter.unwrap_or(n * 10);
-
-    let mut x: Vec<f64> = match x0 {
-        Some(initial) => {
-            if initial.len() != n {
-                return Err(SparseError::IncompatibleShape {
-                    message: "initial guess length must match matrix rows".to_string(),
-                });
-            }
-            initial.to_vec()
-        }
-        None => vec![0.0; n],
-    };
-
-    let b_norm = vec_norm(b);
+fn bicgstab_solve(
+    a: &dyn LinearOperator,
+    b: &[f64],
+    preconditioner: Option<&KrylovPreconditioner<'_>>,
+    x0: Option<&[f64]>,
+    options: IterativeSolveOptions,
+) -> SparseResult<IterativeSolveResult> {
+    let mut x = preconditioned_krylov_start("BiCGSTAB", a, b, x0, options)?;
+    let n = b.len();
+    let b_norm = krylov_norm(b)?;
     if rhs_is_zero(b_norm) {
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
-            // status: ‖b‖ = 0 (rhs_is_zero), so x = 0 solves exactly
+            // status: an exactly zero RHS has the zero solution
             converged: true,
             iterations: 0,
             residual_norm: 0.0,
         });
     }
-
-    // r = b - A*x
-    let ax = a.matvec(&x)?;
-    let mut r: Vec<f64> = b.iter().zip(ax.iter()).map(|(bi, axi)| bi - axi).collect();
-
-    // r_hat = r (shadow residual, kept constant)
-    let r_hat = r.clone();
-
-    let mut rho = 1.0;
-    let mut alpha = 1.0;
-    let mut omega: f64 = 1.0;
-
-    let mut v = vec![0.0; n];
+    let coefficient_error = || SparseError::NonFiniteInput {
+        message: "BiCGSTAB step coefficient is outside the finite floating-point range".to_string(),
+    };
+    let rhs_scale = ScaledValue::from_f64(b_norm);
+    let threshold = rhs_scale.mul(ScaledValue::from_f64(options.tol));
+    let within_tolerance = |norm| norm == 0.0 || !threshold.abs_le(ScaledValue::from_f64(norm));
+    let max_iter = options.max_iter.unwrap_or_else(|| n.saturating_mul(10));
+    let mut r = if x.iter().any(|&value| value != 0.0) {
+        checked_krylov_residual(a, b, &x)?
+    } else {
+        b.to_vec()
+    };
+    let mut r_tilde = r.clone();
     let mut p = vec![0.0; n];
-    // Reused per-iteration scratch (A·p, s, A·s) — byte-identical. frankenscipy-2hclc.
-    let mut s = vec![0.0; n];
+    let mut v = vec![0.0; n];
     let mut t = vec![0.0; n];
-
-    for iteration in 0..max_iter {
-        let r_norm = vec_norm(&r);
-        if r_norm / b_norm < options.tol {
-            return Ok(IterativeSolveResult {
-                solution: x,
-                // status: ‖r‖/‖b‖ < tol
-                converged: true,
-                iterations: iteration,
-                residual_norm: r_norm / b_norm,
-            });
-        }
-
-        let rho_new = dot_product(&r_hat, &r);
-        if rho_new.abs() < KRYLOV_BREAKDOWN_TOL {
-            // Breakdown: r_hat ⊥ r
-            return Ok(IterativeSolveResult {
-                solution: x,
-                converged: false,
-                iterations: iteration,
-                residual_norm: r_norm / b_norm,
-            });
-        }
-
-        // SciPy checks the omega breakdown HERE — on the quotient carried in
-        // from the previous sweep, guarded by `iteration > 0` — rather than
-        // on the `t·t` denominator that produced it. `omega` starts at 1.0,
-        // so the first sweep has nothing to test.
-        if iteration > 0 && omega.abs() < KRYLOV_BREAKDOWN_TOL {
-            return Ok(IterativeSolveResult {
-                solution: x,
-                converged: false,
-                iterations: iteration,
-                residual_norm: r_norm / b_norm,
-            });
-        }
-
-        let beta = (rho_new / rho) * (alpha / omega);
-        rho = rho_new;
-
-        // p = r + beta * (p - omega * v)
-        for i in 0..n {
-            p[i] = r[i] + beta * (p[i] - omega * v[i]);
-        }
-
-        // v = A * p
-        a.matvec_into(&p, &mut v)?;
-
-        // Exact test, as SciPy does (`if rv == 0`).
-        let r_hat_v = dot_product(&r_hat, &v);
-        if r_hat_v == 0.0 {
-            // Breakdown
-            return Ok(IterativeSolveResult {
-                solution: x,
-                converged: false,
-                iterations: iteration,
-                residual_norm: r_norm / b_norm,
-            });
-        }
-        alpha = rho / r_hat_v;
-
-        // s = r - alpha * v
-        for i in 0..n {
-            s[i] = r[i] - alpha * v[i];
-        }
-
-        let s_norm = vec_norm(&s);
-        if s_norm / b_norm < options.tol {
-            // Early convergence: x += alpha * p
-            for i in 0..n {
-                x[i] += alpha * p[i];
+    let mut rho_prev = ScaledValue::default();
+    let (mut alpha, mut omega) = (1.0_f64, 1.0_f64);
+    let mut fresh_direction = true;
+    let mut iterations = 0;
+    let mut candidate = within_tolerance(krylov_norm(&r)?);
+    while iterations < max_iter {
+        if candidate {
+            // Repeated floating-point updates can drive the recursive residual to
+            // zero even when the rounded iterate does not solve the system.
+            r = checked_krylov_residual(a, b, &x)?;
+            let norm = krylov_norm(&r)?;
+            if within_tolerance(norm) {
+                return Ok(IterativeSolveResult {
+                    solution: x,
+                    // status: checked ||b - Ax|| against the requested tolerance
+                    converged: true,
+                    iterations,
+                    residual_norm: norm / b_norm,
+                });
             }
-            return Ok(IterativeSolveResult {
-                solution: x,
-                // status: half-step residual ‖s‖/‖b‖ < tol
-                converged: true,
-                iterations: iteration + 1,
-                residual_norm: s_norm / b_norm,
-            });
+            r_tilde.copy_from_slice(&r);
+            fresh_direction = true;
+        }
+        let rho = cg_dot(&r_tilde, &r);
+        // Preserve SciPy's absolute breakdown tests on rho and omega.
+        if !ScaledValue::from_f64(KRYLOV_BREAKDOWN_TOL).abs_le(rho) {
+            break;
+        }
+        if fresh_direction {
+            p.copy_from_slice(&r);
+            fresh_direction = false;
+        } else {
+            if omega.abs() < KRYLOV_BREAKDOWN_TOL {
+                break;
+            }
+            let beta = rho
+                .div(rho_prev)
+                .mul(ScaledValue::from_f64(alpha))
+                .div(ScaledValue::from_f64(omega))
+                .to_f64()
+                .ok_or_else(coefficient_error)?;
+            for i in 0..n {
+                p[i] = r[i] + beta * (p[i] - omega * v[i]);
+            }
+        }
+        let p_hat = krylov_precondition(preconditioner, &p)?;
+        checked_krylov_matvec(a, &p_hat, &mut v)?;
+        let rv = cg_dot(&r_tilde, &v);
+        if rv.mantissa == 0.0 {
+            break;
+        }
+        alpha = rho.div(rv).to_f64().ok_or_else(coefficient_error)?;
+        for (ri, &vi) in r.iter_mut().zip(&v) {
+            *ri -= alpha * vi;
+        }
+        iterations += 1;
+        candidate = within_tolerance(krylov_norm(&r)?);
+        if candidate {
+            for (xi, &pi) in x.iter_mut().zip(p_hat.iter()) {
+                *xi += alpha * pi;
+            }
+            // A half step may converge even on the last allowed iteration.
+            if iterations == max_iter {
+                break;
+            }
+            continue;
         }
 
-        // t = A * s
-        a.matvec_into(&s, &mut t)?;
-
-        // omega = (t · s) / (t · t)
-        //
-        // SciPy divides here unguarded and tests the resulting `omega` at the
-        // top of the next sweep. It gated `t·t` instead, which is wrong twice
-        // over: `t·t` is a SQUARED norm, so a threshold of 2.220e-10 rejected
-        // ‖t‖ ≈ 7e-6, and the quantity that actually has to be non-degenerate
-        // is the quotient, not the denominator. `t·t` is zero only when `t` is
-        // exactly zero, in which case `s` already solved the system and the
-        // `s_norm` check above returned.
-        let t_dot_s = dot_product(&t, &s);
-        let t_dot_t = dot_product(&t, &t);
-        if t_dot_t == 0.0 {
-            return Ok(IterativeSolveResult {
-                solution: x,
-                converged: false,
-                iterations: iteration + 1,
-                residual_norm: s_norm / b_norm,
-            });
+        let s_hat = krylov_precondition(preconditioner, &r)?;
+        checked_krylov_matvec(a, &s_hat, &mut t)?;
+        let tt = cg_dot(&t, &t);
+        if tt.mantissa == 0.0 {
+            // A*M can annihilate a nonzero residual. Keep the last full iterate.
+            break;
         }
-        omega = t_dot_s / t_dot_t;
-
-        // x += alpha * p + omega * s
+        omega = cg_dot(&t, &r)
+            .div(tt)
+            .to_f64()
+            .ok_or_else(coefficient_error)?;
         for i in 0..n {
-            x[i] += alpha * p[i] + omega * s[i];
+            // Preserve the rounding of the original plain and preconditioned updates.
+            if preconditioner.is_some() {
+                x[i] += alpha * p_hat[i];
+                x[i] += omega * s_hat[i];
+            } else {
+                x[i] += alpha * p_hat[i] + omega * s_hat[i];
+            }
         }
-
-        // r = s - omega * t
-        for i in 0..n {
-            r[i] = s[i] - omega * t[i];
+        for (ri, &ti) in r.iter_mut().zip(&t) {
+            *ri -= omega * ti;
         }
+        rho_prev = rho;
+        // As in SciPy, reaching maxiter at a full step exhausts the budget.
+        candidate = iterations < max_iter && within_tolerance(krylov_norm(&r)?);
     }
-
-    let final_norm = vec_norm(&r) / b_norm;
+    let norm = krylov_norm(&checked_krylov_residual(a, b, &x)?)?;
     Ok(IterativeSolveResult {
         solution: x,
-        converged: false,
-        iterations: max_iter,
-        residual_norm: final_norm,
+        // status: a half-step or initial candidate must satisfy the actual residual test
+        converged: candidate && within_tolerance(norm),
+        iterations,
+        residual_norm: norm / b_norm,
     })
 }
 
@@ -51416,6 +51295,100 @@ mod linear_operator_solver_tests {
                 bicgstab_preconditioned(a, b, |r: &[f64]| Ok(r.to_vec()), None, options())
             }),
         ]
+    }
+
+    #[test]
+    fn bicgstab_certifies_the_rounded_solution() {
+        // There is no f64 x with fl(3*x) == next_up(3). The half-step
+        // residual nevertheless rounds to zero after the first scalar update.
+        let op = FunctionOperator::new(Shape2D::new(1, 1), |x: &[f64]| Ok(vec![3.0 * x[0]]));
+        let b = [3.0_f64.next_up()];
+        let opts = IterativeSolveOptions {
+            tol: 1e-17,
+            max_iter: Some(4),
+            ..options()
+        };
+        for result in [
+            bicgstab(&op, &b, Some(&[1.0]), opts),
+            bicgstab_preconditioned(&op, &b, |r| Ok(r.to_vec()), Some(&[1.0]), opts),
+        ] {
+            let result = result.expect("finite solve");
+            let actual = (b[0] - 3.0 * result.solution[0]).abs() / b[0];
+            assert!(actual > opts.tol);
+            assert!(!result.converged);
+            assert_eq!(result.residual_norm, actual);
+            assert!(result.iterations <= 4);
+        }
+    }
+
+    #[test]
+    fn bicgstab_singular_stabilization_reports_actual_residual() {
+        // The half-step leaves s = [0, -2] in ker(A). An omega step is
+        // undefined even though all inputs and the most recent iterate are finite.
+        let op = FunctionOperator::new(Shape2D::new(2, 2), |x: &[f64]| Ok(vec![x[0], 2.0 * x[0]]));
+        let b = [1.0, 0.0];
+        for result in [
+            bicgstab(&op, &b, None, options()),
+            bicgstab_preconditioned(&op, &b, |r| Ok(r.to_vec()), None, options()),
+        ] {
+            let result = result.expect("finite breakdown");
+            assert!(!result.converged);
+            assert_eq!(result.iterations, 1);
+            let actual = (1.0 - result.solution[0]).hypot(2.0 * result.solution[0]);
+            assert!(actual.is_finite());
+            assert_eq!(result.residual_norm, actual);
+        }
+    }
+
+    #[test]
+    fn bicgstab_rejects_incomplete_products_and_nonfinite_preconditioners() {
+        struct PartialProduct;
+        impl LinearOperator for PartialProduct {
+            fn shape(&self) -> Shape2D {
+                Shape2D::new(2, 2)
+            }
+
+            fn matvec_into(&self, x: &[f64], out: &mut [f64]) -> SparseResult<()> {
+                out[0] = x[0];
+                Ok(())
+            }
+        }
+
+        let b = [1.0, 0.0];
+        for result in [
+            bicgstab(&PartialProduct, &b, None, options()),
+            bicgstab_preconditioned(&PartialProduct, &b, |r| Ok(r.to_vec()), None, options()),
+            bicgstab_preconditioned(
+                &materialized(2),
+                &b,
+                |_| Ok(vec![f64::NAN; 2]),
+                None,
+                options(),
+            ),
+        ] {
+            assert!(matches!(result, Err(SparseError::NonFiniteInput { .. })));
+        }
+    }
+
+    #[test]
+    fn bicgstab_preserves_large_finite_dots_and_last_half_step() {
+        let op = FunctionOperator::new(Shape2D::new(1, 1), |x: &[f64]| Ok(vec![2.0 * x[0]]));
+        let b = [1e200];
+        let opts = IterativeSolveOptions {
+            tol: 0.0,
+            max_iter: Some(1),
+            ..options()
+        };
+        for result in [
+            bicgstab(&op, &b, None, opts),
+            bicgstab_preconditioned(&op, &b, |r| Ok(r.to_vec()), None, opts),
+        ] {
+            let result = result.expect("finite solve");
+            assert!(result.converged);
+            assert_eq!(result.iterations, 1);
+            assert_eq!(result.solution, [0.5e200]);
+            assert_eq!(result.residual_norm, 0.0);
+        }
     }
 
     #[test]
