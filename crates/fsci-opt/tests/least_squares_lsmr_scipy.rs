@@ -14,6 +14,195 @@ use fsci_opt::{
 use fsci_sparse::{CsrMatrix, DenseLinearOperator, Shape2D};
 use serde::{Deserialize, Serialize};
 
+#[test]
+fn exact_trf_matches_scipy_across_residual_units() {
+    #[derive(Debug, Serialize)]
+    struct UnitsCase {
+        problem: usize,
+        scale: f64,
+        reference_scale: f64,
+    }
+    #[derive(Deserialize)]
+    struct UnitsReference {
+        x: Vec<f64>,
+        cost: f64,
+        status: i32,
+    }
+    #[derive(Deserialize)]
+    struct UnitsOracle {
+        scipy: String,
+        numpy: String,
+        rows: Vec<UnitsReference>,
+    }
+
+    fn residuals(problem: usize, x: &[f64]) -> Vec<f64> {
+        match problem {
+            0 => vec![x[0] - 3.0, 0.25 * (x[1] + 2.0)],
+            1 => [-0.2, 0.1, 0.05, 0.3, -0.1]
+                .iter()
+                .enumerate()
+                .map(|(i, noise)| {
+                    let t = i as f64 - 2.0;
+                    x[0] * t + x[1] - (3.0 * t - 2.0 + noise)
+                })
+                .collect(),
+            2 => vec![10.0 * (x[1] - x[0] * x[0]), 1.0 - x[0]],
+            _ => unreachable!(),
+        }
+    }
+
+    fn jacobian(problem: usize, x: &[f64]) -> Vec<Vec<f64>> {
+        match problem {
+            0 => vec![vec![1.0, 0.0], vec![0.0, 0.25]],
+            1 => (0..5).map(|i| vec![f64::from(i) - 2.0, 1.0]).collect(),
+            2 => vec![vec![-20.0 * x[0], 10.0], vec![-1.0, 0.0]],
+            _ => unreachable!(),
+        }
+    }
+
+    let required = std::env::var("FSCI_REQUIRE_SCIPY_ORACLE").as_deref() == Ok("1");
+    let python = std::env::var("FSCI_PYTHON").unwrap_or_else(|_| "python3".into());
+    let available = Command::new(&python)
+        .args(["-c", "import scipy; import numpy"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !available {
+        assert!(!required, "required SciPy oracle unavailable via {python}");
+        eprintln!("SKIP exact TRF residual units: missing SciPy; compared cases = 0");
+        return;
+    }
+    let cases: Vec<_> = (0..3)
+        .flat_map(|problem| {
+            [
+                1e-150, 1e-100, 1e-40, 1e-20, 1.0, 1e20, 1e40, 1e60, 1e100, 1e150,
+            ]
+            .into_iter()
+            .map(move |scale| UnitsCase {
+                problem,
+                scale,
+                // SciPy's cubic-denominator secular derivative also loses
+                // these units. Compare to the mathematically identical
+                // normalized objective explicitly, rather than treating
+                // a failed SciPy solve as a passing comparison.
+                reference_scale: if (1e-40..=1e40).contains(&scale) {
+                    scale
+                } else {
+                    1.0
+                },
+            })
+        })
+        .collect();
+    let script = r#"
+import json, sys, warnings
+import numpy as np
+import scipy
+from scipy.optimize import least_squares
+
+def problem(k):
+    if k == 0:
+        return (lambda x: np.array([x[0]-3., .25*(x[1]+2.)]),
+                lambda x: np.array([[1., 0.], [0., .25]]), np.zeros(2))
+    if k == 1:
+        t = np.arange(5.) - 2.
+        y = 3.*t - 2. + np.array([-.2, .1, .05, .3, -.1])
+        return (lambda x: x[0]*t + x[1] - y,
+                lambda x: np.column_stack([t, np.ones(5)]), np.zeros(2))
+    return (lambda x: np.array([10.*(x[1]-x[0]**2), 1.-x[0]]),
+            lambda x: np.array([[-20.*x[0], 10.], [-1., 0.]]), np.array([-1.2, 1.]))
+
+rows = []
+for case in json.loads(sys.argv[1]):
+    fun, jac, x0 = problem(case['problem'])
+    scale = case['reference_scale']
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', UserWarning)
+        result = least_squares(lambda x: scale*fun(x), x0,
+                               jac=lambda x: scale*jac(x), method='trf',
+                               tr_solver='exact', ftol=1e-12, xtol=1e-12,
+                               gtol=1e-12*scale*scale, max_nfev=200)
+    rows.append(dict(x=result.x.tolist(), cost=float(result.cost), status=int(result.status)))
+print(json.dumps(dict(scipy=scipy.__version__, numpy=np.__version__, rows=rows), allow_nan=False))
+"#;
+    let output = Command::new(&python)
+        .args(["-c", script, &serde_json::to_string(&cases).unwrap()])
+        .output()
+        .expect("launch SciPy residual-unit oracle");
+    assert!(
+        output.status.success(),
+        "SciPy residual-unit oracle failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let oracle: UnitsOracle = serde_json::from_slice(&output.stdout).expect("SciPy result JSON");
+    if required {
+        assert_eq!((&*oracle.scipy, &*oracle.numpy), ("1.17.1", "2.4.3"));
+    }
+    assert_eq!(oracle.rows.len(), cases.len());
+    let mut direct_comparisons = 0;
+    let mut normalized_comparisons = 0;
+    for (case, reference) in cases.iter().zip(&oracle.rows) {
+        let problem = case.problem;
+        let scale = case.scale;
+        let x0 = if problem == 2 {
+            [-1.2, 1.0]
+        } else {
+            [0.0, 0.0]
+        };
+        let result = least_squares(
+            |x| {
+                residuals(problem, x)
+                    .into_iter()
+                    .map(|v| scale * v)
+                    .collect()
+            },
+            &x0,
+            LeastSquaresOptions {
+                method: Some(LeastSquaresMethod::Trf),
+                tr_solver: TrustRegionSolver::Exact,
+                jac: Some(LeastSquaresJacobian::new(move |x| {
+                    jacobian(problem, x)
+                        .into_iter()
+                        .map(|row| row.into_iter().map(|v| scale * v).collect())
+                        .collect()
+                })),
+                ftol: 1e-12,
+                xtol: 1e-12,
+                gtol: 1e-12 * scale * scale,
+                max_nfev: Some(200),
+                ..LeastSquaresOptions::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("{case:?}: {error}"));
+        assert!(reference.status > 0, "oracle did not converge: {case:?}");
+        assert!(result.success, "{case:?}: {result:?}");
+        assert_eq!(result.x.len(), reference.x.len());
+        for (actual, expected) in result.x.iter().zip(&reference.x) {
+            assert!(
+                actual.is_finite() && (actual - expected).abs() < 1e-7 * expected.abs().max(1.0),
+                "{case:?}: {actual} != SciPy {expected}"
+            );
+        }
+        let cost = result.cost / scale / scale;
+        let reference_cost = reference.cost / case.reference_scale / case.reference_scale;
+        assert!(
+            cost.is_finite()
+                && (cost - reference_cost).abs() < 1e-10 * reference_cost.abs().max(1.0),
+            "{case:?}: normalized cost {cost} != SciPy {reference_cost}"
+        );
+        if scale == case.reference_scale {
+            direct_comparisons += 1;
+        } else {
+            normalized_comparisons += 1;
+        }
+    }
+    assert_eq!(direct_comparisons, 15);
+    assert_eq!(normalized_comparisons, 15);
+    eprintln!(
+        "Exact TRF residual units: {direct_comparisons} direct SciPy comparisons, \
+         {normalized_comparisons} equivalent normalized-objective comparisons; SciPy {}, NumPy {}",
+        oracle.scipy, oracle.numpy
+    );
+}
+
 fn custom_loss_residuals(x: &[f64]) -> Vec<f64> {
     let noise = [0.05, -0.01, 0.02, 1.5, -0.04, 0.01, -1.0, 0.03, 0.0];
     let mut residuals: Vec<f64> = noise

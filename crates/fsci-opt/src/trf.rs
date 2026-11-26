@@ -649,22 +649,52 @@ fn solve_lsq_trust_region(
         }
         out
     };
-    let phi_and_derivative = |alpha: f64| -> (f64, f64) {
+    let phi_and_newton_ratio = |alpha: f64| -> (f64, f64) {
         let denom: Vec<f64> = s.iter().map(|si| si * si + alpha).collect();
-        let p_norm = norm(
-            &suf.iter()
-                .zip(&denom)
-                .map(|(a, b)| a / b)
-                .collect::<Vec<_>>(),
-        );
+        let coefficients: Vec<f64> = suf.iter().zip(&denom).map(|(a, b)| a / b).collect();
+        let p_norm = norm(&coefficients);
         let phi = p_norm - delta;
-        let phi_prime = -suf
+        let mut ordinary_powers = true;
+        let derivative_sum = suf
             .iter()
             .zip(&denom)
-            .map(|(a, d)| a * a / (d * d * d))
-            .sum::<f64>()
-            / p_norm;
-        (phi, phi_prime)
+            .map(|(a, d)| {
+                let square = a * a;
+                let cube = d * d * d;
+                ordinary_powers &= (square.is_normal() || *a == 0.0) && cube.is_normal();
+                square / cube
+            })
+            .sum::<f64>();
+        let phi_prime = -derivative_sum / p_norm;
+        let ratio = if ordinary_powers && phi_prime.is_normal() {
+            phi / phi_prime
+        } else {
+            // With w_i = s_i*Uf_i/(s_i² + alpha),
+            // phi' = -||w|| * sum((w_i/||w||)²/(s_i² + alpha)).
+            // The norm below keeps those squares scaled; divide twice instead
+            // of squaring it. This retains the Newton correction even when
+            // the original fourth/sixth powers, or phi' itself, cannot fit.
+            let derivative_norm = norm(
+                &coefficients
+                    .iter()
+                    .zip(&denom)
+                    .map(|(value, denominator)| (value / p_norm) / denominator.sqrt())
+                    .collect::<Vec<_>>(),
+            );
+            -((phi / p_norm) / derivative_norm) / derivative_norm
+        };
+        (phi, ratio)
+    };
+    let bracket_alpha = |lower: f64, upper: f64| {
+        let product = lower * upper;
+        let geometric_mean = if product.is_normal() || lower == 0.0 {
+            product.sqrt()
+        } else {
+            // Both endpoints can be finite while their product overflows or
+            // underflows. Their geometric mean remains inside the bracket.
+            lower.sqrt() * upper.sqrt()
+        };
+        (0.001 * upper).max(geometric_mean)
     };
 
     let full_rank = if m >= n {
@@ -684,25 +714,23 @@ fn solve_lsq_trust_region(
     }
     let mut alpha_upper = norm(&suf) / delta;
     let mut alpha_lower = if full_rank {
-        let (phi, phi_prime) = phi_and_derivative(0.0);
-        -phi / phi_prime
+        -phi_and_newton_ratio(0.0).1
     } else {
         0.0
     };
     let mut alpha = if !full_rank && initial_alpha == 0.0 {
-        (0.001 * alpha_upper).max((alpha_lower * alpha_upper).sqrt())
+        bracket_alpha(alpha_lower, alpha_upper)
     } else {
         initial_alpha
     };
     for _ in 0..MAX_ITER {
         if alpha < alpha_lower || alpha > alpha_upper {
-            alpha = (0.001 * alpha_upper).max((alpha_lower * alpha_upper).sqrt());
+            alpha = bracket_alpha(alpha_lower, alpha_upper);
         }
-        let (phi, phi_prime) = phi_and_derivative(alpha);
+        let (phi, ratio) = phi_and_newton_ratio(alpha);
         if phi < 0.0 {
             alpha_upper = alpha;
         }
-        let ratio = phi / phi_prime;
         alpha_lower = alpha_lower.max(alpha - ratio);
         alpha -= (phi + delta) * ratio / delta;
         if phi.abs() < RTOL * delta {
@@ -1710,6 +1738,80 @@ mod tests {
             super::dot(&ordinary, &ordinary).sqrt().to_bits()
         );
         assert_eq!(super::norm(&[0.0, -0.0]), 0.0);
+    }
+
+    #[test]
+    fn exact_trust_region_step_is_invariant_to_residual_units() {
+        // The unconstrained step [3, -2] is outside the unit trust region.
+        // Scaling both J and f changes the objective's units, not its minimizer.
+        let vectors = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        // Independent diagonal secular equation:
+        // (3/(1+alpha))² + (0.125/(0.0625+alpha))² = 1.
+        let expected = [0.998_171_528_915_490_2, -0.060_445_006_927_891_54];
+        for magnitude in [1e-150, 1e-100, 1e-60, 1.0, 1e60, 1e100, 1e150] {
+            let (step, alpha) = super::solve_lsq_trust_region(
+                2,
+                2,
+                &[-3.0 * magnitude, 0.5 * magnitude],
+                &[magnitude, 0.25 * magnitude],
+                &vectors,
+                1.0,
+                0.0,
+            );
+            assert!(
+                alpha.is_finite() && alpha > 0.0,
+                "units={magnitude}: {alpha}"
+            );
+            assert!((super::norm(&step) - 1.0).abs() < 2e-14);
+            for (&actual, &expected) in step.iter().zip(&expected) {
+                assert!(
+                    actual.is_finite() && (actual - expected).abs() < 5e-9,
+                    "units={magnitude}: step={step:?}"
+                );
+            }
+            // KKT stationarity independently rejects the old finite but wrong
+            // direction at 1e-60, not just its NaNs at more extreme units.
+            let normalized_alpha = alpha / magnitude / magnitude;
+            let stationarity = [
+                (1.0 + normalized_alpha) * step[0] - 3.0,
+                (0.0625 + normalized_alpha) * step[1] + 0.125,
+            ];
+            assert!(
+                super::norm(&stationarity) < 1e-7,
+                "units={magnitude}: stationarity={stationarity:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_trf_fits_do_not_stall_when_residual_units_change() {
+        for magnitude in [1e-150, 1e-100, 1e-60, 1.0, 1e60, 1e100, 1e150] {
+            let result = least_squares(
+                |x| {
+                    assert!(x.iter().all(|value| value.is_finite()));
+                    vec![magnitude * (x[0] - 3.0), 0.25 * magnitude * (x[1] + 2.0)]
+                },
+                &[0.0, 0.0],
+                LeastSquaresOptions {
+                    method: Some(LeastSquaresMethod::Trf),
+                    tr_solver: TrustRegionSolver::Exact,
+                    jac: Some(LeastSquaresJacobian::new(move |_| {
+                        vec![vec![magnitude, 0.0], vec![0.0, 0.25 * magnitude]]
+                    })),
+                    // Absolute gradient units vary with magnitude squared.
+                    gtol: 0.0,
+                    ftol: 1e-12,
+                    xtol: 1e-12,
+                    max_nfev: Some(20),
+                    ..LeastSquaresOptions::default()
+                },
+            )
+            .unwrap_or_else(|error| panic!("units={magnitude}: {error}"));
+            assert!(result.success, "units={magnitude}: {result:?}");
+            assert!((result.x[0] - 3.0).abs() < 2e-12, "{result:?}");
+            assert!((result.x[1] + 2.0).abs() < 2e-12, "{result:?}");
+            assert!(result.cost.is_finite());
+        }
     }
 
     #[test]
