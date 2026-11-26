@@ -35966,18 +35966,19 @@ pub fn freeman_tukey_test(f_obs: &[f64], f_exp: Option<&[f64]>) -> (f64, f64) {
     power_divergence(f_obs, f_exp, -0.5)
 }
 
-/// Modified log-likelihood ratio test (Cressie-Read).
+/// Modified log-likelihood ratio test (Kullback-Leibler divergence of the expected counts).
 ///
-/// A power divergence test with lambda=2/3.
+/// A power divergence test with lambda=-1: `2 Σ e ln(e/o)`. SciPy's `"mod-log-likelihood"`
+/// is lambda=-1; lambda=2/3 is `"cressie-read"` ([`cressie_read_test`]).
 ///
 /// Matches `scipy.stats.power_divergence(f_obs, f_exp, lambda_="mod-log-likelihood")`.
 pub fn mod_log_likelihood_test(f_obs: &[f64], f_exp: Option<&[f64]>) -> (f64, f64) {
-    power_divergence(f_obs, f_exp, 2.0 / 3.0)
+    power_divergence(f_obs, f_exp, -1.0)
 }
 
 /// Cressie-Read test for goodness of fit.
 ///
-/// A power divergence test with lambda=2/3 (same as modified log-likelihood).
+/// A power divergence test with lambda=2/3.
 ///
 /// Matches `scipy.stats.power_divergence(f_obs, f_exp, lambda_="cressie-read")`.
 pub fn cressie_read_test(f_obs: &[f64], f_exp: Option<&[f64]>) -> (f64, f64) {
@@ -55794,6 +55795,12 @@ pub static POWER_DIV_FUSE_DISABLE: std::sync::atomic::AtomicBool =
 ///
 /// # Returns
 /// (statistic, p-value) where p-value is from chi-squared distribution with len-1 dof.
+///
+/// Zero counts give SciPy's IEEE results rather than being skipped. A cell with expected
+/// count 0 makes the statistic NaN when its observed count is also 0, and `inf` when the
+/// observed count is positive and `lambda_ >= 0`. A cell with observed count 0 makes it `inf`
+/// at `lambda_ = -1` and NaN for any other `lambda_ < 0`. An infinite statistic has p-value 0
+/// and a NaN statistic has p-value NaN.
 pub fn power_divergence(f_obs: &[f64], f_exp: Option<&[f64]>, lambda_: f64) -> (f64, f64) {
     let n = f_obs.len();
     if n < 2 {
@@ -55853,40 +55860,34 @@ pub fn power_divergence(f_obs: &[f64], f_exp: Option<&[f64]>, lambda_: f64) -> (
         return (f64::NAN, f64::NAN);
     }
 
+    // Every term is SciPy's own expression in IEEE arithmetic, with no guard on a zero
+    // count. An expected count of 0 or (for lambda < 0) an observed count of 0 makes a
+    // term infinite or NaN in SciPy, and the statistic follows: `chisquare([1, 1], [2, 0])`
+    // is inf. These terms used to be replaced by 0, which reported a finite statistic
+    // (0.5 there) for a sample SciPy rejects outright. For positive counts the
+    // expressions are unchanged, so ordinary inputs give the same bits as before.
     let stat = if (lambda_ - 1.0).abs() < 1e-10 {
         // Pearson chi-squared: Σ (o-e)²/e
         f_obs
             .iter()
             .zip(exp.iter())
-            .map(|(&o, &e)| if e > 0.0 { (o - e).powi(2) / e } else { 0.0 })
+            .map(|(&o, &e)| (o - e).powi(2) / e)
             .sum()
     } else if lambda_.abs() < 1e-10 {
-        // G-test (log-likelihood ratio): 2 Σ o ln(o/e)
+        // G-test (log-likelihood ratio): 2 Σ xlogy(o, o/e)
         2.0 * f_obs
             .iter()
             .zip(exp.iter())
-            .map(|(&o, &e)| {
-                if o > 0.0 && e > 0.0 {
-                    o * (o / e).ln()
-                } else {
-                    0.0
-                }
-            })
+            .map(|(&o, &e)| xlogy(o, o / e))
             .sum::<f64>()
     } else if (lambda_ + 1.0).abs() < 1e-10 {
         // Modified log-likelihood ratio (lambda=-1):
-        // 2 Σ e ln(e/o). The general formula above factors
+        // 2 Σ xlogy(e, e/o). The general formula above factors
         // 2/(λ*(λ+1)) which is 2/0 here, so use the limit.
         2.0 * f_obs
             .iter()
             .zip(exp.iter())
-            .map(|(&o, &e)| {
-                if o > 0.0 && e > 0.0 {
-                    e * (e / o).ln()
-                } else {
-                    0.0
-                }
-            })
+            .map(|(&o, &e)| xlogy(e, e / o))
             .sum::<f64>()
     } else {
         // General power divergence: 2/(λ(λ+1)) Σ o((o/e)^λ - 1)
@@ -55895,22 +55896,19 @@ pub fn power_divergence(f_obs: &[f64], f_exp: Option<&[f64]>, lambda_: f64) -> (
             * f_obs
                 .iter()
                 .zip(exp.iter())
-                .map(|(&o, &e)| {
-                    if o > 0.0 && e > 0.0 {
-                        o * ((o / e).powf(lambda_) - 1.0)
-                    } else {
-                        0.0
-                    }
-                })
+                .map(|(&o, &e)| o * ((o / e).powf(lambda_) - 1.0))
                 .sum::<f64>()
     };
 
     let dof = (n - 1) as f64;
-    let pvalue = if dof > 0.0 {
+    let pvalue = if dof <= 0.0 || stat.is_nan() {
+        f64::NAN
+    } else if stat == f64::INFINITY {
+        // SciPy's chi2.sf(inf) = 0.
+        0.0
+    } else {
         let dist = ChiSquared::new(dof);
         dist.sf(stat).clamp(0.0, 1.0)
-    } else {
-        f64::NAN
     };
 
     (stat, pvalue)
@@ -92118,6 +92116,134 @@ mod tests {
         let (stat, pvalue) = power_divergence(&obs, Some(&exp), 1.0);
         assert!(stat.is_nan());
         assert!(pvalue.is_nan());
+    }
+
+    #[test]
+    fn power_divergence_zero_counts_match_scipy() {
+        // A zero expected count, or a zero observed count at lambda < 0, used to contribute 0
+        // to the statistic, so `chisquare([1, 1], [2, 0])` returned 0.5 where SciPy returns
+        // inf. References: SciPy 1.18.1 `stats.power_divergence(f_obs, f_exp, lambda_=lam)`.
+        let (nan, inf) = (f64::NAN, f64::INFINITY);
+        let exp_has_zero: Option<&[f64]> = Some(&[2.0, 0.0][..]);
+        let exp_positive: Option<&[f64]> = Some(&[2.0, 2.0][..]);
+        let cases: &[(&[f64], Option<&[f64]>, f64, f64, f64)] = &[
+            // expected 0, observed positive: inf for lambda >= 0, a finite term below
+            (&[1.0, 1.0][..], exp_has_zero, 1.0, inf, 0.0),
+            (&[1.0, 1.0][..], exp_has_zero, 0.0, inf, 0.0),
+            (&[1.0, 1.0][..], exp_has_zero, 2.0 / 3.0, inf, 0.0),
+            (&[1.0, 1.0][..], exp_has_zero, 2.0, inf, 0.0),
+            (
+                &[1.0, 1.0][..],
+                exp_has_zero,
+                -1.0,
+                2.772588722239781,
+                0.0958909671424658,
+            ),
+            (
+                &[1.0, 1.0][..],
+                exp_has_zero,
+                -0.5,
+                4.686291501015239,
+                0.030404199984729353,
+            ),
+            (
+                &[1.0, 1.0][..],
+                exp_has_zero,
+                -2.0,
+                2.0,
+                0.15729920705028105,
+            ),
+            (
+                &[1.0, 1.0][..],
+                exp_has_zero,
+                -1.5,
+                2.2091389993231743,
+                0.13719522326413358,
+            ),
+            // expected 0 and observed 0: NaN for every lambda
+            (&[2.0, 0.0][..], exp_has_zero, 1.0, nan, nan),
+            (&[2.0, 0.0][..], exp_has_zero, 0.0, nan, nan),
+            (&[2.0, 0.0][..], exp_has_zero, -1.0, nan, nan),
+            (&[2.0, 0.0][..], exp_has_zero, -0.5, nan, nan),
+            (&[2.0, 0.0][..], exp_has_zero, 2.0 / 3.0, nan, nan),
+            // observed 0, expected positive: finite for lambda >= 0, inf at -1, NaN below 0
+            (
+                &[0.0, 4.0][..],
+                exp_positive,
+                1.0,
+                4.0,
+                0.045500263896358445,
+            ),
+            (
+                &[0.0, 4.0][..],
+                exp_positive,
+                0.0,
+                5.545177444479562,
+                0.018531677751199047,
+            ),
+            (
+                &[0.0, 4.0][..],
+                exp_positive,
+                2.0 / 3.0,
+                4.229287574171036,
+                0.039732114693796,
+            ),
+            (&[0.0, 4.0][..], exp_positive, -1.0, inf, 0.0),
+            (&[0.0, 4.0][..], exp_positive, -0.5, nan, nan),
+            (&[0.0, 4.0][..], exp_positive, -2.0, nan, nan),
+            (&[0.0, 4.0][..], exp_positive, -0.3, nan, nan),
+            // the default uniform expectation with an empty cell
+            (&[0.0, 4.0, 2.0][..], None, -1.0, inf, 0.0),
+            (&[0.0, 4.0, 2.0][..], None, -0.5, nan, nan),
+            (&[0.0, 4.0, 2.0][..], None, 0.0, 5.545177444479562, 0.0625),
+        ];
+        let matches = |got: f64, want: f64, rel: f64| {
+            if want.is_nan() {
+                got.is_nan()
+            } else if want.is_infinite() || want == 0.0 {
+                got == want
+            } else {
+                (got - want).abs() <= rel * want.abs()
+            }
+        };
+        for &(obs, exp, lambda, want_stat, want_p) in cases {
+            let (stat, p) = power_divergence(obs, exp, lambda);
+            assert!(
+                matches(stat, want_stat, 1e-12) && matches(p, want_p, 1e-10),
+                "power_divergence({obs:?}, {exp:?}, {lambda}) = ({stat}, {p}); \
+                 SciPy gives ({want_stat}, {want_p})"
+            );
+        }
+        let (stat, p) = chisquare(&[1.0, 1.0], exp_has_zero);
+        assert!(
+            stat == inf && p == 0.0,
+            "chisquare([1, 1], [2, 0]) = ({stat}, {p})"
+        );
+    }
+
+    #[test]
+    fn mod_log_likelihood_test_uses_scipy_lambda() {
+        // SciPy's "mod-log-likelihood" is lambda = -1; this wrapper used lambda = 2/3, which
+        // is "cressie-read". References: SciPy 1.18.1 `stats.power_divergence(f_obs, f_exp,
+        // lambda_="mod-log-likelihood")`.
+        let (stat, p) = mod_log_likelihood_test(&[10.0, 20.0, 30.0, 40.0], None);
+        assert!(
+            (stat - 24.355454857433738).abs() < 1e-12 * 24.355454857433738,
+            "stat {stat}"
+        );
+        assert!(
+            (p - 2.105534833779073e-05).abs() < 1e-10 * 2.105534833779073e-05,
+            "p {p}"
+        );
+        let (stat, p) = mod_log_likelihood_test(&[3.0, 5.0, 2.0], Some(&[4.0, 4.0, 2.0]));
+        assert!((stat - 0.5163081691005691).abs() < 1e-12, "stat {stat}");
+        assert!((p - 0.7724761962890626).abs() < 1e-12, "p {p}");
+        // and cressie_read_test keeps lambda = 2/3
+        let (stat, _) = cressie_read_test(&[3.0, 5.0, 2.0], Some(&[4.0, 4.0, 2.0]));
+        assert!(
+            (stat - 0.5011766616364995).abs() < 1e-12,
+            "cressie-read stat {stat}"
+        );
     }
 
     // ── Fisher's exact test ──────────────────────────────────────────
