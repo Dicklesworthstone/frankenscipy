@@ -4587,6 +4587,12 @@ where
 {
     validate_minimize_options(options)?;
     check_method_options(OptimizeMethod::Tnc, options)?;
+    validate_bounds_for_x0(x0, options.bounds)?;
+    if x0.is_empty() || x0.iter().any(|value| !value.is_finite()) {
+        return Err(OptError::InvalidArgument {
+            detail: String::from("TNC requires a nonempty finite initial point"),
+        });
+    }
 
     let n = x0.len();
     let tol = requested_tolerance(options.tol);
@@ -4598,6 +4604,7 @@ where
     // Previously bounds were ignored entirely, so TNC returned the unconstrained
     // optimum (e.g. [3,3] for a [0,2]² box instead of [2,2]).
     let bounds = options.bounds;
+    let bounded = bounds.is_some_and(bounds_have_finite_limit);
     let mut x = x0.to_vec();
     if let Some(b) = bounds {
         project_onto_bounds(&mut x, b);
@@ -4606,11 +4613,13 @@ where
     let mut njev = 0usize;
 
     let mut grad = {
-        let value = evaluate_minimize_gradient(
+        let value = evaluate_tnc_gradient(
             &mut objective,
             options.gradient,
             &x,
             options.gradient_eps.unwrap_or(CENTRAL_DIFF_EPS),
+            bounds,
+            f,
         )?;
         njev += 1;
         value
@@ -4621,11 +4630,32 @@ where
     }
 
     for iteration in 0..maxiter {
-        let proj_grad = if let Some(b) = bounds {
-            projected_gradient(&x, &grad, b)
-        } else {
-            grad.clone()
-        };
+        // Solve on the current free face. A full-space Newton direction can
+        // become uphill when its constrained components are clipped away.
+        // Recompute the face each iteration so inward gradients release bounds.
+        let free = bounds.map(|bounds| {
+            bounds
+                .iter()
+                .enumerate()
+                .map(|(i, &(lo, hi))| {
+                    let fixed = matches!((lo, hi), (Some(lo), Some(hi)) if lo == hi);
+                    !fixed
+                        && !(lo.is_some_and(|lo| x[i] <= lo) && grad[i] > 0.0)
+                        && !(hi.is_some_and(|hi| x[i] >= hi) && grad[i] < 0.0)
+                })
+                .collect::<Vec<_>>()
+        });
+        let proj_grad = grad
+            .iter()
+            .enumerate()
+            .map(|(i, &value)| {
+                if free.as_ref().is_none_or(|free| free[i]) {
+                    value
+                } else {
+                    0.0
+                }
+            })
+            .collect::<Vec<_>>();
         let grad_norm = l2_norm(&proj_grad);
         if grad_norm < tol {
             log_completion(
@@ -4665,8 +4695,26 @@ where
             });
         }
 
-        let direction = conjugate_gradient_solve(&hess_approx, &grad, tol, n.min(50));
-        let direction: Vec<f64> = direction.iter().map(|d| -d).collect();
+        let direction =
+            conjugate_gradient_solve(&hess_approx, &proj_grad, tol, n.min(50), free.as_deref());
+        let mut direction: Vec<f64> = direction.iter().map(|d| -d).collect();
+        if bounded {
+            let mut trial: Vec<f64> = x.iter().zip(&direction).map(|(xi, di)| xi + di).collect();
+            if let Some(bounds) = bounds {
+                project_onto_bounds(&mut trial, bounds);
+            }
+            let slope: f64 = grad
+                .iter()
+                .zip(&trial)
+                .zip(&x)
+                .map(|((g, t), x)| g * (t - x))
+                .sum();
+            if !slope.is_finite() || slope >= 0.0 {
+                // CG may return zero before a tight projected-gradient
+                // tolerance is met, or clipping may remove its descent.
+                direction = proj_grad.iter().map(|value| -value).collect();
+            }
+        }
 
         // Bound-projected backtracking line search. With bounds present each trial
         // point is clipped into the box, so the accepted step (and thus x) always
@@ -4684,9 +4732,17 @@ where
                     project_onto_bounds(&mut cand, b);
                 }
                 let step: Vec<f64> = cand.iter().zip(x.iter()).map(|(c, xi)| c - xi).collect();
-                let fv = objective.eval(&cand)?;
+                if bounded && step.iter().all(|&value| value == 0.0) {
+                    break;
+                }
                 let dd = dot(&grad, &step);
-                if fv <= f + 1.0e-4 * dd {
+                let descent = !bounded || (dd.is_finite() && dd < 0.0);
+                let fv = if descent {
+                    objective.eval(&cand)?
+                } else {
+                    f64::INFINITY
+                };
+                if descent && fv <= f + 1.0e-4 * dd {
                     accepted = Some((cand, fv, step));
                     break;
                 }
@@ -4718,11 +4774,13 @@ where
             }
         };
 
-        let grad_new = match evaluate_minimize_gradient(
+        let grad_new = match evaluate_tnc_gradient(
             &mut objective,
             options.gradient,
             &x_new,
             options.gradient_eps.unwrap_or(CENTRAL_DIFF_EPS),
+            bounds,
+            f_new,
         ) {
             Ok(v) => {
                 njev += 1;
@@ -4806,7 +4864,75 @@ where
     })
 }
 
-fn conjugate_gradient_solve(a: &[Vec<f64>], b: &[f64], tol: f64, max_iter: usize) -> Vec<f64> {
+/// TNC's objective is defined on its box, including during differentiation.
+/// Retain central differences where both probes fit; at a boundary use the
+/// same reversed/shortened two-point steps as the other bounded optimizers.
+/// Fixed coordinates need no probe, and the current objective value is cached.
+fn evaluate_tnc_gradient<F>(
+    objective: &mut Objective<'_, F>,
+    gradient: Option<GradientFunc>,
+    x: &[f64],
+    gradient_eps: f64,
+    bounds: Option<&[Bound]>,
+    f_at_x: f64,
+) -> Result<Vec<f64>, OptError>
+where
+    F: Fn(&[f64]) -> f64,
+{
+    let Some(bounds) = bounds.filter(|bounds| bounds_have_finite_limit(bounds)) else {
+        return evaluate_minimize_gradient(objective, gradient, x, gradient_eps);
+    };
+    if let Some(gradient_fn) = gradient {
+        return validate_gradient_output(gradient_fn(x), x.len());
+    }
+    let (lower, upper): (Vec<_>, Vec<_>) = bounds
+        .iter()
+        .map(|&(lo, hi)| (lo.unwrap_or(f64::NEG_INFINITY), hi.unwrap_or(f64::INFINITY)))
+        .unzip();
+    let steps = fd_steps_2point(x, gradient_eps, Some((&lower, &upper)));
+    let mut result = vec![0.0; x.len()];
+    let mut perturbed = x.to_vec();
+    for i in 0..x.len() {
+        if lower[i] == upper[i] {
+            continue;
+        }
+        let step = gradient_eps * (1.0 + x[i].abs());
+        let plus = x[i] + step;
+        let minus = x[i] - step;
+        if plus.is_finite()
+            && minus.is_finite()
+            && plus <= upper[i]
+            && minus >= lower[i]
+            && plus != x[i]
+            && minus != x[i]
+        {
+            perturbed[i] = plus;
+            let f_plus = objective.eval(&perturbed)?;
+            perturbed[i] = minus;
+            let f_minus = objective.eval(&perturbed)?;
+            result[i] = (f_plus - f_minus) / (2.0 * step);
+        } else {
+            perturbed[i] = (x[i] + steps[i]).clamp(lower[i], upper[i]);
+            let actual_step = perturbed[i] - x[i];
+            if actual_step == 0.0 || !actual_step.is_finite() {
+                return Err(OptError::InvalidArgument {
+                    detail: format!("no finite-difference step is representable inside bound {i}"),
+                });
+            }
+            result[i] = (objective.eval(&perturbed)? - f_at_x) / actual_step;
+        }
+        perturbed[i] = x[i];
+    }
+    validate_gradient_output(result, x.len())
+}
+
+fn conjugate_gradient_solve(
+    a: &[Vec<f64>],
+    b: &[f64],
+    tol: f64,
+    max_iter: usize,
+    free: Option<&[bool]>,
+) -> Vec<f64> {
     let n = b.len();
     let mut x = vec![0.0; n];
     let mut r = b.to_vec();
@@ -4816,8 +4942,13 @@ fn conjugate_gradient_solve(a: &[Vec<f64>], b: &[f64], tol: f64, max_iter: usize
     for _ in 0..max_iter {
         let mut ap = vec![0.0; n];
         for i in 0..n {
+            if free.is_some_and(|free| !free[i]) {
+                continue;
+            }
             for j in 0..n {
-                ap[i] += a[i][j] * p[j];
+                if free.is_none_or(|free| free[j]) {
+                    ap[i] += a[i][j] * p[j];
+                }
             }
         }
         let pap: f64 = p.iter().zip(ap.iter()).map(|(pi, api)| pi * api).sum();
@@ -8931,6 +9062,242 @@ mod tests {
             "tnc returned an out-of-bounds point: {:?}",
             result.x
         );
+    }
+
+
+    #[test]
+    fn tnc_keeps_boundary_gradient_probes_inside_the_box() {
+        let bounds = [(Some(0.0), Some(1.0))];
+        for (start, target, expected) in [
+            (0.0, 0.7, 0.7),
+            (1.0, 0.7, 0.7),
+            (0.5, -0.5, 0.0),
+            (0.5, 1.5, 1.0),
+        ] {
+            let calls = std::cell::Cell::new(0);
+            let fun = |x: &[f64]| {
+                assert!((0.0..=1.0).contains(&x[0]), "out-of-bounds probe: {x:?}");
+                calls.set(calls.get() + 1);
+                (x[0] - target).powi(2)
+            };
+            let result = minimize(
+                fun,
+                &[start],
+                MinimizeOptions {
+                    method: Some(OptimizeMethod::Tnc),
+                    bounds: Some(&bounds),
+                    tol: Some(1e-7),
+                    callback: Some(|x| {
+                        assert!((0.0..=1.0).contains(&x[0]));
+                        true
+                    }),
+                    ..MinimizeOptions::default()
+                },
+            )
+            .expect("bounded TNC");
+            assert!(
+                result.success,
+                "start={start}, target={target}: {}",
+                result.message
+            );
+            assert!((result.x[0] - expected).abs() < 1e-6, "{result:?}");
+            assert_eq!(result.nfev, calls.get());
+        }
+    }
+
+    #[test]
+    fn tnc_skips_fixed_variable_probes_and_projects_the_initial_point() {
+        let bounds = [(Some(2.0), Some(2.0)), (Some(0.0), Some(1.0))];
+        let calls = std::cell::Cell::new(0);
+        let fun = |x: &[f64]| {
+            assert_eq!(x[0], 2.0, "fixed variable was perturbed");
+            assert!((0.0..=1.0).contains(&x[1]));
+            calls.set(calls.get() + 1);
+            (x[0] - 3.0).powi(2) + (x[1] - 0.7).powi(2)
+        };
+        let result = tnc(
+            &fun,
+            &[10.0, -1.0],
+            MinimizeOptions {
+                bounds: Some(&bounds),
+                tol: Some(1e-7),
+                ..MinimizeOptions::default()
+            },
+        )
+        .expect("fixed coordinate");
+        assert!(result.success, "{}", result.message);
+        assert_eq!(result.x[0], 2.0);
+        assert!((result.x[1] - 0.7).abs() < 1e-6);
+        assert_eq!(result.nfev, calls.get());
+
+        let fixed = [(Some(2.0), Some(2.0))];
+        let result = tnc(
+            &|x: &[f64]| {
+                assert_eq!(x, &[2.0]);
+                1.0
+            },
+            &[10.0],
+            MinimizeOptions {
+                bounds: Some(&fixed),
+                ..MinimizeOptions::default()
+            },
+        )
+        .expect("all variables fixed");
+        assert!(result.success);
+        assert_eq!((result.nit, result.nfev), (0, 1));
+    }
+
+    #[test]
+    fn tnc_solves_on_fixed_and_outward_active_faces() {
+        let fun = |x: &[f64]| {
+            assert!(x[0] >= 0.0);
+            x[0].powi(2) - x[0] * x[1] + 1.5 * x[1].powi(2) + 10.0 * x[0] - 2.1 * x[1]
+        };
+        let gradient: GradientFunc = |x: &[f64]| {
+            assert!(x[0] >= 0.0);
+            vec![2.0 * x[0] - x[1] + 10.0, -x[0] + 3.0 * x[1] - 2.1]
+        };
+        for upper in [Some(0.0), None] {
+            for gradient in [None, Some(gradient)] {
+                let bounds = [(Some(0.0), upper), (None, None)];
+                let result = tnc(
+                    &fun,
+                    &[0.0, 0.0],
+                    MinimizeOptions {
+                        bounds: Some(&bounds),
+                        gradient,
+                        tol: Some(1e-8),
+                        ..MinimizeOptions::default()
+                    },
+                )
+                .expect("free-face subproblem");
+                assert!(result.success, "{}", result.message);
+                assert_eq!(result.x[0], 0.0);
+                assert!((result.x[1] - 0.7).abs() < 1e-8, "{result:?}");
+                assert!((result.fun.expect("objective") + 0.735).abs() < 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn tnc_releases_a_bound_when_the_gradient_turns_inward() {
+        let bounds = [(Some(0.0), None), (None, None)];
+        let result = tnc(
+            &|x: &[f64]| {
+                assert!(x[0] >= 0.0);
+                (x[0] - x[1]).powi(2) + (x[1] - 2.0).powi(2) + x[0]
+            },
+            &[0.0, 0.0],
+            MinimizeOptions {
+                bounds: Some(&bounds),
+                gradient: Some(|x| {
+                    assert!(x[0] >= 0.0);
+                    vec![
+                        2.0 * (x[0] - x[1]) + 1.0,
+                        -2.0 * (x[0] - x[1]) + 2.0 * (x[1] - 2.0),
+                    ]
+                }),
+                tol: Some(1e-8),
+                ..MinimizeOptions::default()
+            },
+        )
+        .expect("release the initial active bound");
+        assert!(result.success, "{}", result.message);
+        assert!((result.x[0] - 1.0).abs() < 1e-8);
+        assert!((result.x[1] - 1.5).abs() < 1e-8);
+    }
+
+    #[test]
+    fn tnc_uses_descent_when_small_cg_curvature_stops_early() {
+        let bounds = [(Some(0.0), Some(1.0))];
+        let result = tnc(
+            &|x: &[f64]| {
+                assert!((0.0..=1.0).contains(&x[0]));
+                (x[0] - 0.3).powi(2)
+            },
+            &[0.300_000_001],
+            MinimizeOptions {
+                bounds: Some(&bounds),
+                gradient: Some(|x| vec![2.0 * (x[0] - 0.3)]),
+                tol: Some(1e-12),
+                maxiter: Some(20),
+                ..MinimizeOptions::default()
+            },
+        )
+        .expect("small projected-gradient step");
+        assert!(result.success, "{}", result.message);
+        assert!((result.x[0] - 0.3).abs() < 1e-12);
+    }
+
+    #[test]
+    fn tnc_does_not_freeze_an_interior_point_in_a_narrow_box() {
+        let lower = 1.0;
+        let upper = 1.0 + 4.0 * f64::EPSILON;
+        let bounds = [(Some(lower), Some(upper))];
+        let result = tnc(
+            &|x: &[f64]| {
+                assert!((lower..=upper).contains(&x[0]));
+                x[0]
+            },
+            &[1.0 + 2.0 * f64::EPSILON],
+            MinimizeOptions {
+                bounds: Some(&bounds),
+                ..MinimizeOptions::default()
+            },
+        )
+        .expect("narrow box");
+        assert!(result.success, "{}", result.message);
+        assert_eq!(result.x[0], lower);
+    }
+
+    #[test]
+    fn tnc_does_not_report_an_interior_near_bound_point_as_stationary() {
+        let bounds = [(Some(0.0), Some(1.0))];
+        let result = tnc(
+            &|x: &[f64]| {
+                assert!((0.0..=1.0).contains(&x[0]));
+                1e15 * x[0]
+            },
+            &[5e-15],
+            MinimizeOptions {
+                bounds: Some(&bounds),
+                gradient: Some(|_| vec![1e15]),
+                ..MinimizeOptions::default()
+            },
+        )
+        .expect("near-bound interior point");
+        assert!(result.success, "{}", result.message);
+        assert_eq!(result.x[0], 0.0);
+        assert_eq!(result.fun, Some(0.0));
+    }
+
+    #[test]
+    fn tnc_rejects_invalid_bounds_before_calling_the_objective() {
+        let calls = std::cell::Cell::new(0);
+        let fun = |_: &[f64]| {
+            calls.set(calls.get() + 1);
+            0.0
+        };
+        for bounds in [
+            vec![],
+            vec![(None, None), (None, None)],
+            vec![(Some(1.0), Some(0.0))],
+            vec![(Some(f64::NAN), Some(1.0))],
+            vec![(Some(0.0), Some(f64::NAN))],
+            vec![(Some(f64::NEG_INFINITY), Some(1.0))],
+        ] {
+            let result = minimize(
+                &fun,
+                &[0.0],
+                MinimizeOptions {
+                    method: Some(OptimizeMethod::Tnc),
+                    bounds: Some(&bounds),
+                    ..MinimizeOptions::default()
+                },
+            );
+            assert!(matches!(result, Err(OptError::InvalidBounds { .. })));
+        }
+        assert_eq!(calls.get(), 0);
     }
 
     #[test]
