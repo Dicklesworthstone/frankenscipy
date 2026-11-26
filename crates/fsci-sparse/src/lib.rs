@@ -178,6 +178,7 @@ pub use linalg::{
     SparseIluFactorization,
     SparseInverse,
     SparseLuFactorization,
+    SparseTriangularSolveOptions,
     SvdsResult,
     YenResult,
     average_clustering,
@@ -298,6 +299,8 @@ pub use linalg::{
     // Direct solvers
     spsolve,
     spsolve_triangular,
+    spsolve_triangular_many,
+    spsolve_triangular_with_options,
     spsolve_with_audit,
     spsolve_with_casp,
     strongly_connected_components,

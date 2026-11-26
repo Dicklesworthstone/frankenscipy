@@ -37959,70 +37959,145 @@ fn validate_eigen_problem(
     Ok(n)
 }
 
-/// Solve a sparse triangular system Ax = b.
+/// Select the triangular factor and diagonal convention used by
+/// [`spsolve_triangular_with_options`] and [`spsolve_triangular_many`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SparseTriangularSolveOptions {
+    /// Use the lower triangle when true, or the upper triangle when false.
+    pub lower: bool,
+    /// Treat every diagonal as one, even when absent or explicitly zero.
+    pub unit_diagonal: bool,
+}
+
+impl Default for SparseTriangularSolveOptions {
+    fn default() -> Self {
+        Self {
+            lower: true,
+            unit_diagonal: false,
+        }
+    }
+}
+
+/// Solve a sparse triangular system Ax = b with an explicit diagonal.
 ///
 /// Matches `scipy.sparse.linalg.spsolve_triangular(A, b, lower)`.
-/// Performs forward substitution (lower=true) or backward substitution (lower=false).
 pub fn spsolve_triangular(a: &CsrMatrix, b: &[f64], lower: bool) -> SparseResult<Vec<f64>> {
-    let shape = a.shape();
-    if !shape.is_square() {
-        return Err(SparseError::InvalidShape {
-            message: "spsolve_triangular requires a square matrix".to_string(),
-        });
-    }
-    let n = shape.rows;
+    spsolve_triangular_with_options(
+        a,
+        b,
+        SparseTriangularSolveOptions {
+            lower,
+            unit_diagonal: false,
+        },
+    )
+}
+
+/// Solve a lower or upper triangular system, optionally assuming a unit diagonal.
+/// Stored duplicates are summed before substitution. Entries in the opposite
+/// triangle are ignored.
+pub fn spsolve_triangular_with_options(
+    a: &CsrMatrix,
+    b: &[f64],
+    options: SparseTriangularSolveOptions,
+) -> SparseResult<Vec<f64>> {
+    let n = triangular_order(a)?;
     if b.len() != n {
         return Err(SparseError::IncompatibleShape {
             message: "rhs length must match matrix rows".to_string(),
         });
     }
-
-    let indptr = a.indptr();
-    let indices = a.indices();
-    let data = a.data();
     let mut x = b.to_vec();
+    triangular_solve_panel(a, &mut x, 1, options)?;
+    Ok(x)
+}
 
-    if lower {
-        // Forward substitution
-        for i in 0..n {
-            let mut diag: f64 = 0.0;
-            for idx in indptr[i]..indptr[i + 1] {
-                let j = indices[idx];
-                if j < i {
-                    x[i] -= data[idx] * x[j];
-                } else if j == i {
-                    diag = data[idx];
+/// Solve the same sparse triangular factor against multiple right-hand sides.
+///
+/// Like [`splu_solve_many`], input and output are RHS-major: each inner vector is
+/// one column of SciPy's `(n, k)` array. The working panel stores the RHS lanes
+/// contiguously for each row so each substitution updates all right-hand sides.
+pub fn spsolve_triangular_many(
+    a: &CsrMatrix,
+    right_hand_sides: &[Vec<f64>],
+    options: SparseTriangularSolveOptions,
+) -> SparseResult<Vec<Vec<f64>>> {
+    let n = triangular_order(a)?;
+    if right_hand_sides.iter().any(|rhs| rhs.len() != n) {
+        return Err(SparseError::IncompatibleShape {
+            message: "each rhs length must match matrix rows".to_string(),
+        });
+    }
+    let lanes = right_hand_sides.len();
+    let size = n.checked_mul(lanes).ok_or_else(|| SparseError::InvalidShape {
+        message: "triangular right-hand side panel is too large".to_string(),
+    })?;
+    let mut panel = Vec::with_capacity(size);
+    for row in 0..n {
+        panel.extend(right_hand_sides.iter().map(|rhs| rhs[row]));
+    }
+    triangular_solve_panel(a, &mut panel, lanes, options)?;
+    Ok((0..lanes)
+        .map(|lane| (0..n).map(|row| panel[row * lanes + lane]).collect())
+        .collect())
+}
+
+fn triangular_order(a: &CsrMatrix) -> SparseResult<usize> {
+    if !a.shape().is_square() {
+        return Err(SparseError::InvalidShape {
+            message: "spsolve_triangular requires a square matrix".to_string(),
+        });
+    }
+    Ok(a.shape().rows)
+}
+
+fn triangular_solve_panel(
+    a: &CsrMatrix,
+    panel: &mut [f64],
+    lanes: usize,
+    options: SparseTriangularSolveOptions,
+) -> SparseResult<()> {
+    let n = a.shape().rows;
+    for step in 0..n {
+        let row = if options.lower { step } else { n - 1 - step };
+        let range = a.indptr()[row]..a.indptr()[row + 1];
+        let cols = &a.indices()[range.clone()];
+        let entries = cols.iter().copied().zip(a.data()[range].iter().copied());
+        let target = row * lanes;
+        let mut diagonal = 0.0;
+        let mut apply = |(col, value): (usize, f64)| {
+            if col == row {
+                diagonal = value;
+            } else if (col < row) == options.lower {
+                let source = col * lanes;
+                for lane in 0..lanes {
+                    let contribution = value * panel[source + lane];
+                    panel[target + lane] -= contribution;
                 }
             }
-            if pivot_is_zero(diag) {
-                return Err(SparseError::SingularMatrix {
-                    message: format!("zero diagonal at row {i}"),
-                });
+        };
+        if cols.windows(2).all(|pair| pair[0] < pair[1]) {
+            entries.for_each(&mut apply);
+        } else {
+            // Noncanonical rows can contain nonadjacent duplicates. Coalesce
+            // before multiplying so large opposite entries cancel correctly.
+            let mut sums = BTreeMap::new();
+            for (col, value) in entries {
+                *sums.entry(col).or_insert(0.0) += value;
             }
-            x[i] /= diag;
+            sums.into_iter().for_each(&mut apply);
         }
-    } else {
-        // Backward substitution
-        for i in (0..n).rev() {
-            let mut diag: f64 = 0.0;
-            for idx in indptr[i]..indptr[i + 1] {
-                let j = indices[idx];
-                if j > i {
-                    x[i] -= data[idx] * x[j];
-                } else if j == i {
-                    diag = data[idx];
-                }
-            }
-            if pivot_is_zero(diag) {
+        if !options.unit_diagonal {
+            if pivot_is_zero(diagonal) {
                 return Err(SparseError::SingularMatrix {
-                    message: format!("zero diagonal at row {i}"),
+                    message: format!("zero diagonal at row {row}"),
                 });
             }
-            x[i] /= diag;
+            for value in &mut panel[target..target + lanes] {
+                *value /= diagonal;
+            }
         }
     }
-
-    Ok(x)
+    Ok(())
 }
 
 /// `k` eigenpairs of the sparse symmetric matrix `A` (or of the symmetric-definite pencil
