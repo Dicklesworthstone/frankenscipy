@@ -898,12 +898,27 @@ where
 {
     let first = gauss_kronrod_15_vec(f, a, b, neval, None)?;
     let mut integral = first.integral.clone();
-    let mut error = first.error;
-    let mut roundoff = first.roundoff;
+    let mut sums: Vec<_> = integral
+        .iter()
+        .map(|&value| CompensatedSum {
+            value,
+            correction: 0.0,
+        })
+        .collect();
+    let mut error = CompensatedSum {
+        value: first.error,
+        correction: 0.0,
+    };
+    let mut roundoff = CompensatedSum {
+        value: first.roundoff,
+        correction: 0.0,
+    };
     let mut panels = std::collections::BinaryHeap::from([first]);
 
     loop {
-        let total_error = error + roundoff;
+        let summed_error = error.total();
+        let accumulated_roundoff = roundoff.total();
+        let total_error = summed_error + accumulated_roundoff;
         if !total_error.is_finite() || integral.iter().any(|v| !v.is_finite()) {
             return Ok((integral, f64::INFINITY, false));
         }
@@ -911,10 +926,10 @@ where
             .epsabs
             .max(options.epsrel * max_abs_component(&integral));
         // Leave headroom for the accumulated roundoff estimate, as quad_vec does.
-        if error <= tolerance / 8.0 && total_error <= tolerance {
+        if summed_error <= tolerance / 8.0 && total_error <= tolerance {
             return Ok((integral, total_error, true));
         }
-        if panels.len() >= options.limit.max(1) || error <= roundoff {
+        if panels.len() >= options.limit.max(1) || summed_error <= accumulated_roundoff {
             return Ok((integral, total_error, false));
         }
         let worst = panels.pop().expect("at least one quadrature panel");
@@ -925,11 +940,24 @@ where
         let dim = Some(integral.len());
         let left = gauss_kronrod_15_vec(f, worst.a, mid, neval, dim)?;
         let right = gauss_kronrod_15_vec(f, mid, worst.b, neval, dim)?;
-        for (i, value) in integral.iter_mut().enumerate() {
-            *value += (left.integral[i] - worst.integral[i]) + right.integral[i];
+        for (i, sum) in sums.iter_mut().enumerate() {
+            // Cancel the parent separately from the children. Forming a
+            // replacement delta can overflow or erase a small component.
+            gauss_kronrod_replace_panel(
+                sum,
+                worst.integral[i],
+                left.integral[i],
+                right.integral[i],
+            );
+            integral[i] = sum.total();
         }
-        error = (error - worst.error).max(0.0) + left.error + right.error;
-        roundoff += left.roundoff + right.roundoff;
+        error.add(-worst.error);
+        error.add(left.error);
+        error.add(right.error);
+        // Keep quad_vec's cumulative roundoff bound, including replaced
+        // panels, while retaining the low bits of each update.
+        roundoff.add(left.roundoff);
+        roundoff.add(right.roundoff);
         panels.push(left);
         panels.push(right);
     }
@@ -1006,12 +1034,9 @@ where
     *neval += 1;
     let dim = dim.unwrap_or(center_value.len());
 
-    let mut result_kronrod = vec![0.0; dim];
-    let mut result_gauss = vec![0.0; dim];
-    let mut absolute = vec![0.0; dim];
     let mut samples = Vec::with_capacity(XGK.len());
 
-    for (i, (&xgk, &wgk)) in XGK.iter().zip(WGK.iter()).enumerate() {
+    for (i, &xgk) in XGK.iter().enumerate() {
         // Rounding can otherwise move an interior Kronrod node onto a singular
         // endpoint after repeated refinement. Keep representable nodes inside.
         let mut x = center + half_length * xgk;
@@ -1036,59 +1061,49 @@ where
             });
         }
 
-        for j in 0..dim {
-            result_kronrod[j] += wgk * fval[j];
-            absolute[j] += wgk * fval[j].abs();
-        }
-
-        if i % 2 == 1 {
-            let wg = WG[i / 2];
-            for (acc, value) in result_gauss.iter_mut().zip(fval.iter()) {
-                *acc += wg * value;
-            }
-        }
         samples.push(fval);
     }
 
-    let mut deviation = vec![0.0; dim];
-    for (sample, weight) in samples.iter().zip(WGK) {
-        for j in 0..dim {
-            deviation[j] += weight * (sample[j] - 0.5 * result_kronrod[j]).abs();
-        }
-    }
-    for value in &mut result_kronrod {
-        *value *= half_length;
-    }
-    for value in &mut result_gauss {
-        *value *= half_length;
-    }
-
-    let mut error = result_kronrod
+    let scale = samples
         .iter()
-        .zip(result_gauss.iter())
-        .map(|(kronrod, gauss)| (kronrod - gauss).abs())
-        .fold(0.0, |a: f64, b: f64| {
-            if a.is_nan() || b.is_nan() {
-                f64::NAN
-            } else {
-                a.max(b)
-            }
-        });
-    let deviation = max_abs_component(&deviation) * half_length.abs();
-    if deviation != 0.0 && error != 0.0 {
-        error = deviation * (200.0 * (error / deviation)).powf(1.5).min(1.0);
+        .flatten()
+        .filter(|value| value.is_finite())
+        .fold(0.0_f64, |scale, value| scale.max(value.abs()));
+    let mut integral = Vec::with_capacity(dim);
+    let mut nonfinite = false;
+    let mut difference = 0.0_f64;
+    let mut deviation = 0.0_f64;
+    let mut absolute = 0.0_f64;
+    for j in 0..dim {
+        let component = std::array::from_fn(|i| samples[i][j]);
+        if component.iter().any(|value| !value.is_finite()) {
+            integral.push(f64::NAN);
+            nonfinite = true;
+            continue;
+        }
+        let sums = gauss_kronrod_sums(&component, &WGK, &WG);
+        // Preserve every output in its own local units. Normalizing the
+        // entire vector by its largest sample would erase small components.
+        integral.push(de_weighted_term(half_length, sums.scale, sums.kronrod));
+        // Combine the error indicators in one common scale before applying
+        // the nonlinear QUADPACK correction, retaining the maximum norm.
+        // A ratio that underflows cannot affect this norm: a component at
+        // the maximum scale contributes a strictly positive roundoff bound.
+        let ratio = if scale == 0.0 { 0.0 } else { sums.scale / scale };
+        difference = difference.max(sums.difference * ratio);
+        deviation = deviation.max(sums.deviation * ratio);
+        absolute = absolute.max(sums.absolute * ratio);
     }
-    let roundoff = 50.0 * f64::EPSILON * (max_abs_component(&absolute) * half_length.abs());
-    if error.is_nan() || roundoff.is_nan() {
-        error = f64::INFINITY;
+    let (error, roundoff) = if nonfinite {
+        (f64::INFINITY, f64::INFINITY)
     } else {
-        error = error.max(roundoff);
-    }
+        gauss_kronrod_bounds(half_length, scale, difference, deviation, absolute)
+    };
 
     Ok(QuadVecPanel {
         a,
         b,
-        integral: result_kronrod,
+        integral,
         error,
         roundoff,
     })
@@ -4815,6 +4830,79 @@ fn gauss_kronrod_replace_panel(sum: &mut CompensatedSum, parent: f64, left: f64,
     }
 }
 
+/// Scale-free sums for one component of a Gauss-Kronrod panel.
+///
+/// Keeping each component in its own units protects both huge ordinates and
+/// outputs much smaller than another component. Scalar and vector quadrature
+/// share this kernel, while the vector driver combines indicators in its norm.
+#[derive(Default)]
+struct GaussKronrodSums {
+    scale: f64,
+    kronrod: f64,
+    difference: f64,
+    deviation: f64,
+    absolute: f64,
+}
+
+fn gauss_kronrod_sums(
+    values: &[f64; 15],
+    kronrod_weights: &[f64; 15],
+    gauss_weights: &[f64; 7],
+) -> GaussKronrodSums {
+    let scale = values.iter().fold(0.0_f64, |s, value| s.max(value.abs()));
+    if scale == 0.0 {
+        return GaussKronrodSums::default();
+    }
+    let mut kronrod = CompensatedSum::default();
+    let mut gauss = CompensatedSum::default();
+    let mut absolute = CompensatedSum::default();
+    for (&value, &weight) in values.iter().zip(kronrod_weights) {
+        let normalized = value / scale;
+        kronrod.add(weight * normalized);
+        absolute.add(weight * normalized.abs());
+    }
+    for (&idx, &weight) in [1, 3, 5, 7, 9, 11, 13].iter().zip(gauss_weights) {
+        gauss.add(weight * (values[idx] / scale));
+    }
+    let mean = 0.5 * kronrod.total();
+    let mut deviation = CompensatedSum::default();
+    for (&value, &weight) in values.iter().zip(kronrod_weights) {
+        deviation.add(weight * (value / scale - mean).abs());
+    }
+    GaussKronrodSums {
+        scale,
+        kronrod: kronrod.total(),
+        difference: (kronrod.total() - gauss.total()).abs(),
+        deviation: deviation.total(),
+        absolute: absolute.total(),
+    }
+}
+
+fn gauss_kronrod_bounds(
+    half: f64,
+    scale: f64,
+    mut error: f64,
+    deviation: f64,
+    absolute: f64,
+) -> (f64, f64) {
+    // QUADPACK's resasc correction and roundoff floor; an embedded-rule
+    // coincidence alone is not an accuracy certificate under cancellation.
+    if deviation > 0.0 && error > 0.0 {
+        error = deviation * (200.0 * (error / deviation)).powf(1.5).min(1.0);
+    }
+    let roundoff = 50.0 * f64::EPSILON * absolute;
+    error = error.max(roundoff);
+    let scaled_bound = |value: f64| {
+        let bound = de_weighted_term(half, scale, value);
+        if bound == 0.0 && value > 0.0 {
+            f64::from_bits(1)
+        } else {
+            bound
+        }
+    };
+    (scaled_bound(error), scaled_bound(roundoff))
+}
+
 fn gauss_kronrod_panel(
     f: &dyn Fn(f64) -> f64,
     a: f64,
@@ -4876,9 +4964,6 @@ fn gauss_kronrod_panel(
         0.279_705_391_489_276_7,
         0.129_484_966_168_869_7,
     ];
-    // Indices into k_nodes that correspond to the 7 Gauss nodes
-    let g_indices: [usize; 7] = [1, 3, 5, 7, 9, 11, 13];
-
     let failed = || GaussKronrodPanel {
         a,
         b,
@@ -4907,60 +4992,21 @@ fn gauss_kronrod_panel(
         return failed();
     }
 
-    // Work in the integrand's local units, then apply the interval width.
-    // An unscaled Kronrod sum is twice a constant integrand and can overflow
-    // even on [0, 1] when the integral is representable. Normalized sums also
-    // keep the embedded-rule difference and deviation estimate in range.
-    let scale = fvals.iter().fold(0.0_f64, |s, value| s.max(value.abs()));
-    if scale == 0.0 {
-        return GaussKronrodPanel {
-            a,
-            b,
-            integral: 0.0,
-            error: 0.0,
-            roundoff: 0.0,
-        };
-    }
-    let mut kronrod = CompensatedSum::default();
-    let mut gauss = CompensatedSum::default();
-    let mut absolute = CompensatedSum::default();
-    for (&value, &weight) in fvals.iter().zip(&k_weights) {
-        let normalized = value / scale;
-        kronrod.add(weight * normalized);
-        absolute.add(weight * normalized.abs());
-    }
-    for (&idx, &weight) in g_indices.iter().zip(&g_weights) {
-        gauss.add(weight * (fvals[idx] / scale));
-    }
-    let mean = 0.5 * kronrod.total();
-    let mut deviation = CompensatedSum::default();
-    for (&value, &weight) in fvals.iter().zip(&k_weights) {
-        deviation.add(weight * (value / scale - mean).abs());
-    }
-    let deviation = deviation.total();
-    let mut error = (kronrod.total() - gauss.total()).abs();
-    // QUADPACK's resasc correction and roundoff floor; an embedded-rule
-    // coincidence alone is not an accuracy certificate under cancellation.
-    if deviation > 0.0 && error > 0.0 {
-        error = deviation * (200.0 * (error / deviation)).powf(1.5).min(1.0);
-    }
-    let roundoff = 50.0 * f64::EPSILON * absolute.total();
-    error = error.max(roundoff);
-    let scaled_bound = |value: f64| {
-        let bound = de_weighted_term(half, scale, value);
-        if bound == 0.0 && value > 0.0 {
-            f64::from_bits(1)
-        } else {
-            bound
-        }
-    };
+    let sums = gauss_kronrod_sums(&fvals, &k_weights, &g_weights);
+    let (error, roundoff) = gauss_kronrod_bounds(
+        half,
+        sums.scale,
+        sums.difference,
+        sums.deviation,
+        sums.absolute,
+    );
 
     GaussKronrodPanel {
         a,
         b,
-        integral: de_weighted_term(half, scale, kronrod.total()),
-        error: scaled_bound(error),
-        roundoff: scaled_bound(roundoff),
+        integral: de_weighted_term(half, sums.scale, sums.kronrod),
+        error,
+        roundoff,
     }
 }
 
@@ -6982,6 +7028,106 @@ mod tests {
     }
 
     #[test]
+    fn quad_vec_preserves_components_across_extreme_scales() {
+        for (a, b, values, expected) in [
+            (0.0, 0.5, [1e308, 1e-300, -2.0], [5e307, 5e-301, -1.0]),
+            (0.5, 0.0, [1e308, 1e-300, -2.0], [-5e307, -5e-301, 1.0]),
+            (0.0, 1e-308, [1e308, -1e308, 1.0], [1.0, -1.0, 1e-308]),
+            (-1e308, 1e308, [1e-308, -1e-300, 0.0], [2.0, -2e8, 0.0]),
+        ] {
+            let calls = std::cell::Cell::new(0);
+            let result = quad_vec(
+                |x| {
+                    assert!(x.is_finite());
+                    calls.set(calls.get() + 1);
+                    values.to_vec()
+                },
+                a,
+                b,
+                QuadOptions {
+                    epsabs: 0.0,
+                    epsrel: 1e-12,
+                    limit: 1,
+                },
+            )
+            .unwrap();
+            assert!(result.converged, "{a}..{b}: {result:?}");
+            assert!(result.error.is_finite() && result.error > 0.0);
+            assert_eq!(result.neval, 15);
+            assert_eq!(result.neval, calls.get());
+            for (&actual, expected) in result.integral.iter().zip(expected) {
+                assert!(actual.is_finite());
+                if expected == 0.0 {
+                    assert_eq!(actual, expected);
+                } else {
+                    assert!(
+                        (actual / expected - 1.0).abs() <= 8.0 * f64::EPSILON,
+                        "{a}..{b}: {actual:e} != {expected:e}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quad_vec_refinement_retains_tiny_components_after_cancellation() {
+        for sign in [-1.0, 1.0] {
+            // A change at a single point has zero integral. The first panel
+            // sees it; refinement must recover the tiny constant underneath.
+            let result = quad_vec(
+                |x| vec![sign * if x == 0.5 { 1e300 } else { 1e-300 }, -2e-300],
+                0.0,
+                1.0,
+                QuadOptions {
+                    epsabs: 0.0,
+                    epsrel: 1e-8,
+                    limit: 2,
+                },
+            )
+            .unwrap();
+            assert!((result.integral[0] / (sign * 1e-300) - 1.0).abs() < 8.0 * f64::EPSILON);
+            assert!((result.integral[1] / -2e-300 - 1.0).abs() < 8.0 * f64::EPSILON);
+            assert_eq!(result.neval, 45);
+            // Recovering the value does not erase the earlier rounding risk.
+            assert!(!result.converged);
+            assert!(result.error.is_finite() && result.error > 1e280);
+        }
+    }
+
+    #[test]
+    fn quad_vec_refinement_avoids_overflow_when_replacing_negative_panels() {
+        let result = quad_vec(
+            |x| {
+                let first = if x == 1.0 {
+                    -0.025 * 1.79e308
+                } else if x < 1.0 {
+                    1.79e308
+                } else {
+                    -1.79e308
+                };
+                // The first component is an odd step, apart from a harmless
+                // point value. Both half-integrals fit in f64. Subtracting the
+                // negative coarse estimate from the positive left integral
+                // would overflow before the negative right integral cancels it.
+                vec![first, 1e-300]
+            },
+            0.0,
+            2.0,
+            QuadOptions {
+                epsabs: 1e296,
+                epsrel: 0.0,
+                limit: 2,
+            },
+        )
+        .unwrap();
+        assert!(result.converged, "{result:?}");
+        assert_eq!(result.integral[0], 0.0);
+        assert!((result.integral[1] / 2e-300 - 1.0).abs() < 8.0 * f64::EPSILON);
+        assert!(result.error.is_finite() && result.error > 0.0 && result.error <= 1e296);
+        assert_eq!(result.neval, 45);
+    }
+
+    #[test]
     fn quad_vec_polynomial_components() {
         let result =
             quad_vec(|x| vec![x, x * x], 0.0, 1.0, QuadOptions::default()).expect("quad_vec");
@@ -7104,10 +7250,12 @@ mod tests {
             "roundoff must stop unproductive refinement"
         );
 
-        for value in [f64::NAN, f64::INFINITY] {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let result = quad_vec(|_| vec![value, 1.0], 0.0, 1.0, QuadOptions::default()).unwrap();
             assert!(!result.converged);
             assert!(!result.error.is_finite());
+            assert!(result.integral[0].is_nan());
+            assert!((result.integral[1] - 1.0).abs() < 8.0 * f64::EPSILON);
             assert_eq!(result.neval, 15);
         }
     }

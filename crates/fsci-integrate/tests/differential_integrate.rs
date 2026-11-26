@@ -1166,3 +1166,100 @@ print(json.dumps({'scipy':scipy.__version__,'numpy':np.__version__,'rows':rows})
         oracle["scipy"], oracle["numpy"]
     );
 }
+
+
+/// Compare vector integrals in independently scaled component units. SciPy
+/// evaluates the same smooth functions in normalized coordinates: directly
+/// asking it to sum 1e308 ordinates can overflow its own GK15 intermediates.
+#[test]
+fn quad_vec_scaled_scipy() {
+    use fsci_integrate::{QuadOptions, quad_vec};
+    use std::process::Command;
+
+    let python = std::env::var("FSCI_PYTHON")
+        .or_else(|_| std::env::var("SCIPY_PYTHON"))
+        .unwrap_or_else(|_| "python3".into());
+    let script = r#"
+import json
+import numpy as np
+import scipy
+from scipy.integrate import quad_vec
+assert scipy.__version__ == '1.17.1', scipy.__version__
+assert np.__version__ == '2.4.3', np.__version__
+value, error, info = quad_vec(
+    lambda x: np.array([1., np.exp(x), x*x]),
+    0., 1., epsabs=0., epsrel=1e-12,
+    norm='max', quadrature='gk15', limit=64, full_output=True)
+print(json.dumps({'value': value.tolist(), 'error': float(error),
+                  'success': bool(info.success)}))
+"#;
+    let output = Command::new(&python)
+        .args(["-c", script])
+        .env("OPENBLAS_NUM_THREADS", "1")
+        .env("OMP_NUM_THREADS", "1")
+        .output();
+    let required = std::env::var("FSCI_REQUIRE_SCIPY_ORACLE").as_deref() == Ok("1");
+    let output = match output {
+        Ok(output) if output.status.success() => output,
+        other => {
+            assert!(!required, "required pinned SciPy oracle failed: {other:?}");
+            eprintln!("SKIP quad_vec_scaled_scipy: pinned SciPy oracle unavailable: {other:?}");
+            return;
+        }
+    };
+    let oracle: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(oracle["success"].as_bool(), Some(true));
+    assert!(oracle["error"].as_f64().unwrap().is_finite());
+    let normalized = oracle["value"].as_array().unwrap();
+    assert_eq!(normalized.len(), 3);
+    let mut comparisons = 0;
+    for (a, b, width, amplitudes) in [
+        (0.0, 0.5, 0.5, [1e308, 5e307, 1e-300]),
+        (0.5, 0.0, 0.5, [1e308, 5e307, 1e-300]),
+        (0.0, 1e-308, 1e-308, [1e308, 5e307, 1.0]),
+        (-5e307, 5e307, 1e308, [1e-308, 1e-308, 1e-300]),
+        (0.0, 1.0, 1.0, [1e-300, 1e-308, 0.0]),
+    ] {
+        let lo = f64::min(a, b);
+        let calls = std::cell::Cell::new(0);
+        let result = quad_vec(
+            |x| {
+                calls.set(calls.get() + 1);
+                let t = (x - lo) / width;
+                vec![
+                    amplitudes[0],
+                    amplitudes[1] * t.exp(),
+                    amplitudes[2] * (t * t),
+                ]
+            },
+            a,
+            b,
+            QuadOptions {
+                epsabs: 0.0,
+                epsrel: 1e-12,
+                limit: 64,
+            },
+        )
+        .unwrap();
+        assert!(result.converged, "{a}..{b}: {result:?}");
+        assert!(result.error.is_finite() && result.error > 0.0);
+        assert_eq!(result.neval, calls.get());
+        assert!(result.neval <= 15 + 30 * 63);
+        let sign = if a <= b { 1.0 } else { -1.0 };
+        for (j, (&actual, reference)) in result.integral.iter().zip(normalized).enumerate() {
+            let expected = sign * reference.as_f64().unwrap() * amplitudes[j] * width;
+            assert!(actual.is_finite() && expected.is_finite());
+            if expected == 0.0 {
+                assert_eq!(actual, expected);
+            } else {
+                assert!(
+                    (actual / expected - 1.0).abs() <= 2e-12,
+                    "{a}..{b}, component {j}: {actual:e} != {expected:e}"
+                );
+            }
+            comparisons += 1;
+        }
+    }
+    assert_eq!(comparisons, 15);
+    eprintln!("quad_vec: 15 component comparisons against normalized SciPy 1.17.1 integrals");
+}
