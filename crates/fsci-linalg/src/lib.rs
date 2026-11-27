@@ -1649,7 +1649,12 @@ pub fn solve_banded(
 ) -> Result<SolveResult, LinalgError> {
     let (nlower, nupper) = l_and_u;
     let (rows, cols) = matrix_shape(ab)?;
-    let expected_rows = nlower + nupper + 1;
+    let expected_rows = nlower
+        .checked_add(nupper)
+        .and_then(|width| width.checked_add(1))
+        .ok_or_else(|| LinalgError::InvalidArgument {
+            detail: "bandwidth exceeds the representable packed row count".to_string(),
+        })?;
     if rows != expected_rows {
         return Err(LinalgError::InvalidBandShape {
             expected_rows,
@@ -1678,6 +1683,24 @@ pub fn solve_banded(
     };
     validate_finite_matrix_and_vector(ab, b, options.mode, options.check_finite)?;
 
+    // Orient the packed matrix once. Factorization, residual, and fallback must
+    // all see the same operator. Padding is outside A and is never transposed.
+    let transposed_band;
+    let (ab, nlower, nupper) = if options.transposed {
+        let mut packed = vec![vec![0.0; cols]; rows];
+        for j in 0..cols {
+            let start = j.saturating_sub(nupper);
+            let end = j.saturating_add(nlower).min(cols - 1);
+            for i in start..=end {
+                packed[nlower + j - i][i] = ab[nupper + i - j][j];
+            }
+        }
+        transposed_band = packed;
+        (transposed_band.as_slice(), nupper, nlower)
+    } else {
+        (ab, nlower, nupper)
+    };
+
     // Fast path: banded Gaussian elimination with partial pivoting on LAPACK-style
     // packed band storage — O(n·kl·(kl+ku)) time and O(n·(kl+ku)) memory, never
     // materializing the dense matrix. On a zero/NaN pivot (structurally singular
@@ -1703,6 +1726,7 @@ pub fn solve_banded(
         b,
         SolveOptions {
             assume_a: Some(MatrixAssumption::General),
+            transposed: false,
             ..options
         },
     )?;
@@ -31317,6 +31341,33 @@ mod tests {
         )
         .expect("triangular solve must work");
         assert_close_slice(&result.x, &[2.0, 1.25], 1e-12, 1e-12);
+    }
+
+    #[test]
+    fn solve_banded_transpose_swaps_bandwidths_and_certifies_the_requested_system() {
+        // A has one subdiagonal and two superdiagonals. Its transpose needs
+        // a pivot in column zero. The 99s are unused band-storage padding.
+        let ab = [
+            vec![99.0, 99.0, 5.0, 7.0],
+            vec![99.0, 4.0, 6.0, 9.0],
+            vec![0.0, 2.0, 8.0, 11.0],
+            vec![1.0, 3.0, 10.0, 99.0],
+        ];
+        let options = SolveOptions {
+            transposed: true,
+            ..SolveOptions::default()
+        };
+        let result = solve_banded((1, 2), &ab, &[-2.0, 9.0, 7.0, 2.0], options).unwrap();
+        assert_close_slice(&result.x, &[1.0, -2.0, 3.0, -1.0], 1e-13, 1e-13);
+        assert!(result.backward_error.unwrap() < 1e-14);
+
+        let empty = [Vec::new()];
+        let result = solve_banded((0, 0), &empty, &[], options).unwrap();
+        assert!(result.x.is_empty());
+        assert!(matches!(
+            solve_banded((usize::MAX, 1), &empty, &[], options),
+            Err(LinalgError::InvalidArgument { .. })
+        ));
     }
 
     #[test]
