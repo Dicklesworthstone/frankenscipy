@@ -5452,7 +5452,9 @@ where
 /// Compute the integral of a function given at discrete points using
 /// the composite trapezoidal rule with Richardson extrapolation.
 ///
-/// More accurate than plain trapezoid for smooth functions.
+/// On a uniform grid, paired panels cancel the leading trapezoidal error.
+/// With an odd number of panels, the last panel contributes its ordinary
+/// trapezoid to both estimates.
 pub fn trapezoid_richardson(y: &[f64], x: &[f64]) -> f64 {
     if y.len() < 2 || x.len() != y.len() {
         return 0.0;
@@ -5467,13 +5469,18 @@ pub fn trapezoid_richardson(y: &[f64], x: &[f64]) -> f64 {
         return t1;
     }
 
-    // Evaluate the coarse grid in place. This preserves the exact summation
-    // order of collecting indices 0, 2, 4, ... while avoiding two allocations.
+    // Evaluate the coarse grid in place, retaining both endpoints.
     let mut t2 = 0.0;
     let mut i = 0;
     while i + 2 < n {
         t2 += 0.5 * (y[i] + y[i + 2]) * (x[i + 2] - x[i]);
         i += 2;
+    }
+
+    if i + 1 < n {
+        // The last fine panel has no partner. Including it unchanged in
+        // both estimates integrates it once after extrapolation.
+        t2 += 0.5 * (y[i] + y[i + 1]) * (x[i + 1] - x[i]);
     }
 
     // Richardson extrapolation: T = (4*T1 - T2) / 3
@@ -6099,6 +6106,19 @@ mod tests {
     }
 
     #[test]
+    fn trapezoid_richardson_integrates_affine_data_over_the_full_domain() {
+        for x in [
+            [0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+            [7.0, 6.0, 4.0, 3.0, 1.0, -2.0],
+        ] {
+            assert_eq!(trapezoid_richardson(&[1.0; 6], &x), x[5] - x[0]);
+            let y = x.map(|t| 2.0 * t + 3.0);
+            let exact = (x[5] - x[0]) * (x[5] + x[0] + 3.0);
+            assert_eq!(trapezoid_richardson(&y, &x), exact);
+        }
+    }
+
+    #[test]
     fn trapezoid_richardson_strided_coarse_pass_is_bit_identical() {
         fn collected_reference(y: &[f64], x: &[f64]) -> f64 {
             if y.len() < 2 || x.len() != y.len() {
@@ -6108,8 +6128,12 @@ mod tests {
             if y.len() < 5 {
                 return t1;
             }
-            let y2: Vec<f64> = y.iter().step_by(2).copied().collect();
-            let x2: Vec<f64> = x.iter().step_by(2).copied().collect();
+            let mut y2: Vec<_> = y.iter().step_by(2).copied().collect();
+            let mut x2: Vec<_> = x.iter().step_by(2).copied().collect();
+            if x.len().is_multiple_of(2) {
+                y2.push(y[y.len() - 1]);
+                x2.push(x[x.len() - 1]);
+            }
             let t2 = trapezoid_irregular(&y2, &x2);
             (4.0 * t1 - t2) / 3.0
         }
