@@ -2957,12 +2957,98 @@ fn df_sane_line_search_budget(maxiter: usize, n: usize) -> usize {
     maxiter.saturating_mul(per_iteration).saturating_add(1000)
 }
 
+/// Normalize a difference without losing a finite pair to subtraction overflow.
+fn df_sane_scaled_difference(
+    difference: &[f64],
+    next: &[f64],
+    previous: &[f64],
+) -> (f64, Vec<f64>) {
+    let scale = difference
+        .iter()
+        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    if scale == 0.0 {
+        return (0.0, vec![0.0; difference.len()]);
+    }
+    if scale.is_finite() {
+        return (
+            scale,
+            difference.iter().map(|value| value / scale).collect(),
+        );
+    }
+    let scale = next
+        .iter()
+        .chain(previous)
+        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    (
+        scale,
+        next.iter()
+            .zip(previous)
+            .map(|(next, previous)| next / scale - previous / scale)
+            .collect(),
+    )
+}
+
+/// The spectral quotient is invariant to a common coordinate/residual scale.
+/// Keep ordinary arithmetic, but do not form zero/zero or infinity/infinity
+/// from perfectly finite steps and residual differences.
+fn df_sane_spectral_parameter(
+    previous_x: &[f64],
+    next_x: &[f64],
+    previous_f: &[f64],
+    next_f: &[f64],
+) -> f64 {
+    let step: Vec<f64> = next_x.iter().zip(previous_x).map(|(a, b)| a - b).collect();
+    let difference: Vec<f64> = next_f.iter().zip(previous_f).map(|(a, b)| a - b).collect();
+    let ss = nk_dot(&step, &step);
+    let sy = nk_dot(&step, &difference);
+    if ss.is_normal() && sy.is_normal() {
+        return ss / sy;
+    }
+
+    let (step_scale, step) = df_sane_scaled_difference(&step, next_x, previous_x);
+    let (difference_scale, difference) = df_sane_scaled_difference(&difference, next_f, previous_f);
+    if step_scale == 0.0 || difference_scale == 0.0 {
+        return 1.0;
+    }
+    let ss = nk_dot(&step, &step);
+    let sy = nk_dot(&step, &difference);
+    if sy == 0.0 {
+        return 1.0;
+    }
+    let quotient = (step_scale / difference_scale) * (ss / sy);
+    if quotient.is_finite() && quotient != 0.0 {
+        return quotient;
+    }
+    // Individual factors can overflow or underflow although their product
+    // is finite. The iteration clamps the final quotient's magnitude.
+    (step_scale.ln() - difference_scale.ln() + ss.ln() - sy.abs().ln())
+        .exp()
+        .copysign(sy)
+}
+
+fn df_sane_evaluate<F>(func: &F, x: &[f64], n: usize) -> Result<Vec<f64>, OptError>
+where
+    F: Fn(&[f64]) -> Vec<f64>,
+{
+    if x.iter().any(|value| !value.is_finite()) {
+        return Err(OptError::NonFiniteInput {
+            detail: String::from("df_sane: trial point must contain only finite values"),
+        });
+    }
+    evaluate_multivariate_root(func, x, n, "df_sane")
+}
+
 /// Solve `F(x) = 0` with the derivative-free spectral residual method (DF-SANE),
 /// matching `scipy.optimize.root(method='df-sane')`.
 ///
 /// Uses spectral (Barzilai-Borwein) steps `d = -σ_k F(x_k)` with the Cruz-
 /// Martinez-Raydan nonmonotone backtracking line search (window `M = 10`,
 /// `η_k = ‖F₀‖²/(1+k)²`). Converges when `‖F(x_k)‖ < ftol·‖F(x₀)‖ + 1e-300`.
+///
+/// Every callback must preserve the initial vector length and return finite
+/// values. Convergence uses a scaled norm, so squaring a tiny residual cannot
+/// turn it into a root. Exhausting the line-search evaluation budget returns
+/// the last accepted iterate with `converged = false`.
 pub fn df_sane<F>(
     func: F,
     x0: &[f64],
@@ -2981,25 +3067,39 @@ where
     const TAU_MAX: f64 = 0.5;
     let fatol = 1e-300;
 
-    let merit = |fv: &[f64]| -> f64 { fv.iter().map(|v| v * v).sum::<f64>() };
-
     let mut x_k = x0.to_vec();
-    let mut f_k_res = evaluate_multivariate_root(&func, &x_k, n, "df_sane")?;
+    let mut f_k_res = df_sane_evaluate(&func, &x_k, n)?;
     let mut nfev = 1usize;
-    let mut f_k = merit(&f_k_res); // ‖F‖²
+    let f0_norm = euclidean_norm(&f_k_res);
+    if !f0_norm.is_finite() {
+        return Err(OptError::NonFiniteInput {
+            detail: String::from("df_sane: initial residual norm is not finite"),
+        });
+    }
+    let initial_merit = nk_dot(&f_k_res, &f_k_res);
+    // A common positive scale leaves the Cruz inequalities unchanged. Use
+    // ordinary arithmetic when safe; otherwise normalize before squaring.
+    // Leave headroom for the nonmonotone allowance f_bar + eta.
+    let merit_scale =
+        if f0_norm > 0.0 && (!initial_merit.is_normal() || initial_merit > f64::MAX / 16.0) {
+            f0_norm
+        } else {
+            1.0
+        };
+    let merit = |fv: &[f64]| -> f64 { fv.iter().map(|value| (value / merit_scale).powi(2)).sum() };
+    let mut f_k = merit(&f_k_res);
     let f_0 = f_k;
-    let f0_norm = f_0.sqrt();
     let mut sigma_k = 1.0_f64;
     let mut prev_fs: std::collections::VecDeque<f64> = std::collections::VecDeque::new();
     prev_fs.push_back(f_k);
+    let max_nfev = df_sane_line_search_budget(maxiter, n);
 
     for k in 0..maxiter {
-        let fk_norm = f_k.sqrt();
-        if fk_norm < ftol * f0_norm + fatol {
+        if euclidean_norm(&f_k_res) < ftol * f0_norm + fatol {
             return Ok(MultivariateRootResult {
                 x: x_k,
                 fun: f_k_res,
-                // status: ‖F(x_k)‖ < ftol·‖F(x₀)‖ + fatol
+                // status: the unsquared residual norm satisfies the tolerance.
                 converged: true,
                 message: "df_sane converged".to_string(),
                 iterations: k,
@@ -3015,53 +3115,60 @@ where
         let d: Vec<f64> = f_k_res.iter().map(|v| -sigma_k * v).collect();
         let eta = f_0 / ((1 + k) as f64).powi(2);
         let f_bar = prev_fs.iter().cloned().fold(f64::MIN, f64::max);
-        let fk_cur = f_k; // prev_fs[-1]
+        let fk_cur = f_k;
 
-        // Cruz nonmonotone line search.
+        // Validate both arms and bound every callback. A rejected trial must
+        // never replace the accepted state merely because the budget ran out.
         let mut alpha_p = 1.0_f64;
         let mut alpha_m = 1.0_f64;
-        let (xp, fp, fp_res) = loop {
+        let accepted = loop {
+            if nfev >= max_nfev {
+                break None;
+            }
             let xp: Vec<f64> = x_k
                 .iter()
                 .zip(&d)
                 .map(|(xi, di)| xi + alpha_p * di)
                 .collect();
-            let fp_res = func(&xp);
+            let fp_res = df_sane_evaluate(&func, &xp, n)?;
             nfev += 1;
             let fp = merit(&fp_res);
             if fp <= f_bar + eta - GAMMA * alpha_p * alpha_p * fk_cur {
-                break (xp, fp, fp_res);
+                break Some((xp, fp, fp_res));
             }
             let alpha_tp = alpha_p * alpha_p * fk_cur / (fp + (2.0 * alpha_p - 1.0) * fk_cur);
 
+            if nfev >= max_nfev {
+                break None;
+            }
             let xm: Vec<f64> = x_k
                 .iter()
                 .zip(&d)
                 .map(|(xi, di)| xi - alpha_m * di)
                 .collect();
-            let fm_res = func(&xm);
+            let fm_res = df_sane_evaluate(&func, &xm, n)?;
             nfev += 1;
             let fm = merit(&fm_res);
             if fm <= f_bar + eta - GAMMA * alpha_m * alpha_m * fk_cur {
-                break (xm, fm, fm_res);
+                break Some((xm, fm, fm_res));
             }
             let alpha_tm = alpha_m * alpha_m * fk_cur / (fm + (2.0 * alpha_m - 1.0) * fk_cur);
 
             alpha_p = alpha_tp.clamp(TAU_MIN * alpha_p, TAU_MAX * alpha_p);
             alpha_m = alpha_tm.clamp(TAU_MIN * alpha_m, TAU_MAX * alpha_m);
-            if nfev > df_sane_line_search_budget(maxiter, n) {
-                // Safety: abandon a stalled line search.
-                break (xp, fp, fp_res);
-            }
+        };
+        let Some((xp, fp, fp_res)) = accepted else {
+            return Ok(MultivariateRootResult {
+                x: x_k,
+                fun: f_k_res,
+                converged: false,
+                message: String::from("df_sane exhausted its line-search evaluation budget"),
+                iterations: k,
+                function_calls: nfev,
+            });
         };
 
-        // Spectral parameter update: σ = <s,s>/<s,y>.
-        let s_k: Vec<f64> = xp.iter().zip(&x_k).map(|(a, b)| a - b).collect();
-        let y_k: Vec<f64> = fp_res.iter().zip(&f_k_res).map(|(a, b)| a - b).collect();
-        let ss = nk_dot(&s_k, &s_k);
-        let sy = nk_dot(&s_k, &y_k);
-        sigma_k = if sy != 0.0 { ss / sy } else { 1.0 };
-
+        sigma_k = df_sane_spectral_parameter(&x_k, &xp, &f_k_res, &fp_res);
         x_k = xp;
         f_k_res = fp_res;
         f_k = fp;
@@ -3071,7 +3178,7 @@ where
         }
     }
 
-    let converged = f_k.sqrt() < ftol * f0_norm + fatol;
+    let converged = euclidean_norm(&f_k_res) < ftol * f0_norm + fatol;
     Ok(MultivariateRootResult {
         x: x_k,
         fun: f_k_res,
@@ -3397,6 +3504,130 @@ mod tests {
             "x = {:?}",
             r2.x
         );
+    }
+
+    #[test]
+    fn df_sane_preserves_roots_across_extreme_coordinate_scales() {
+        for scale in [1e-200, 1.0, 1e200] {
+            let result = df_sane(
+                |x| vec![scale * ((x[0] / scale).powi(2) - 2.0)],
+                &[scale],
+                1e-10,
+                100,
+            )
+            .expect("finite scaled residuals must not overflow or vanish when squared");
+            assert!(result.converged, "{scale:e}: {result:?}");
+            assert!(result.iterations > 0, "the initial residual is not a root");
+            assert!((result.x[0] / scale - 2.0_f64.sqrt()).abs() < 1e-10);
+            assert!(result.fun[0].abs() / scale < 1e-10);
+            assert!(result.function_calls < 30);
+        }
+    }
+
+    #[test]
+    fn df_sane_validates_both_line_search_callback_branches() {
+        for negative_branch in [false, true] {
+            for malformed in [vec![], vec![1.0, 2.0]] {
+                let calls = std::cell::Cell::new(0);
+                let error = df_sane(
+                    |x| {
+                        calls.set(calls.get() + 1);
+                        if calls.get() == 1 {
+                            vec![1.0]
+                        } else if negative_branch && x[0] < 0.0 {
+                            vec![4.0]
+                        } else {
+                            malformed.clone()
+                        }
+                    },
+                    &[0.0],
+                    1e-8,
+                    10,
+                )
+                .expect_err("a changed residual shape must not become a root");
+                assert!(matches!(error, crate::OptError::InvalidArgument { .. }));
+                assert_eq!(calls.get(), if negative_branch { 3 } else { 2 });
+            }
+            for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let calls = std::cell::Cell::new(0);
+                let error = df_sane(
+                    |x| {
+                        calls.set(calls.get() + 1);
+                        if calls.get() == 1 {
+                            vec![1.0]
+                        } else if negative_branch && x[0] < 0.0 {
+                            vec![4.0]
+                        } else {
+                            vec![bad]
+                        }
+                    },
+                    &[0.0],
+                    1e-8,
+                    10,
+                )
+                .expect_err("a nonfinite trial must return an error before backtracking");
+                assert!(matches!(error, crate::OptError::NonFiniteInput { .. }));
+                assert_eq!(calls.get(), if negative_branch { 3 } else { 2 });
+            }
+        }
+    }
+
+    #[test]
+    fn df_sane_never_passes_an_overflowing_trial_point_to_the_callback() {
+        let calls = std::cell::Cell::new(0);
+        let error = df_sane(
+            |x| {
+                calls.set(calls.get() + 1);
+                assert!(x.iter().all(|value| value.is_finite()));
+                vec![-f64::MAX]
+            },
+            &[f64::MAX],
+            1e-8,
+            10,
+        )
+        .expect_err("an unrepresentable trial point is a structured error");
+        assert!(matches!(error, crate::OptError::NonFiniteInput { .. }));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn df_sane_exhausted_line_search_preserves_the_last_accepted_iterate() {
+        let calls = std::cell::Cell::new(0);
+        let result = df_sane(
+            |_| {
+                calls.set(calls.get() + 1);
+                vec![if calls.get() == 1 { 1.0 } else { 4.0 }]
+            },
+            &[0.0],
+            1e-8,
+            1,
+        )
+        .expect("bounded line-search failure returns the last accepted state");
+        assert!(!result.converged);
+        assert_eq!(result.x, vec![0.0]);
+        assert_eq!(result.fun, vec![1.0]);
+        assert_eq!(result.iterations, 0);
+        assert_eq!(
+            result.function_calls,
+            super::df_sane_line_search_budget(1, 1)
+        );
+        assert_eq!(calls.get(), result.function_calls);
+        assert!(result.message.contains("line-search evaluation budget"));
+    }
+
+    #[test]
+    fn df_sane_spectral_quotient_survives_overflowing_intermediate_ratios() {
+        for sign in [-1.0, 1.0] {
+            let sigma = super::df_sane_spectral_parameter(
+                &[0.0, 0.0],
+                &[1e-310, 0.0],
+                &[0.0, 0.0],
+                &[sign * 1e-310, 1.0],
+            );
+            // ss and sy both underflow, while the separately normalized
+            // factors are 1e-310 and +/-1e310. The true quotient is +/-1.
+            assert!((sigma - sign).abs() < 1e-12, "sigma={sigma}");
+        }
     }
 
     #[test]
