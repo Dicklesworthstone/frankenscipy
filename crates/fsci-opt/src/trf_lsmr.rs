@@ -171,9 +171,18 @@ fn solve_projected(hessian: [[f64; 2]; 2], gradient: [f64; 2], radius: f64) -> [
     let (cos, sin) = if b == 0.0 {
         if a >= c { (1.0, 0.0) } else { (0.0, 1.0) }
     } else {
-        let angle = 0.5 * (2.0 * b).atan2(a - c);
-        let (sin, cos) = angle.sin_cos();
-        (cos, sin)
+        // A Jacobi ratio keeps symmetric eigenvectors exactly symmetric.
+        // sin/cos of pi/4 can differ by an ULP, injecting a false component
+        // into a rank-one model's null space and sending an interior step
+        // all the way to the trust boundary.
+        let half_difference = 0.5 * (a - c);
+        let tangent = b / (half_difference.abs() + half_difference.hypot(b));
+        let inverse_length = 1.0 / 1.0_f64.hypot(tangent);
+        if a >= c {
+            (inverse_length, tangent * inverse_length)
+        } else {
+            (tangent * inverse_length, inverse_length)
+        }
     };
     let largest = 0.5 * a + 0.5 * c + (0.5 * (a - c)).hypot(b);
     // B is a Gram matrix. Its determinant can become a tiny negative number
@@ -509,6 +518,32 @@ mod tests {
         let residual = [4.0 * step[0] + step[1] + 3.0, step[0] + 2.0 * step[1] - 4.0];
         assert!((residual[0] * step[1] - residual[1] * step[0]).abs() < 1.0e-13);
         assert!(residual[0] * step[0] + residual[1] * step[1] < 0.0);
+    }
+
+    #[test]
+    fn projected_solver_retains_minimum_norm_rank_one_steps() {
+        for (hessian, gradient, expected) in [
+            ([[1.0, 1.0], [1.0, 1.0]], [1.0, 1.0], [-0.5, -0.5]),
+            ([[1.0, -1.0], [-1.0, 1.0]], [1.0, -1.0], [-0.5, 0.5]),
+            ([[4.0, 2.0], [2.0, 1.0]], [2.0, 1.0], [-0.4, -0.2]),
+            ([[1.0, 2.0], [2.0, 4.0]], [1.0, 2.0], [-0.2, -0.4]),
+        ] {
+            let step = solve_projected(hessian, gradient, 2.0);
+            assert!((step[0] - expected[0]).abs() < 1e-14, "{step:?}");
+            assert!((step[1] - expected[1]).abs() < 1e-14, "{step:?}");
+            assert!(step[0].hypot(step[1]) < 2.0);
+        }
+    }
+
+    #[test]
+    fn projected_solver_preserves_genuine_rotated_null_space_descent() {
+        let component = 0.5 / 2.0_f64.sqrt();
+        for sign in [-1.0, 1.0] {
+            let step = solve_projected([[1.0, sign], [sign, 1.0]], [1.0, -sign], 0.5);
+            assert!((step[0] + component).abs() < 1e-14, "{step:?}");
+            assert!((step[1] - sign * component).abs() < 1e-14, "{step:?}");
+            assert!((step[0].hypot(step[1]) - 0.5).abs() < 1e-14);
+        }
     }
 
     #[test]
