@@ -238,24 +238,26 @@ pub(crate) fn subspace(
         });
     }
 
+    let first: Vec<f64> = gradient.iter().map(|value| value / gradient_norm).collect();
     let mut regularization = 0.0;
     if options.regularize {
-        // Minimize q(-t*g) for 0 <= t <= radius/||g||.
-        let image = jacobian.product(gradient)?;
+        // Minimize q(-t*u), where u = g/||g|| and 0 <= t <= radius.
+        // Using the unit direction avoids forming J*g or ||g||^2: either
+        // can overflow even when the cost, projected model and step are finite.
+        let image = jacobian.product(&first)?;
         let quadratic = dot(&image, &image)
-            + gradient
+            + first
                 .iter()
                 .zip(diagonal)
-                .map(|(g, d)| g * g * d)
+                .map(|(u, d)| u * u * d)
                 .sum::<f64>();
-        let linear = dot(gradient, gradient);
-        let to_boundary = radius / gradient_norm;
+        let linear = gradient_norm;
         let length = if quadratic > 0.0 {
-            (linear / quadratic).min(to_boundary)
+            (linear / quadratic).min(radius)
         } else {
-            to_boundary
+            radius
         };
-        regularization = (length * (linear - 0.5 * length * quadratic) / radius) / radius;
+        regularization = (length / radius) * ((linear - 0.5 * length * quadratic) / radius);
     }
     let extra: Vec<f64> = if bounded {
         diagonal
@@ -285,7 +287,6 @@ pub(crate) fn subspace(
     let gauss_newton =
         lsmr_with_options(&operator, &rhs, options.linear_options(mode, damp))?.solution;
 
-    let first: Vec<f64> = gradient.iter().map(|value| value / gradient_norm).collect();
     let mut second = gauss_newton.clone();
     // Reorthogonalization is important when LSMR's direction nearly coincides
     // with the gradient. Do not manufacture a second direction for rank one.
@@ -375,7 +376,118 @@ pub(crate) fn dogbox_step(
 
 #[cfg(test)]
 mod tests {
-    use super::solve_projected;
+    use super::{TrustRegionLsmrOptions, TrustRegionSolver, solve_projected, subspace};
+    use crate::{LeastSquaresJacobian, LeastSquaresMatrix, LeastSquaresOptions, least_squares};
+    use fsci_runtime::RuntimeMode;
+    use fsci_sparse::{CsrMatrix, DenseLinearOperator, Shape2D};
+
+    #[test]
+    fn regularized_subspace_preserves_finite_models_with_large_residual_units() {
+        for magnitude in [1.0_f64, 1e100, 1e150] {
+            let jacobian = LeastSquaresMatrix::Dense(vec![vec![magnitude]]);
+            let residuals = [-magnitude];
+            let gradient = [-magnitude * magnitude];
+            for bounded in [false, true] {
+                for radius in [0.25_f64, 1.0, 4.0] {
+                    let model = subspace(
+                        &jacobian,
+                        &residuals,
+                        &gradient,
+                        &[0.0],
+                        radius,
+                        bounded,
+                        TrustRegionLsmrOptions::default(),
+                        RuntimeMode::Strict,
+                    )
+                    .expect("finite Cauchy regularization must not square the gradient");
+                    let step = model.step(radius);
+                    let expected = radius.min(1.0);
+                    assert_eq!(step.len(), 1);
+                    assert!(
+                        (step[0] - expected).abs() < 1e-13,
+                        "magnitude={magnitude}, bounded={bounded}, radius={radius}: {step:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn regularized_subspace_retains_the_gradient_direction_at_large_scales() {
+        for magnitude in [1.0_f64, 1e100, 1e150] {
+            let square = magnitude * magnitude;
+            let jacobian =
+                LeastSquaresMatrix::Dense(vec![vec![magnitude, 0.0], vec![0.0, magnitude]]);
+            let model = subspace(
+                &jacobian,
+                &[-2.0 * magnitude, -magnitude],
+                &[-2.0 * square, -square],
+                &[0.0, 0.0],
+                0.5,
+                false,
+                TrustRegionLsmrOptions::default(),
+                RuntimeMode::Strict,
+            )
+            .expect("isotropic finite model");
+            let step = model.step(0.5);
+            let root_five = 5.0_f64.sqrt();
+            assert!(
+                (step[0] - 1.0 / root_five).abs() < 1e-13,
+                "magnitude={magnitude}: {step:?}"
+            );
+            assert!(
+                (step[1] - 0.5 / root_five).abs() < 1e-13,
+                "magnitude={magnitude}: {step:?}"
+            );
+            assert!((step[0].hypot(step[1]) - 0.5).abs() < 1e-13);
+        }
+    }
+
+    #[test]
+    fn regularized_trf_fits_large_residual_units_with_every_jacobian_storage() {
+        for magnitude in [1.0_f64, 1e100, 1e150] {
+            for storage in 0..3 {
+                let jacobian = match storage {
+                    0 => LeastSquaresJacobian::new(move |_| vec![vec![magnitude]]),
+                    1 => LeastSquaresJacobian::new_sparse(move |_| {
+                        CsrMatrix::from_components(
+                            Shape2D::new(1, 1),
+                            vec![magnitude],
+                            vec![0],
+                            vec![0, 1],
+                            true,
+                        )
+                        .unwrap()
+                    }),
+                    _ => LeastSquaresJacobian::new_operator(move |_| {
+                        DenseLinearOperator::from_rows(&[vec![magnitude]]).unwrap()
+                    }),
+                };
+                let result = least_squares(
+                    move |x| vec![magnitude * (x[0] - 1.0)],
+                    &[0.0],
+                    LeastSquaresOptions {
+                        jac: Some(jacobian),
+                        tr_solver: if storage == 0 {
+                            TrustRegionSolver::Lsmr(TrustRegionLsmrOptions::default())
+                        } else {
+                            TrustRegionSolver::Auto
+                        },
+                        max_nfev: Some(10),
+                        ..LeastSquaresOptions::default()
+                    },
+                )
+                .expect("finite least-squares problems must not fail in regularization");
+                assert!(
+                    result.success && (result.x[0] - 1.0).abs() < 1e-12,
+                    "magnitude={magnitude}, storage={storage}: {result:?}"
+                );
+                assert!(result.cost.is_finite());
+                assert_eq!(result.jac.is_sparse(), storage == 1);
+                assert_eq!(result.jac.is_operator(), storage == 2);
+            }
+        }
+    }
 
     #[test]
     fn projected_solver_handles_interior_boundary_and_rank_one() {
