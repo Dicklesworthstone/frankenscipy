@@ -2461,13 +2461,6 @@ fn expm_dm(a: &DMatrix<C64>) -> Result<DMatrix<C64>, LinalgError> {
     if norm1 == 0.0 {
         return Ok(ident);
     }
-    if !norm1.is_finite() {
-        return Ok(DMatrix::from_element(
-            n,
-            n,
-            Complex::new(f64::NAN, f64::NAN),
-        ));
-    }
     let low: Option<&[f64]> = if norm1 <= THETA[0] {
         Some(&PADE3)
     } else if norm1 <= THETA[1] {
@@ -2495,8 +2488,13 @@ fn expm_dm(a: &DMatrix<C64>) -> Result<DMatrix<C64>, LinalgError> {
         let w = a * po;
         return lu_solve_matrix(&(&pe - &w), &(&pe + &w)).ok_or_else(singular);
     }
-    let s = ((norm1 / THETA[4]).log2().ceil()).max(0.0) as i32;
-    let scaled = a * Complex::new(2.0_f64.powi(-s), 0.0);
+    let Some(s) = super::expm_squarings(norm1, n, THETA[4], |scale| {
+        one_norm(&a.map(|z| z * scale))
+    }) else {
+        return Ok(DMatrix::from_element(n, n, Complex::new(f64::NAN, f64::NAN)));
+    };
+    let scale = 0.5_f64.powi(s);
+    let scaled = a.map(|z| z * scale);
     let c = |k: usize| Complex::new(PADE13[k], 0.0);
     let a2 = &scaled * &scaled;
     let a4 = &a2 * &a2;
@@ -3536,6 +3534,19 @@ mod tests {
             pinv(&a, Some(-1.0), None, opts()).unwrap_err(),
             LinalgError::InvalidPinvThreshold
         );
+    }
+
+    #[test]
+    fn expm_handles_finite_components_whose_modulus_overflows() {
+        let large = c(1.6e308, -1.6e308);
+        let a = [vec![CZERO, large], vec![CZERO, CZERO]];
+        let result = expm(&a, opts()).unwrap();
+        // A² = 0 even though the one-norm is too large for binary64.
+        assert_eq!(result[0][0], CONE);
+        assert_eq!(result[1][0], CZERO);
+        assert_eq!(result[1][1], CONE);
+        assert!((result[0][1].re / large.re - 1.0).abs() < 1e-13);
+        assert!((result[0][1].im / large.im - 1.0).abs() < 1e-13);
     }
 
     #[test]

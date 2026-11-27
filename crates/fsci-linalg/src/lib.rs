@@ -12095,6 +12095,25 @@ const EXPM_PADE9: [f64; 10] = [
     1.0,
 ];
 
+/// A finite matrix can have an unrepresentable column sum. On that rare path,
+/// scale every entry down before measuring the norm, then restore the exponent.
+/// The two spare bits cover the complex modulus and a rounded column sum.
+fn expm_squarings(
+    norm1: f64,
+    n: usize,
+    theta: f64,
+    scaled_one_norm: impl FnOnce(f64) -> f64,
+) -> Option<i32> {
+    if norm1.is_finite() {
+        return Some((norm1 / theta).log2().ceil().max(0.0) as i32);
+    }
+    let shift = n.max(1).ilog2() as i32 + 2;
+    let scaled = scaled_one_norm(0.5_f64.powi(shift));
+    scaled
+        .is_finite()
+        .then(|| shift + (scaled / theta).log2().ceil() as i32)
+}
+
 /// Adaptive-order matrix exponential (Higham Alg. 10.20 / scipy `scipy.linalg.expm`):
 /// choose the lowest Padé degree `m ∈ {3,5,7,9}` whose θ-bound covers `‖A‖₁` (no
 /// scaling needed), else fall back to the degree-13 scaling-and-squaring kernel. This
@@ -12178,12 +12197,10 @@ fn expm_pade_scaling_squaring(a: &DMatrix<f64>) -> DMatrix<f64> {
     // ~3× reduction in matrix products, which dominate expm's cost (and cascade
     // into cosm/sinm/sqrtm, which are built on this kernel).
     const THETA13: f64 = 5.371_920_351_148_152;
-    let s = if norm1 <= THETA13 {
-        0u32
-    } else {
-        (norm1 / THETA13).log2().ceil().max(0.0) as u32
+    let Some(s) = expm_squarings(norm1, n, THETA13, |scale| matrix_one_norm(&(a * scale))) else {
+        return DMatrix::from_element(n, n, f64::NAN);
     };
-    let scaled = a / 2.0_f64.powi(s as i32);
+    let scaled = a * 0.5_f64.powi(s);
 
     // [13/13] Padé numerator/denominator coefficients b₀..b₁₃.
     const B: [f64; 14] = [
@@ -12295,12 +12312,11 @@ fn expm_pm(a: &DMatrix<f64>) -> (DMatrix<f64>, DMatrix<f64>) {
         182.0,
         1.0,
     ];
-    let s = if norm1 <= THETA13 {
-        0u32
-    } else {
-        (norm1 / THETA13).log2().ceil().max(0.0) as u32
+    let Some(s) = expm_squarings(norm1, n, THETA13, |scale| matrix_one_norm(&(a * scale))) else {
+        let invalid = DMatrix::from_element(n, n, f64::NAN);
+        return (invalid.clone(), invalid);
     };
-    let a_s = a / 2.0_f64.powi(s as i32);
+    let a_s = a * 0.5_f64.powi(s);
     let a2 = par_dmatmul(&a_s, &a_s);
     let a4 = par_dmatmul(&a2, &a2);
     let a6 = par_dmatmul(&a2, &a4);
@@ -42541,6 +42557,32 @@ mod tests {
         let a = vec![vec![0.0, 0.0], vec![0.0, 0.0]];
         let result = expm(&a, DecompOptions::default()).expect("expm works");
         assert_close_matrix(&result, &[vec![1.0, 0.0], vec![0.0, 1.0]], 1e-12, 1e-12);
+    }
+
+    #[test]
+    fn expm_recovers_finite_nilpotent_with_overflowing_column_norm() {
+        // A² = 0, so exp(±A) = I ± A exactly. The column sum is 8e308.
+        let mut a = vec![vec![0.0; 6]; 6];
+        for row in a.iter_mut().take(5) {
+            row[5] = 1.6e308;
+        }
+        let matrix = dmatrix_from_rows(&a).unwrap();
+        let single = expm(&a, DecompOptions::default()).unwrap();
+        let (positive, negative) = expm_pm(&matrix);
+        for i in 0..6 {
+            for j in 0..6 {
+                if i < 5 && j == 5 {
+                    assert!((single[i][j] / a[i][j] - 1.0).abs() < 1e-13);
+                    assert!((positive[(i, j)] / a[i][j] - 1.0).abs() < 1e-13);
+                    assert!((negative[(i, j)] / a[i][j] + 1.0).abs() < 1e-13);
+                } else {
+                    let expected = if i == j { 1.0 } else { 0.0 };
+                    assert_eq!(single[i][j], expected);
+                    assert_eq!(positive[(i, j)], expected);
+                    assert_eq!(negative[(i, j)], expected);
+                }
+            }
+        }
     }
 
     #[test]
