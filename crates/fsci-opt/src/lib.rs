@@ -869,18 +869,29 @@ pub fn rosen_hess_prod(x: &[f64], p: &[f64]) -> Vec<f64> {
 /// Solve the linear sum assignment problem using a Hungarian-style algorithm.
 ///
 /// Returns `(row_ind, col_ind)` with monotonically increasing row indices.
+/// A positive infinite cost forbids that pairing. An error is returned if the
+/// smaller side cannot be fully matched using finite costs.
 pub fn linear_sum_assignment(
     cost_matrix: &[Vec<f64>],
 ) -> Result<(Vec<usize>, Vec<usize>), OptError> {
-    if cost_matrix.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
-    }
+    linear_sum_assignment_with_maximize(cost_matrix, false)
+}
 
-    let col_count = cost_matrix[0].len();
-    if col_count == 0 {
-        return Ok((Vec::new(), Vec::new()));
-    }
-
+/// Solve the rectangular assignment problem with SciPy's `maximize` option.
+///
+/// Maximization treats negative infinity as a forbidden edge. Minimization
+/// treats positive infinity as forbidden. NaN and infinity of the opposite
+/// sign are invalid in both square and rectangular problems.
+pub fn linear_sum_assignment_with_maximize(
+    cost_matrix: &[Vec<f64>],
+    maximize: bool,
+) -> Result<(Vec<usize>, Vec<usize>), OptError> {
+    let col_count = cost_matrix.first().map_or(0, Vec::len);
+    let invalid_infinity = if maximize {
+        f64::INFINITY
+    } else {
+        f64::NEG_INFINITY
+    };
     for (row_index, row) in cost_matrix.iter().enumerate() {
         if row.len() != col_count {
             return Err(OptError::InvalidArgument {
@@ -890,21 +901,24 @@ pub fn linear_sum_assignment(
                 ),
             });
         }
-        if row.iter().any(|value| !value.is_finite()) {
+        if row.iter().any(|&x| x.is_nan() || x == invalid_infinity) {
             return Err(OptError::NonFiniteInput {
-                detail: format!("cost_matrix contains non-finite values in row {row_index}"),
+                detail: format!("cost_matrix contains invalid numeric entries in row {row_index}"),
             });
         }
     }
+    if col_count == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
 
     if cost_matrix.len() <= col_count {
-        let assignment = shortest_augmenting_path_rectangular(cost_matrix);
+        let assignment = shortest_augmenting_path_rectangular(cost_matrix, maximize)?;
         let row_ind = (0..assignment.len()).collect::<Vec<_>>();
         return Ok((row_ind, assignment));
     }
 
     let transposed = transpose_matrix(cost_matrix);
-    let assignment = shortest_augmenting_path_rectangular(&transposed);
+    let assignment = shortest_augmenting_path_rectangular(&transposed, maximize)?;
     let mut pairs = assignment
         .into_iter()
         .enumerate()
@@ -1115,7 +1129,10 @@ pub fn quadratic_assignment(
 
 // Modified Jonker-Volgenant shortest augmenting path implementation for
 // row_count <= col_count, following SciPy's rectangular_lsap core.
-fn shortest_augmenting_path_rectangular(cost_matrix: &[Vec<f64>]) -> Vec<usize> {
+fn shortest_augmenting_path_rectangular(
+    cost_matrix: &[Vec<f64>],
+    maximize: bool,
+) -> Result<Vec<usize>, OptError> {
     let row_count = cost_matrix.len();
     let col_count = cost_matrix[0].len();
     // Flatten to one contiguous row-major buffer. scipy's LAPJVsp solves on a
@@ -1126,7 +1143,11 @@ fn shortest_augmenting_path_rectangular(cost_matrix: &[Vec<f64>]) -> Vec<usize> 
     // contiguous, cache-friendly row access while staying byte-identical.
     let mut flat = Vec::with_capacity(row_count * col_count);
     for row in cost_matrix {
-        flat.extend_from_slice(row);
+        if maximize {
+            flat.extend(row.iter().map(|&cost| -cost));
+        } else {
+            flat.extend_from_slice(row);
+        }
     }
     let mut u = vec![0.0; row_count];
     let mut v = vec![0.0; col_count];
@@ -1135,8 +1156,11 @@ fn shortest_augmenting_path_rectangular(cost_matrix: &[Vec<f64>]) -> Vec<usize> 
     let mut scratch = ShortestAugmentingPathScratch::new(row_count, col_count);
 
     for cur_row in 0..row_count {
-        let (sink, min_val) =
-            scratch.shortest_augmenting_path(&flat, col_count, &u, &v, &row4col, cur_row);
+        let (sink, min_val) = scratch
+            .shortest_augmenting_path(&flat, col_count, &u, &v, &row4col, cur_row)
+            .ok_or_else(|| OptError::InvalidArgument {
+                detail: String::from("cost matrix is infeasible"),
+            })?;
 
         u[cur_row] += min_val;
         for row in 0..row_count {
@@ -1166,7 +1190,7 @@ fn shortest_augmenting_path_rectangular(cost_matrix: &[Vec<f64>]) -> Vec<usize> 
         }
     }
 
-    col4row
+    Ok(col4row)
 }
 
 const UNASSIGNED: usize = usize::MAX;
@@ -1199,7 +1223,7 @@ impl ShortestAugmentingPathScratch {
         v: &[f64],
         row4col: &[usize],
         start_row: usize,
-    ) -> (usize, f64) {
+    ) -> Option<(usize, f64)> {
         let col_count = v.len();
         let mut min_val;
         let mut row = start_row;
@@ -1227,10 +1251,13 @@ impl ShortestAugmentingPathScratch {
             }
         }
 
+        if !lowest.is_finite() {
+            return None;
+        }
         min_val = lowest;
         let col = self.remaining[best_remaining_index];
         if row4col[col] == UNASSIGNED {
-            return (col, min_val);
+            return Some((col, min_val));
         }
 
         row = row4col[col];
@@ -1259,10 +1286,13 @@ impl ShortestAugmentingPathScratch {
                 }
             }
 
+            if !lowest.is_finite() {
+                return None;
+            }
             min_val = lowest;
             let col = self.remaining[best_remaining_index];
             if row4col[col] == UNASSIGNED {
-                return (col, min_val);
+                return Some((col, min_val));
             }
 
             row = row4col[col];
@@ -8060,6 +8090,52 @@ mod tests {
             linear_sum_assignment(&cost_matrix).expect("assignment should succeed");
         assert_eq!(row_ind, vec![0, 1]);
         assert_eq!(col_ind, vec![0, 1]);
+    }
+
+    #[test]
+    fn linear_sum_assignment_handles_forbidden_edges_in_both_directions() {
+        let inf = f64::INFINITY;
+        // The second row can only use column 0. Its augmenting path must
+        // displace row 0 to column 1, even though column 2 is free.
+        let cost = vec![vec![0.0, 3.0, inf], vec![1.0, inf, inf]];
+        assert_eq!(
+            linear_sum_assignment(&cost).unwrap(),
+            (vec![0, 1], vec![1, 0])
+        );
+
+        let weight = vec![vec![4.0, 6.0], vec![1.0, -inf], vec![2.0, -inf]];
+        assert_eq!(
+            super::linear_sum_assignment_with_maximize(&weight, true).unwrap(),
+            (vec![0, 2], vec![1, 0])
+        );
+        assert_eq!(
+            super::linear_sum_assignment_with_maximize(&[vec![1.0, 3.0]], true).unwrap(),
+            (vec![0], vec![1])
+        );
+    }
+
+    #[test]
+    fn linear_sum_assignment_reports_infeasibility_and_bad_inputs() {
+        let inf = f64::INFINITY;
+        // Each row and column has a candidate, but rows 0 and 1 both
+        // require column 0.
+        let cost = vec![
+            vec![1.0, inf, inf],
+            vec![0.0, inf, inf],
+            vec![inf, 1.0, 2.0],
+        ];
+        assert_eq!(
+            linear_sum_assignment(&cost).unwrap_err().to_string(),
+            "cost matrix is infeasible"
+        );
+        let invalid = [(f64::NAN, false), (f64::NAN, true), (-inf, false), (inf, true)];
+        for (value, maximize) in invalid {
+            assert!(matches!(
+                super::linear_sum_assignment_with_maximize(&[vec![value]], maximize),
+                Err(crate::OptError::NonFiniteInput { .. })
+            ));
+        }
+        assert!(linear_sum_assignment(&[vec![], vec![1.0]]).is_err());
     }
 
     #[test]
