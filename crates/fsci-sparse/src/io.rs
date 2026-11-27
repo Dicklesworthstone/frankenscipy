@@ -368,40 +368,27 @@ impl NpzWritable for DiaMatrix {
             compressed,
         )?;
 
+        let width = self.storage_width;
         let data_len = self
             .offsets()
             .len()
-            .checked_mul(shape.cols)
-            .ok_or_else(|| SparseError::IndexOverflow {
-                message: "DIA data member length overflows usize".to_string(),
-            })
-            .map_err(sparse_io)?;
+            .checked_mul(width)
+            .ok_or_else(|| invalid_data("DIA data member length overflows usize"))?;
         let mut data = vec![0.0; data_len];
-        for (diagonal_index, (&offset, diagonal)) in
-            self.offsets().iter().zip(self.data()).enumerate()
-        {
-            let first_col = if offset > 0 {
-                usize::try_from(offset)
-                    .map_err(|_| invalid_data("positive DIA offset does not fit in usize"))?
-            } else {
-                0
-            };
-            for (entry, &value) in diagonal.iter().enumerate() {
-                let column = first_col
-                    .checked_add(entry)
-                    .ok_or_else(|| invalid_data("DIA column offset overflows usize"))?;
-                let target = diagonal_index
-                    .checked_mul(shape.cols)
-                    .and_then(|base| base.checked_add(column))
-                    .ok_or_else(|| invalid_data("DIA data offset overflows usize"))?;
-                data[target] = value;
+        for (k, (&offset, diagonal)) in self.offsets().iter().zip(self.data()).enumerate() {
+            if !diagonal.is_empty() {
+                let start = k * width + offset.max(0) as usize;
+                data[start..start + diagonal.len()].copy_from_slice(diagonal);
             }
+        }
+        for &(k, col, bits) in &self.padding {
+            data[k * width + col] = f64::from_bits(bits);
         }
         write_f64_member(
             npz,
             "data",
             &data,
-            &[self.offsets().len(), shape.cols],
+            &[self.offsets().len(), width],
             compressed,
         )
     }
@@ -734,25 +721,11 @@ fn load_dia<R: Read + Seek>(
         )));
     }
 
-    let mut diagonals = Vec::with_capacity(offsets.len());
-    for (diagonal_index, &offset) in offsets.iter().enumerate() {
-        let row = &flat_data[diagonal_index * width..(diagonal_index + 1) * width];
-        let mut values = Vec::new();
-        let mut matrix_row = if offset < 0 { offset.unsigned_abs() } else { 0 };
-        let mut matrix_col = if offset > 0 {
-            usize::try_from(offset)
-                .map_err(|_| invalid_data("positive DIA offset does not fit in usize"))?
-        } else {
-            0
-        };
-        while matrix_row < shape.rows && matrix_col < shape.cols {
-            values.push(row.get(matrix_col).copied().unwrap_or(0.0));
-            matrix_row += 1;
-            matrix_col += 1;
-        }
-        diagonals.push(values);
-    }
-    let matrix = DiaMatrix::from_diagonals(shape, offsets, diagonals).map_err(sparse_io)?;
+    let mut values = flat_data.into_iter();
+    let rows = (0..offsets.len())
+        .map(|_| values.by_ref().take(width).collect())
+        .collect();
+    let matrix = DiaMatrix::from_padded(shape, rows, offsets, width).map_err(sparse_io)?;
     Ok(if is_array {
         SparseNpz::Array(SparseArrayOutput::Dia(SparseArray2D::new(matrix)))
     } else {
@@ -1187,6 +1160,39 @@ mod tests {
                 assert_eq!(loaded, SparseNpz::Matrix(matrix.clone()));
             }
         }
+    }
+
+    #[test]
+    fn dia_npz_round_trip_preserves_width_and_ignored_padding_bits() {
+        let shape = Shape2D::new(5, 7);
+        for width in [0, 3, 9] {
+            let mut row: Vec<_> = (0..width).map(|i| i as f64).collect();
+            if !row.is_empty() {
+                row[0] = -0.0;
+            }
+            let dia = DiaMatrix::new(shape, vec![row.clone()], vec![2]).unwrap();
+            let mut bytes = Cursor::new(Vec::new());
+            save_npz_to_writer(&mut bytes, &dia, false).unwrap();
+            bytes.set_position(0);
+            let mut archive = NpzArchive::new(bytes).unwrap();
+            let (stored, dimensions) = read_numeric_member(&mut archive, "data").unwrap();
+            assert_eq!(dimensions, [1, width]);
+            assert!(stored.iter().zip(&row).all(|(a, b)| a.to_bits() == b.to_bits()));
+            let loaded = round_trip(&dia, false);
+            let SparseNpz::Matrix(SparseMatrixOutput::Dia(restored)) = loaded else {
+                panic!("expected DIA");
+            };
+            assert_eq!(restored, dia);
+            assert_eq!(restored.storage_width, width);
+            if width > 0 {
+                assert!(restored.padding.contains(&(0, 0, (-0.0f64).to_bits())));
+            }
+        }
+        let empty = DiaMatrix::from_padded(shape, Vec::new(), Vec::new(), 3).unwrap();
+        assert_eq!(
+            round_trip(&empty, true),
+            SparseNpz::Matrix(SparseMatrixOutput::Dia(empty))
+        );
     }
 
     #[test]

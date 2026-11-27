@@ -2223,6 +2223,10 @@ pub struct DiaMatrix {
     pub(crate) shape: Shape2D,
     pub(crate) offsets: Vec<isize>,
     pub(crate) data: Vec<Vec<f64>>,
+    // The wire format is rectangular and column-indexed. The numerical kernels
+    // use compact, in-bounds slots in `data`. Retain ignored padding bits for NPZ.
+    pub(crate) storage_width: usize,
+    pub(crate) padding: Vec<(usize, usize, u64)>,
 }
 
 impl DiaMatrix {
@@ -2238,19 +2242,34 @@ impl DiaMatrix {
             });
         }
 
+        let mut width = 0;
+        for (&row, &col) in row_indices.iter().zip(&col_indices) {
+            validate_coordinate(shape, row, col)?;
+            // A validated column is strictly below shape.cols.
+            width = width.max(col + 1);
+        }
+        let stored_shape = Shape2D::new(shape.rows, width);
         let mut diagonals = BTreeMap::<isize, Vec<f64>>::new();
         for ((row, col), value) in row_indices.into_iter().zip(col_indices).zip(data) {
-            validate_coordinate(shape, row, col)?;
-            let offset = col as isize - row as isize;
+            let offset = isize::try_from(col as i128 - row as i128).map_err(|_| {
+                SparseError::IndexOverflow {
+                    message: "DIA offset does not fit in isize".to_string(),
+                }
+            })?;
             let diagonal = diagonals
                 .entry(offset)
-                .or_insert_with(|| vec![0.0; diagonal_len(shape, offset)]);
-            let diagonal_index = if offset >= 0 { row } else { col };
-            diagonal[diagonal_index] += value;
+                .or_insert_with(|| vec![0.0; diagonal_len(stored_shape, offset)]);
+            diagonal[row.min(col)] += value;
         }
 
-        let (offsets, data): (Vec<_>, Vec<_>) = diagonals.into_iter().unzip();
-        Self::from_diagonals(shape, offsets, data)
+        let (offsets, data) = diagonals.into_iter().unzip();
+        Ok(Self {
+            shape,
+            offsets,
+            data,
+            storage_width: width,
+            padding: Vec::new(),
+        })
     }
 
     pub fn from_diagonals(
@@ -2292,6 +2311,8 @@ impl DiaMatrix {
             shape,
             offsets,
             data,
+            storage_width: shape.cols,
+            padding: Vec::new(),
         })
     }
 
@@ -2302,15 +2323,7 @@ impl DiaMatrix {
 
     #[must_use]
     pub fn nnz(&self) -> usize {
-        let mut count = 0;
-        for diag in &self.data {
-            for &val in diag {
-                if val != 0.0 {
-                    count += 1;
-                }
-            }
-        }
-        count
+        self.data.iter().map(Vec::len).sum()
     }
 
     #[must_use]
@@ -2342,26 +2355,62 @@ impl DiaMatrix {
     }
 
     pub fn new(shape: Shape2D, data: Vec<Vec<f64>>, offsets: Vec<isize>) -> SparseResult<Self> {
-        if data.len() != offsets.len() {
+        let width = data.first().map_or(0, Vec::len);
+        Self::from_padded(shape, data, offsets, width)
+    }
+
+    pub(crate) fn from_padded(
+        shape: Shape2D,
+        rows: Vec<Vec<f64>>,
+        offsets: Vec<isize>,
+        width: usize,
+    ) -> SparseResult<Self> {
+        if rows.len() != offsets.len() || rows.iter().any(|row| row.len() != width) {
             return Err(SparseError::InvalidArgument {
-                message: "data and offsets must have same length".to_string(),
+                message: "DIA storage must be rectangular with one row per offset".to_string(),
             });
         }
-        let mut exact_data = Vec::with_capacity(data.len());
-        for (k, &off) in offsets.iter().enumerate() {
-            let expected_len = diagonal_len(shape, off);
-            let mut diag = Vec::with_capacity(expected_len);
-            let mut r = if off < 0 { (-off) as usize } else { 0 };
-            let mut c = if off > 0 { off as usize } else { 0 };
-            while r < shape.rows && c < shape.cols {
-                let val = if c < data[k].len() { data[k][c] } else { 0.0 };
-                diag.push(val);
-                r += 1;
-                c += 1;
+        let mut seen = BTreeSet::new();
+        let mut data = Vec::with_capacity(rows.len());
+        let mut padding = Vec::new();
+        let stored_shape = Shape2D::new(shape.rows, shape.cols.min(width));
+        for (k, (row, &offset)) in rows.into_iter().zip(&offsets).enumerate() {
+            if !seen.insert(offset) {
+                return Err(SparseError::InvalidArgument {
+                    message: "DIA offsets must be unique".to_string(),
+                });
             }
-            exact_data.push(diag);
+            let first_col = (offset.max(0) as usize).min(width);
+            let end = first_col + diagonal_len(stored_shape, offset);
+            for (col, &value) in row.iter().enumerate() {
+                if !(first_col..end).contains(&col) && value.to_bits() != 0 {
+                    padding.push((k, col, value.to_bits()));
+                }
+            }
+            data.push(row[first_col..end].to_vec());
         }
-        Self::from_diagonals(shape, offsets, exact_data)
+        Ok(Self {
+            shape,
+            offsets,
+            data,
+            storage_width: width,
+            padding,
+        })
+    }
+
+    /// Stored entries in diagonal order, including explicit zeros.
+    pub(crate) fn stored_entries(&self) -> impl Iterator<Item = (usize, usize, f64)> + '_ {
+        self.offsets
+            .iter()
+            .zip(&self.data)
+            .flat_map(|(&offset, diagonal)| {
+                let row = offset.min(0).unsigned_abs();
+                let col = offset.max(0) as usize;
+                diagonal
+                    .iter()
+                    .enumerate()
+                    .map(move |(i, &v)| (row + i, col + i, v))
+            })
     }
 
     pub fn num_diags(&self) -> usize {
@@ -2369,7 +2418,12 @@ impl DiaMatrix {
     }
 
     pub fn get(&self, row: usize, col: usize) -> f64 {
-        let offset_needed = col as isize - row as isize;
+        if row >= self.shape.rows || col >= self.shape.cols {
+            return 0.0;
+        }
+        let Ok(offset_needed) = isize::try_from(col as i128 - row as i128) else {
+            return 0.0;
+        };
         for (k, &off) in self.offsets.iter().enumerate() {
             if off == offset_needed {
                 let idx = if off >= 0 { row } else { col };
@@ -2390,47 +2444,23 @@ impl DiaMatrix {
         }
 
         let mut y = vec![0.0; rows];
-        for (k, &off) in self.offsets.iter().enumerate() {
-            let diag = &self.data[k];
-            for (i, yi) in y.iter_mut().enumerate() {
-                let j = i as isize + off;
-                if j >= 0 && (j as usize) < cols {
-                    let j = j as usize;
-                    let idx = if off >= 0 { i } else { j };
-                    if idx < diag.len() {
-                        *yi += diag[idx] * x[j];
-                    }
-                }
-            }
+        for (row, col, value) in self.stored_entries() {
+            y[row] += value * x[col];
         }
         Ok(y)
     }
 
     pub fn to_coo(&self) -> SparseResult<CooMatrix> {
-        let (rows, cols) = (self.shape.rows, self.shape.cols);
         let mut row_indices = Vec::new();
         let mut col_indices = Vec::new();
         let mut data = Vec::new();
-
-        for (k, &off) in self.offsets.iter().enumerate() {
-            let diag = &self.data[k];
-            for i in 0..rows {
-                let j = i as isize + off;
-                if j >= 0 && (j as usize) < cols {
-                    let j = j as usize;
-                    let idx = if off >= 0 { i } else { j };
-                    if idx < diag.len() {
-                        let val = diag[idx];
-                        if val != 0.0 {
-                            row_indices.push(i);
-                            col_indices.push(j);
-                            data.push(val);
-                        }
-                    }
-                }
+        for (row, col, value) in self.stored_entries() {
+            if value != 0.0 {
+                row_indices.push(row);
+                col_indices.push(col);
+                data.push(value);
             }
         }
-
         CooMatrix::from_triplets(self.shape, data, row_indices, col_indices, true)
     }
 
@@ -3051,12 +3081,9 @@ fn canonicalize_lil_row(
 }
 
 fn diagonal_len(shape: Shape2D, offset: isize) -> usize {
-    let start_row = if offset < 0 { (-offset) as usize } else { 0 };
-    let start_col = if offset > 0 { offset as usize } else { 0 };
-    shape
-        .rows
-        .saturating_sub(start_row)
-        .min(shape.cols.saturating_sub(start_col))
+    let rows = shape.rows.saturating_sub(offset.min(0).unsigned_abs());
+    let cols = shape.cols.saturating_sub(offset.max(0) as usize);
+    rows.min(cols)
 }
 
 fn validate_setdiag_offset(shape: Shape2D, k: isize) -> SparseResult<()> {

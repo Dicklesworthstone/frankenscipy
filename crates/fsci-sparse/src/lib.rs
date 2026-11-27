@@ -1821,14 +1821,47 @@ mod tests {
     }
 
     #[test]
-    fn dia_nnz() {
-        let shape = Shape2D::new(3, 3);
-        let data = vec![
-            vec![1.0, 0.0, 3.0], // main diagonal (1 zero)
-        ];
-        let offsets = vec![0];
-        let dia = DiaMatrix::new(shape, data, offsets).expect("dia");
-        assert_eq!(dia.nnz(), 2); // only nonzero entries count
+    fn dia_counts_stored_zeros_and_skips_absent_columns_in_matvec() {
+        // The raw DIA row only covers columns 0..3. Column zero is padding
+        // on offset +1, column two contains a stored zero, column three is absent.
+        let dia = DiaMatrix::new(
+            Shape2D::new(4, 5),
+            vec![vec![99.0, 2.0, 0.0]],
+            vec![1],
+        )
+        .unwrap();
+        assert_eq!(dia.nnz(), 2);
+        assert_eq!(dia.to_coo().unwrap().nnz(), 1);
+        let x = [0.0, 3.0, f64::INFINITY, f64::INFINITY, f64::NAN];
+        for y in [
+            dia.matvec(&x).unwrap(),
+            LinearOperator::matvec(&dia, &x).unwrap(),
+        ] {
+            assert_eq!(y[0], 6.0);
+            assert!(y[1].is_nan());
+            assert_eq!(y[2..], [0.0, 0.0]);
+        }
+        let z = dia
+            .rmatvec(&[3.0, f64::INFINITY, f64::INFINITY, f64::NAN])
+            .unwrap();
+        assert_eq!(z[..2], [0.0, 6.0]);
+        assert!(z[2].is_nan());
+        assert!(z[3].is_nan());
+        assert!(z[4].is_nan());
+    }
+
+    #[test]
+    fn dia_from_triplets_limits_storage_to_last_supplied_column() {
+        let shape = Shape2D::new(5, 7);
+        let dia = DiaMatrix::from_triplets(shape, vec![2.0, 3.0], vec![1, 2], vec![0, 2])
+            .expect("two diagonal bands");
+        // SciPy COO.todia() allocates max(col)+1=3 columns in both bands.
+        assert_eq!(dia.nnz(), 6);
+        assert_eq!(dia.to_coo().unwrap().nnz(), 2);
+        let y = dia
+            .matvec(&[1.0, 1.0, 1.0, f64::NAN, f64::NAN, f64::NAN, f64::NAN])
+            .unwrap();
+        assert_eq!(y, [0.0, 2.0, 3.0, 0.0, 0.0]);
     }
 
     #[test]

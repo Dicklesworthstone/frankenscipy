@@ -387,23 +387,11 @@ impl LinearOperator for DiaMatrix {
         self.shape
     }
 
-    /// `A·x` diagonal by diagonal (the inherent `DiaMatrix::matvec` order); `data[k][j]` is
-    /// the entry in column `j` of diagonal `offsets[k]`, as SciPy stores it.
     fn matvec_into(&self, x: &[f64], y: &mut [f64]) -> SparseResult<()> {
         check_application("matvec", x, y, self.shape.cols, self.shape.rows)?;
         y.fill(0.0);
-        for (k, &offset) in self.offsets.iter().enumerate() {
-            let diagonal = &self.data[k];
-            for (i, yi) in y.iter_mut().enumerate() {
-                let j = i as isize + offset;
-                if j >= 0 && (j as usize) < self.shape.cols {
-                    let j = j as usize;
-                    let idx = if offset >= 0 { i } else { j };
-                    if idx < diagonal.len() {
-                        *yi += diagonal[idx] * x[j];
-                    }
-                }
-            }
+        for (row, col, value) in self.stored_entries() {
+            y[row] += value * x[col];
         }
         Ok(())
     }
@@ -411,17 +399,14 @@ impl LinearOperator for DiaMatrix {
     fn rmatvec_into(&self, x: &[f64], y: &mut [f64]) -> SparseResult<()> {
         check_application("rmatvec", x, y, self.shape.rows, self.shape.cols)?;
         y.fill(0.0);
-        for (k, &offset) in self.offsets.iter().enumerate() {
-            let diagonal = &self.data[k];
-            for (i, &xi) in x.iter().enumerate() {
-                let j = i as isize + offset;
-                if j >= 0 && (j as usize) < self.shape.cols {
-                    let j = j as usize;
-                    let idx = if offset >= 0 { i } else { j };
-                    if idx < diagonal.len() {
-                        y[j] += diagonal[idx] * xi;
-                    }
-                }
+        // DIA transpose extends a short stored band with zeroes before its
+        // matvec. These slots participate in IEEE arithmetic (0 * inf is NaN).
+        for (&offset, diagonal) in self.offsets.iter().zip(&self.data) {
+            let row = offset.min(0).unsigned_abs();
+            let col = offset.max(0) as usize;
+            let len = x.len().saturating_sub(row).min(y.len().saturating_sub(col));
+            for i in 0..len {
+                y[col + i] += diagonal.get(i).copied().unwrap_or(0.0) * x[row + i];
             }
         }
         Ok(())
