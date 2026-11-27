@@ -8881,6 +8881,7 @@ pub fn cho_solve_banded(
             });
         }
     }
+    validate_finite_matrix_and_vector(cb, b, RuntimeMode::Strict, true)?;
 
     if n == 0 {
         return Ok(SolveResult {
@@ -8902,7 +8903,7 @@ pub fn cho_solve_banded(
                     x[i] -= cb[k][i - k] * x[i - k];
                 }
             }
-            if cb[0][i].abs() < 1e-15 {
+            if cb[0][i] == 0.0 {
                 return Err(LinalgError::SingularMatrix);
             }
             x[i] /= cb[0][i];
@@ -8928,7 +8929,7 @@ pub fn cho_solve_banded(
                     x[i] -= cb[kd - offset][i] * x[i - offset];
                 }
             }
-            if cb[kd][i].abs() < 1e-15 {
+            if cb[kd][i] == 0.0 {
                 return Err(LinalgError::SingularMatrix);
             }
             x[i] /= cb[kd][i];
@@ -9014,7 +9015,8 @@ pub fn solveh_banded(ab: &[Vec<f64>], b: &[f64], lower: bool) -> Result<SolveRes
 ///   `A == c · cᵀ` with `c` lower triangular.
 ///
 /// Entries of `ab` outside the band (the unused corner triangle) are ignored on
-/// input and left untouched in the output, exactly as SciPy does.
+/// input arithmetic and left untouched in the output. The default finite check,
+/// as in SciPy, covers all supplied entries including padding.
 ///
 /// # Arguments
 /// * `ab` - Banded matrix in lower or upper band storage, shape `(u+1, n)`
@@ -9041,6 +9043,7 @@ pub fn cholesky_banded(ab: &[Vec<f64>], lower: bool) -> Result<Vec<Vec<f64>>, Li
         }
     }
 
+    validate_finite_matrix(ab, RuntimeMode::Strict, true)?;
     let mut c = ab.to_vec();
     if n == 0 {
         return Ok(c);
@@ -39460,6 +39463,36 @@ mod tests {
         let b = vec![6.0, 9.0, 8.0];
         let result = cho_solve_banded(&cb, &b, false).expect("upper cho_solve_banded");
         assert_close_slice(&result.x, &[1.0, 1.0, 1.0], 1e-10, 1e-10);
+    }
+
+    #[test]
+    fn banded_cholesky_solve_is_invariant_under_power_of_two_scaling() {
+        // A = L Lᵀ with L = [[2, 0], [1, 1]]. Scaling A and b together
+        // changes neither the solution [2, -1] nor the condition number.
+        for scale in [2.0_f64.powi(-1000), 1.0, 2.0_f64.powi(990)] {
+            let diag = vec![4.0 * scale, 2.0 * scale];
+            let b = [6.0 * scale, 2.0 * scale];
+            for lower in [true, false] {
+                let ab = if lower {
+                    vec![diag.clone(), vec![2.0 * scale, 0.0]]
+                } else {
+                    vec![vec![0.0, 2.0 * scale], diag.clone()]
+                };
+                let factor = cholesky_banded(&ab, lower).unwrap();
+                let factored = cho_solve_banded(&factor, &b, lower).unwrap();
+                let direct = solveh_banded(&ab, &b, lower).unwrap();
+                assert_eq!(factored.x, [2.0, -1.0]);
+                assert_eq!(direct.x, factored.x);
+            }
+        }
+        for lower in [true, false] {
+            let err = cho_solve_banded(&[vec![0.0]], &[1.0], lower).unwrap_err();
+            assert_eq!(err, LinalgError::SingularMatrix);
+            let err = solveh_banded(&[vec![f64::NAN]], &[1.0], lower).unwrap_err();
+            assert_eq!(err, LinalgError::NonFiniteInput);
+            let err = cho_solve_banded(&[vec![1.0]], &[f64::INFINITY], lower).unwrap_err();
+            assert_eq!(err, LinalgError::NonFiniteInput);
+        }
     }
 
     #[test]
