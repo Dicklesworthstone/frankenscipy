@@ -36,6 +36,34 @@ pub struct QuadResult {
     pub converged: bool,
 }
 
+/// Results of the two independently adapted components of a complex integral.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComplexQuadResult {
+    pub real: QuadResult,
+    pub imag: QuadResult,
+}
+
+impl ComplexQuadResult {
+    /// Integral in the crate's (real, imaginary) convention.
+    #[must_use]
+    pub fn integral(&self) -> crate::complex::Complex64 {
+        (self.real.integral, self.imag.integral)
+    }
+
+    /// Separate absolute error estimates for the real and imaginary parts.
+    #[must_use]
+    pub fn error(&self) -> crate::complex::Complex64 {
+        (self.real.error, self.imag.error)
+    }
+}
+
+/// QUADPACK diagnostics for each component of `quad_complex_full_output`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComplexQuadInfo {
+    pub real: QuadInfo,
+    pub imag: QuadInfo,
+}
+
 /// Norm used to control vector quadrature error.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum QuadVecNorm {
@@ -357,6 +385,56 @@ where
     F: Fn(f64) -> f64,
 {
     quad_full_output(f, a, b, &[], options).map(warn_unless_converged)
+}
+
+/// Integrate a complex-valued function along a real interval, as in unweighted
+/// `scipy.integrate.quad(..., complex_func=True)`. Each component has its own
+/// adaptive subdivision, error budget, convergence status, and warnings. The
+/// callback is evaluated independently on each pass. Finite and infinite
+/// bounds are supported. Reversing the bounds negates both components, as in
+/// [`quad`]; SciPy 1.17.1 omits this sign in its complex dispatch.
+///
+/// # Errors
+/// Returns the same validation errors as [`quad`].
+pub fn quad_complex<F>(
+    f: F,
+    a: f64,
+    b: f64,
+    options: QuadOptions,
+) -> Result<ComplexQuadResult, IntegrateValidationError>
+where
+    F: Fn(f64) -> crate::complex::Complex64,
+{
+    let real = quad(|x| f(x).0, a, b, options)?;
+    let imag = quad(|x| f(x).1, a, b, options)?;
+    Ok(ComplexQuadResult { real, imag })
+}
+
+/// Complex quadrature with optional breakpoints and per-component panel diagnostics.
+/// An empty `points` slice selects ordinary quadrature. As in [`quad_full_output`],
+/// QUADPACK returns convergence messages in the diagnostics.
+///
+/// # Errors
+/// Returns the same validation errors as [`quad_full_output`].
+pub fn quad_complex_full_output<F>(
+    f: F,
+    a: f64,
+    b: f64,
+    points: &[f64],
+    options: QuadOptions,
+) -> Result<(ComplexQuadResult, ComplexQuadInfo), IntegrateValidationError>
+where
+    F: Fn(f64) -> crate::complex::Complex64,
+{
+    let (real, real_info) = quad_full_output(|x| f(x).0, a, b, points, options)?;
+    let (imag, imag_info) = quad_full_output(|x| f(x).1, a, b, points, options)?;
+    Ok((
+        ComplexQuadResult { real, imag },
+        ComplexQuadInfo {
+            real: real_info,
+            imag: imag_info,
+        },
+    ))
 }
 
 /// SciPy's `quad` without `full_output` turns QUADPACK's `ier` 1–5 into an `IntegrationWarning`
@@ -6956,6 +7034,62 @@ mod tests {
             err,
             IntegrateValidationError::QuadInvalidTolerance { .. }
         ));
+    }
+
+    #[test]
+    fn complex_quad_integrates_exponentials_on_finite_and_infinite_intervals() {
+        let opts = QuadOptions::default();
+        let half_pi = std::f64::consts::FRAC_PI_2;
+        for (a, b, expected) in [(0.0, half_pi, 1.0), (half_pi, 0.0, -1.0)] {
+            let r = quad_complex(|x| (x.cos(), x.sin()), a, b, opts).unwrap();
+            let (re, im) = r.integral();
+            assert!(r.real.converged && r.imag.converged);
+            assert!((re - expected).abs() < 1e-12 && (im - expected).abs() < 1e-12);
+        }
+        // Integral of exp((-1 + i)x) = 1/(1 - i) over the positive half-line.
+        let r = quad_complex(
+            |x| ((-x).exp() * x.cos(), (-x).exp() * x.sin()),
+            0.0,
+            f64::INFINITY,
+            opts,
+        )
+        .unwrap();
+        assert!(r.real.converged && r.imag.converged);
+        assert!((r.real.integral - 0.5).abs() < 1e-8);
+        assert!((r.imag.integral - 0.5).abs() < 1e-8);
+    }
+
+    #[test]
+    fn complex_quad_keeps_independent_subdivisions_errors_and_warnings() {
+        // The imaginary part exhausts its panel budget; the real part is exactly one.
+        let f = |x: f64| (1.0, if x == 0.0 { 0.0 } else { (1.0 / x).sin() });
+        let opts = QuadOptions {
+            limit: 5,
+            ..QuadOptions::default()
+        };
+        let (full, warnings) =
+            fsci_runtime::catch_warnings(|| quad_complex_full_output(f, 0.0, 1.0, &[], opts));
+        let (result, info) = full.unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!((info.real.ier, info.imag.ier), (0, 1));
+        assert!(result.real.converged && !result.imag.converged);
+        assert!(result.real.neval < result.imag.neval);
+        assert!((result.imag.integral - 0.505_789_358_239_215_2).abs() < 1e-12);
+        let (plain, warnings) = fsci_runtime::catch_warnings(|| quad_complex(f, 0.0, 1.0, opts));
+        assert_eq!(plain.unwrap(), result);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            warnings[0].category,
+            fsci_runtime::WarningCategory::IntegrationWarning
+        );
+
+        let kink = |x: f64| ((x - 0.25).abs(), x);
+        let (r, info) =
+            quad_complex_full_output(kink, 0.0, 1.0, &[0.25], QuadOptions::default()).unwrap();
+        assert_eq!((info.real.last, info.imag.last), (2, 2));
+        assert!((r.real.integral - 0.3125).abs() < 1e-14);
+        assert!((r.imag.integral - 0.5).abs() < 1e-14);
+        assert!(quad_complex_full_output(kink, 0.0, f64::INFINITY, &[0.25], opts).is_err());
     }
 
     #[test]
