@@ -1655,6 +1655,8 @@ impl From<OdeSolverAction> for SolverKind {
 ///    perturbation would overflow, the same-sized backward perturbation is used.
 /// 2. Estimates the spectral radius $\rho(J) = \max_i |\lambda_i(J)|$ via $\le 20$ power iterations
 ///    $v_{k+1} = J v_k / \|J v_k\|_2$ starting from a deterministic unit vector.
+///    When the final two iterations return to the same direction up to sign,
+///    their geometric mean estimates the per-step gain of the two-cycle.
 /// 3. Computes the dimensionless horizon stiffness indicator:
 ///    $$I_{\text{stiff}} = \rho(J) \cdot |t_{\text{end}} - t_0|$$
 ///    and the ratio of the tolerance-driven explicit step scale $h_{\text{tol}} = \Delta t \cdot \text{rtol}^{1/5}$
@@ -1955,7 +1957,12 @@ where
 
     let mut rho_power = 0.0_f64;
     let mut w = vec![0.0_f64; n];
-    for _iter in 0..20 {
+    const POWER_STEPS: usize = 20;
+    let mut cycle_start = Vec::new();
+    for iter in 0..POWER_STEPS {
+        if iter == POWER_STEPS - 2 {
+            cycle_start.clone_from(&v);
+        }
         if let Some(matrix) = analytic_sparse.as_ref() {
             w.fill(0.0);
             // Ascending CSC columns preserve each dense row's summation order
@@ -1995,6 +2002,22 @@ where
         }
         if (rho_power - prev).abs() <= 1e-9 * rho_power {
             break;
+        }
+        if iter == POWER_STEPS - 1 {
+            // For y'' = -omega² y, J² = -omega² I. The normalized directions
+            // repeat up to sign, but the two individual gains can differ by
+            // orders of magnitude when displacement and velocity use different
+            // units. Only use the two-step gain after spending the full budget.
+            let alignment = v.iter().zip(&cycle_start).map(|(a, b)| a * b).sum::<f64>();
+            let residual_sq = v
+                .iter()
+                .zip(&cycle_start)
+                .map(|(end, start)| (end - alignment.signum() * start).powi(2))
+                .sum::<f64>();
+            if residual_sq <= (64.0 * f64::EPSILON).powi(2) {
+                // Taking the square roots first also covers extreme Jacobian scales.
+                rho_power = prev.sqrt() * w_norm.sqrt();
+            }
         }
     }
 
@@ -6081,6 +6104,71 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn casp_probe_recovers_two_step_spectral_radius_in_both_directions() {
+        fn dense(_t: f64, y: &[f64]) -> Vec<Vec<f64>> {
+            vec![vec![0.0, y[0]], vec![y[1], 0.0]]
+        }
+        fn sparse(_t: f64, y: &[f64]) -> fsci_sparse::CscMatrix {
+            fsci_sparse::CscMatrix::from_components(
+                fsci_sparse::Shape2D::new(2, 2),
+                vec![y[1], y[0]],
+                vec![1, 0],
+                vec![0, 1, 2],
+                true,
+            )
+            .unwrap()
+        }
+
+        // J² = +/- (1000 * scale)² I. A single power-iteration gain does
+        // not determine the radius; the individual gains depend on the units.
+        for scale in [1e-200, 1.0, 1e200] {
+            for sign in [-1.0, 1.0] {
+                let y0 = [scale, sign * 1e6 * scale];
+                let base = SolveIvpOptions {
+                    t_span: (0.0, 1.0),
+                    y0: &y0,
+                    ..SolveIvpOptions::default()
+                };
+                for options in [
+                    SolveIvpOptions {
+                        jac: Some(dense),
+                        ..base.clone()
+                    },
+                    SolveIvpOptions {
+                        jac_sparse: Some(sparse),
+                        ..base
+                    },
+                ] {
+                    let probe = probe_ode_stiffness(
+                        &mut |_t, _y| panic!("analytic probe must not call the RHS"),
+                        &options,
+                    );
+                    assert_eq!((probe.probe_nfev, probe.probe_njev), (0, 1));
+                    assert!((probe.spectral_radius / (1000.0 * scale) - 1.0).abs() < 1e-12);
+                }
+            }
+        }
+
+        let options = SolveIvpOptions {
+            t_span: (0.0, 2.0),
+            y0: &[0.0, 0.0],
+            ..SolveIvpOptions::default()
+        };
+        let mut portfolio = OdeSolverPortfolio::new(RuntimeMode::Strict, 4);
+        let solved = solve_ivp_with_casp(
+            &mut |_t, y| vec![y[1], -1e6 * y[0]],
+            &options,
+            &mut portfolio,
+        )
+        .unwrap();
+        let probe = solved.stiffness_probe;
+        assert_eq!((probe.probe_nfev, probe.probe_njev), (3, 0));
+        assert!((probe.stiffness_indicator - 2000.0).abs() < 1e-9);
+        assert_eq!(solved.attempts, vec![(OdeSolverAction::BDF, true)]);
+        assert!(solved.result.success);
     }
 
     #[test]
