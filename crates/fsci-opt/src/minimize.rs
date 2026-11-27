@@ -3612,15 +3612,41 @@ fn brent_line_minimum(
     f: &mut impl FnMut(f64) -> Result<f64, OptError>,
     tol: f64,
 ) -> Result<(f64, f64), OptError> {
+    let samples = downhill_bracket(f, 0.0, 1.0)?;
+    if !samples.valid {
+        let points = samples.points;
+        if points.iter().any(|(x, fx)| x.is_nan() || fx.is_nan()) {
+            return Ok((f64::NAN, f64::NAN));
+        }
+        let mut best = points[0];
+        for point in &points[1..] {
+            if point.1 < best.1 {
+                best = *point;
+            }
+        }
+        return Ok(best);
+    }
+
+    refine_brent(f, samples.points, tol, 500)
+}
+
+pub(super) struct DownhillBracket {
+    pub(super) points: [(f64, f64); 3],
+    pub(super) valid: bool,
+}
+
+// Keep the samples even on failure: Powell recovers the best point, while
+// the stand-alone Brent API reports an invalid bracket to its caller.
+pub(super) fn downhill_bracket<E>(
+    f: &mut impl FnMut(f64) -> Result<f64, E>,
+    mut xa: f64,
+    mut xb: f64,
+) -> Result<DownhillBracket, E> {
     const GOLD: f64 = 1.618_034;
     const VERY_SMALL: f64 = 1.0e-21;
     const GROW_LIMIT: f64 = 110.0;
     const BRACKET_MAXITER: usize = 1000;
-    const MINTOL: f64 = 1.0e-11;
-    const CG: f64 = 0.381_966;
-    const BRENT_MAXITER: usize = 500;
 
-    let (mut xa, mut xb) = (0.0_f64, 1.0_f64);
     let (mut fa, mut fb) = (f(xa)?, f(xb)?);
     if fa < fb {
         std::mem::swap(&mut xa, &mut xb);
@@ -3692,26 +3718,28 @@ fn brent_line_minimum(
         && xa.is_finite()
         && xb.is_finite()
         && xc.is_finite();
-    if !valid {
-        let points = [(xa, fa), (xb, fb), (xc, fc)];
-        if points.iter().any(|(x, fx)| x.is_nan() || fx.is_nan()) {
-            return Ok((f64::NAN, f64::NAN));
-        }
-        let mut best = points[0];
-        for point in &points[1..] {
-            if point.1 < best.1 {
-                best = *point;
-            }
-        }
-        return Ok(best);
-    }
+    Ok(DownhillBracket {
+        points: [(xa, fa), (xb, fb), (xc, fc)],
+        valid,
+    })
+}
 
+pub(super) fn refine_brent(
+    f: &mut impl FnMut(f64) -> Result<f64, OptError>,
+    points: [(f64, f64); 3],
+    tol: f64,
+    maxiter: usize,
+) -> Result<(f64, f64), OptError> {
+    const MINTOL: f64 = 1.0e-11;
+    const CG: f64 = 0.381_966;
+
+    let [(xa, _), (xb, fb), (xc, _)] = points;
     let (mut x, mut w, mut v) = (xb, xb, xb);
     let (mut fx, mut fw, mut fv) = (fb, fb, fb);
     let (mut a, mut b) = if xa < xc { (xa, xc) } else { (xc, xa) };
     let mut deltax = 0.0_f64;
     let mut rat = 0.0_f64;
-    for _ in 0..BRENT_MAXITER {
+    for _ in 0..maxiter {
         let tol1 = tol * x.abs() + MINTOL;
         let tol2 = 2.0 * tol1;
         let xmid = 0.5 * (a + b);

@@ -3902,77 +3902,20 @@ fn invalid_scalar_minimize_controls(a: f64, b: f64, tol: f64, maxiter: usize) ->
 
 /// Find a minimum bracket for a 1D function.
 ///
-/// Returns (xa, xb, xc, fa, fb, fc) such that f(xb) < f(xa) and f(xb) < f(xc).
+/// Returns (xa, xb, xc, fa, fb, fc). A valid bracket has xb strictly between
+/// xa and xc, with fb no greater than either endpoint and below at least one.
+/// If the downhill search fails, the tuple contains its last three samples.
 /// Matches `scipy.optimize.bracket`.
 pub fn bracket<F>(f: F, xa: f64, xb: f64) -> (f64, f64, f64, f64, f64, f64)
 where
     F: Fn(f64) -> f64,
 {
-    let golden = std::f64::consts::GOLDEN_RATIO;
-    let limit = 100.0;
-
-    let mut xa = xa;
-    let mut xb = xb;
-    let mut fa = f(xa);
-    let mut fb = f(xb);
-
-    if fa < fb {
-        std::mem::swap(&mut xa, &mut xb);
-        std::mem::swap(&mut fa, &mut fb);
-    }
-
-    let mut xc = xb + golden * (xb - xa);
-    let mut fc = f(xc);
-
-    for _ in 0..200 {
-        if fb <= fc {
-            return (xa, xb, xc, fa, fb, fc);
-        }
-
-        // Parabolic extrapolation
-        let r = (xb - xa) * (fb - fc);
-        let q = (xb - xc) * (fb - fa);
-        let denom = 2.0 * (q - r).max(1e-20) * if q > r { 1.0 } else { -1.0 };
-        let mut w = xb - ((xb - xc) * q - (xb - xa) * r) / denom;
-        let wlim = xb + limit * (xc - xb);
-
-        if (w - xc) * (xb - w) > 0.0 {
-            let fw = f(w);
-            if fw < fc {
-                xa = xb;
-                fa = fb;
-                xb = w;
-                fb = fw;
-                return (xa, xb, xc, fa, fb, fc);
-            } else if fw > fb {
-                xc = w;
-                fc = fw;
-                return (xa, xb, xc, fa, fb, fc);
-            }
-            w = xc + golden * (xc - xb);
-        } else if (w - wlim) * (wlim - xc) >= 0.0 {
-            w = wlim;
-        } else if (w - wlim) * (xc - w) > 0.0 {
-            let fw = f(w);
-            if fw < fc {
-                xb = xc;
-                xc = w;
-                w = xc + golden * (xc - xb);
-                fb = fc;
-                fc = fw;
-            }
-        } else {
-            w = xc + golden * (xc - xb);
-        }
-
-        xa = xb;
-        xb = xc;
-        xc = w;
-        fa = fb;
-        fb = fc;
-        fc = f(xc);
-    }
-
+    let Ok(samples) = minimize::downhill_bracket(
+        &mut |x| Ok::<_, std::convert::Infallible>(f(x)),
+        xa,
+        xb,
+    );
+    let [(xa, fa), (xb, fb), (xc, fc)] = samples.points;
     (xa, xb, xc, fa, fb, fc)
 }
 
@@ -4029,35 +3972,40 @@ where
             detail: "brack values must be finite".to_string(),
         });
     }
-    // Establish the bracketing triple (xa, xc) bounding the minimum.
-    let (xa, xc) = match brack {
-        None => {
-            let (a, _b, c, ..) = bracket(&func, 0.0, 1.0);
-            (a, c)
+    let mut eval = |x| Ok(func(x));
+    let points = match *brack.unwrap_or(&[0.0, 1.0]) {
+        [xa, xb] => {
+            let samples = minimize::downhill_bracket(&mut eval, xa, xb)?;
+            if !samples.valid {
+                return Err(OptError::InvalidArgument {
+                    detail: "could not find a valid downhill bracket".to_string(),
+                });
+            }
+            samples.points
         }
-        Some(b) if b.len() == 2 => {
-            let (a, _b, c, ..) = bracket(&func, b[0], b[1]);
-            (a, c)
-        }
-        Some(b) if b.len() == 3 => {
-            let (fa, fb, fc) = (func(b[0]), func(b[1]), func(b[2]));
+        [xa, xb, xc] => {
+            let (xa, xc) = (xa.min(xc), xa.max(xc));
+            if !(xa < xb && xb < xc) {
+                return Err(OptError::InvalidArgument {
+                    detail: "middle bracketing point must lie between the endpoints".to_string(),
+                });
+            }
+            let (fa, fb, fc) = (func(xa), func(xb), func(xc));
             if !(fb < fa && fb < fc) {
                 return Err(OptError::InvalidArgument {
                     detail: "brack must be a downhill bracket: f(xb) < f(xa) and f(xb) < f(xc)"
                         .to_string(),
                 });
             }
-            (b[0], b[2])
+            [(xa, fa), (xb, fb), (xc, fc)]
         }
-        Some(_) => {
+        _ => {
             return Err(OptError::InvalidArgument {
                 detail: "brack must have 2 or 3 elements".to_string(),
             });
         }
     };
-    let lo = xa.min(xc);
-    let hi = xa.max(xc);
-    Ok(brent_minimize(&func, lo, hi, tol, maxiter).0)
+    Ok(minimize::refine_brent(&mut eval, points, tol, maxiter)?.0)
 }
 
 /// Run [`minimize`] with a fixed method and return the minimiser `xopt`, the
@@ -10997,6 +10945,21 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn brent_preserves_bracket_minimum_and_rejects_invalid_brackets() {
+        // Only the supplied middle sample lies in the narrow well. Discarding
+        // it and running a bounded search from scratch loses the minimum.
+        let well = |x: f64| ((x - 0.25).abs() * 1.0e10).min(1.0);
+        for points in [[-1.0, 0.25, 2.0], [2.0, 0.25, -1.0]] {
+            let x = crate::brent(well, Some(&points), 1.0e-8, 500).unwrap();
+            assert_eq!(x, 0.25);
+        }
+        // Reject bad ordering before invoking the objective.
+        let invalid = [0.0, 3.0, 1.0];
+        assert!(crate::brent(|_| panic!("bad bracket"), Some(&invalid), 1e-8, 500).is_err());
+        assert!(crate::brent(|_| 1.0, None, 1e-8, 500).is_err());
     }
 
     #[test]
