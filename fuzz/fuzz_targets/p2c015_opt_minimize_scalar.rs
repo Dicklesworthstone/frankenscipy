@@ -1,7 +1,7 @@
 #![no_main]
 
 use arbitrary::Arbitrary;
-use fsci_opt::{golden, minimize_scalar, MinimizeScalarOptions};
+use fsci_opt::{MinimizeScalarOptions, golden, minimize_scalar, minimize_scalar_bounded};
 use libfuzzer_sys::fuzz_target;
 
 const TOL: f64 = 1e-6;
@@ -61,11 +61,11 @@ fuzz_target!(|input: MinInput| {
         let x_min = result.x;
         let f_min = result.fun;
 
-        if x_min < a - TOL || x_min > b + TOL {
-            panic!(
-                "minimize_scalar: x_min {} outside bracket [{}, {}]",
-                x_min, a, b
-            );
+        // The two seeds may be expanded downhill, including beyond [a, b].
+        if result.success {
+            assert!(x_min.is_finite());
+            assert!(!f_min.is_nan());
+            assert!(result.nfev >= result.nit + 3);
         }
 
         let computed_fmin = f(x_min);
@@ -83,6 +83,20 @@ fuzz_target!(|input: MinInput| {
             );
         }
     }
+
+    // A hard box belongs to the explicitly bounded solver. Check both its
+    // evaluation domain and the point/value pair, including boundary minima.
+    let (bounded_x, bounded_f) = minimize_scalar_bounded(
+        |x| {
+            assert!(x >= a - TOL && x <= b + TOL);
+            f(x)
+        },
+        bracket,
+        TOL,
+        500,
+    );
+    assert!(bounded_x >= a - TOL && bounded_x <= b + TOL);
+    assert_eq!(bounded_f, f(bounded_x));
 
     let (golden_x, golden_f) = golden(f, a, b, 1e-6, 500);
 

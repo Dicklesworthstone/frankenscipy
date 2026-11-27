@@ -3614,17 +3614,7 @@ fn brent_line_minimum(
 ) -> Result<(f64, f64), OptError> {
     let samples = downhill_bracket(f, 0.0, 1.0)?;
     if !samples.valid {
-        let points = samples.points;
-        if points.iter().any(|(x, fx)| x.is_nan() || fx.is_nan()) {
-            return Ok((f64::NAN, f64::NAN));
-        }
-        let mut best = points[0];
-        for point in &points[1..] {
-            if point.1 < best.1 {
-                best = *point;
-            }
-        }
-        return Ok(best);
+        return Ok(samples.best_sample());
     }
 
     refine_brent(f, samples.points, tol, 500)
@@ -3633,6 +3623,21 @@ fn brent_line_minimum(
 pub(super) struct DownhillBracket {
     pub(super) points: [(f64, f64); 3],
     pub(super) valid: bool,
+}
+
+impl DownhillBracket {
+    fn best_sample(&self) -> (f64, f64) {
+        if self.points.iter().any(|(x, fx)| x.is_nan() || fx.is_nan()) {
+            return (f64::NAN, f64::NAN);
+        }
+        let mut best = self.points[0];
+        for point in &self.points[1..] {
+            if point.1 < best.1 {
+                best = *point;
+            }
+        }
+        best
+    }
 }
 
 // Keep the samples even on failure: Powell recovers the best point, while
@@ -4401,9 +4406,9 @@ pub struct MinimizeScalarResult {
 
 /// Minimize a scalar function using Brent's method.
 ///
-/// Finds a local minimum of `f` within the bracket `(a, b)`.
-/// Optionally, an interior point `xatol` can be provided.
-/// Matches `scipy.optimize.minimize_scalar(f, bracket=(a, b), method='brent')`.
+/// The two points seed a downhill bracket search. The returned minimizer may
+/// lie outside their interval, as in `scipy.optimize.minimize_scalar` with
+/// `method='brent'`. Use [`crate::minimize_scalar_bounded`] for a hard interval.
 pub fn minimize_scalar<F>(
     f: F,
     bracket: (f64, f64),
@@ -4412,135 +4417,61 @@ pub fn minimize_scalar<F>(
 where
     F: Fn(f64) -> f64,
 {
-    let (mut a, mut b) = bracket;
+    let (a, b) = bracket;
     if !a.is_finite() || !b.is_finite() {
         return Err(OptError::NonFiniteInput {
-            detail: "bracket bounds must be finite".to_string(),
+            detail: "bracket seeds must be finite".to_string(),
         });
     }
-    if a > b {
-        std::mem::swap(&mut a, &mut b);
-    }
-    if (a - b).abs() < f64::EPSILON {
+    if a == b {
         return Err(OptError::InvalidBounds {
-            detail: "bracket bounds must not be equal".to_string(),
+            detail: "bracket seeds must not be equal".to_string(),
+        });
+    }
+    if !options.tol.is_finite() || options.tol < 0.0 {
+        return Err(OptError::InvalidArgument {
+            detail: "tol must be finite and nonnegative".to_string(),
         });
     }
 
-    // Brent's method with golden section and parabolic interpolation
-    let golden_ratio = 0.5 * (3.0 - 5.0_f64.sqrt()); // ~0.381966
-
-    let mut x = a + golden_ratio * (b - a);
-    let mut w = x;
-    let mut v = x;
-    let mut fx = f(x);
-    let mut fw = fx;
-    let mut fv = fx;
-    let mut nfev = 1;
-
-    let mut d = 0.0_f64;
-    let mut e = 0.0_f64;
-
-    for nit in 0..options.maxiter {
-        let midpoint = 0.5 * (a + b);
-        let tol1 = options.tol * x.abs() + 1e-10;
-        let tol2 = 2.0 * tol1;
-
-        // Convergence check
-        if (x - midpoint).abs() <= (tol2 - 0.5 * (b - a)) {
-            return Ok(MinimizeScalarResult {
-                x,
-                fun: fx,
-                // status: Brent bracket stop |x − mid| ≤ 2·tol1 − (b−a)/2
-                success: true,
-                nfev,
-                nit,
-            });
-        }
-
-        // Try parabolic interpolation
-        let mut use_golden = true;
-
-        if e.abs() > tol1 {
-            // Parabolic fit through (v, fv), (w, fw), (x, fx)
-            let r = (x - w) * (fx - fv);
-            let q = (x - v) * (fx - fw);
-            let mut p = (x - v) * q - (x - w) * r;
-            let mut q_val = 2.0 * (q - r);
-
-            if q_val > 0.0 {
-                p = -p;
-            } else {
-                q_val = -q_val;
-            }
-
-            if p.abs() < (0.5 * q_val * e).abs() && p > q_val * (a - x) && p < q_val * (b - x) {
-                // Accept parabolic step
-                d = p / q_val;
-                let u_test = x + d;
-                if (u_test - a) < tol2 || (b - u_test) < tol2 {
-                    d = if x < midpoint { tol1 } else { -tol1 };
-                }
-                use_golden = false;
-            }
-        }
-
-        if use_golden {
-            // Golden section step
-            e = if x < midpoint { b - x } else { a - x };
-            d = golden_ratio * e;
-        } else {
-            e = d;
-        }
-
-        // Evaluate at new point
-        let u = if d.abs() >= tol1 {
-            x + d
-        } else if d > 0.0 {
-            x + tol1
-        } else {
-            x - tol1
-        };
-        let fu = f(u);
-        nfev += 1;
-
-        // Update bracket
-        if fu <= fx {
-            if u < x {
-                b = x;
-            } else {
-                a = x;
-            }
-            v = w;
-            fv = fw;
-            w = x;
-            fw = fx;
-            x = u;
-            fx = fu;
-        } else {
-            if u < x {
-                a = u;
-            } else {
-                b = u;
-            }
-            if fu <= fw || w == x {
-                v = w;
-                fv = fw;
-                w = u;
-                fw = fu;
-            } else if fu <= fv || v == x || v == w {
-                v = u;
-                fv = fu;
-            }
-        }
+    let mut bracket_calls = 0;
+    let samples = downhill_bracket(
+        &mut |x| {
+            bracket_calls += 1;
+            Ok::<_, OptError>(f(x))
+        },
+        a,
+        b,
+    )?;
+    if !samples.valid {
+        let (x, fun) = samples.best_sample();
+        return Ok(MinimizeScalarResult {
+            x,
+            fun,
+            success: false,
+            nfev: bracket_calls,
+            nit: 0,
+        });
     }
 
+    // Brent evaluates exactly one trial per refinement iteration. The
+    // convergence check itself and reuse of the middle sample cost no calls.
+    let mut nit = 0;
+    let (x, fun) = refine_brent(
+        &mut |x| {
+            nit += 1;
+            Ok(f(x))
+        },
+        samples.points,
+        options.tol,
+        options.maxiter,
+    )?;
     Ok(MinimizeScalarResult {
         x,
-        fun: fx,
-        success: false,
-        nfev,
-        nit: options.maxiter,
+        fun,
+        success: nit < options.maxiter && !x.is_nan() && !fun.is_nan(),
+        nfev: bracket_calls + nit,
+        nit,
     })
 }
 
@@ -7581,11 +7512,40 @@ mod tests {
     }
 
     #[test]
-    fn minimize_scalar_linear_converges() {
-        // f(x) = x, monotone, should find the left endpoint
-        let result = minimize_scalar(|x| x, (0.0, 10.0), MinimizeScalarOptions::default())
-            .expect("minimize_scalar works");
-        assert!(result.x < 1.0, "should be near 0, got {}", result.x);
+    fn minimize_scalar_expands_seed_pair_and_counts_evaluations() {
+        let calls = std::cell::Cell::new(0);
+        let result = minimize_scalar(
+            |x| {
+                calls.set(calls.get() + 1);
+                (x - 6.0).powi(2)
+            },
+            (0.0, 1.0),
+            MinimizeScalarOptions::default(),
+        )
+        .unwrap();
+        assert!(result.success);
+        assert!((result.x - 6.0).abs() < 1e-7);
+        assert_eq!(result.nfev, calls.get());
+        assert!(result.nfev >= result.nit + 3);
+    }
+
+    #[test]
+    fn minimize_scalar_reports_failed_bracket_and_refinement_limit() {
+        let flat = minimize_scalar(|_| 3.0, (0.0, 1.0), MinimizeScalarOptions::default()).unwrap();
+        assert!(!flat.success);
+        assert_eq!((flat.fun, flat.nfev, flat.nit), (3.0, 3, 0));
+
+        let result = minimize_scalar(
+            |x| (x - 0.5).powi(2),
+            (0.0, 1.0),
+            MinimizeScalarOptions {
+                maxiter: 1,
+                ..MinimizeScalarOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(!result.success);
+        assert_eq!((result.nfev, result.nit), (4, 1));
     }
 
     #[test]
