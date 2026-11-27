@@ -240,29 +240,15 @@ fn diags_row_block(
     for row in base..end {
         let mut c = 0usize;
         for &(offset, diag) in diagonal_order {
-            let entry = if offset >= 0 {
-                let col = row + offset as usize;
-                if col < shape.cols && row < diag.len() {
-                    Some((col, diag[row]))
-                } else {
-                    None
-                }
-            } else {
-                let row_offset = (-offset) as usize;
-                row.checked_sub(row_offset)
-                    .filter(|&k| k < diag.len())
-                    .map(|k| (k, diag[k]))
+            let Some(col) = row.checked_add_signed(offset).filter(|&col| col < shape.cols) else {
+                continue;
             };
-            // Store only structural non-zeros. SciPy keeps every diagonal
-            // element in the DIA intermediate but masks `data != 0` when it
-            // converts to CSR, so `sparse.diags(..., format="csr")` prunes both
-            // all-zero diagonals and interior zeros. [`diags`] returns CSR
-            // directly and therefore matches the converted peer, not the DIA
-            // one. `-0.0 == 0.0` and `NaN != 0.0` in Rust exactly as in numpy,
-            // so those two edges agree without special-casing.
-            if let Some((col, value)) = entry
-                && value != 0.0
-            {
+            // A diagonal is indexed from its first in-bounds element. A
+            // singleton broadcasts over the whole diagonal without expanding it.
+            let k = if diag.len() == 1 { 0 } else { row.min(col) };
+            let value = diag[k];
+            // DIA to CSR prunes explicit zeros and preserves NaNs.
+            if value != 0.0 {
                 indices.push(col);
                 data.push(value);
                 c += 1;
@@ -279,11 +265,8 @@ fn diags_row_block(
 pub static SPARSE_DIAGS_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// When `true`, [`diags`] takes the ORIG validating path: bounds-check EVERY diagonal element
-/// (O(nnz) pre-scan) then build the CSR through `from_components(.., true)` (another O(nnz) bounds
-/// scan + `detect_canonical`). Default `false` checks only each diagonal's last (extremal) element
-/// and, since the emitted rows are provably in-bounds and canonical, builds via the trusted
-/// constructor — skipping both O(nnz) validation scans. Byte-identical result AND metadata. A/B gate.
+/// When true, verify the emitted CSR components and canonical metadata through the
+/// checked constructor. Both paths apply the same SciPy diagonal shape rules.
 #[doc(hidden)]
 pub static DIAGS_VALIDATE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -319,49 +302,57 @@ pub fn diags(
         }
     }
 
-    let inferred = infer_shape(diagonals, offsets)?;
-    let shape = shape.unwrap_or(inferred);
-
-    let validate = DIAGS_VALIDATE.load(std::sync::atomic::Ordering::Relaxed);
-    for (diag, &offset) in diagonals.iter().zip(offsets.iter()) {
-        if diag.is_empty() {
-            continue;
-        }
-        let start_row = if offset < 0 { (-offset) as usize } else { 0 };
-        let start_col = if offset > 0 { offset as usize } else { 0 };
-        // `row` and `col` both increase by 1 per step `k`, so the LAST element (k = len-1)
-        // carries the maximum row and column. If it fits the shape, every earlier element
-        // does too; if any element would exceed the shape, the last one does (same axis).
-        // Checking only that extremum yields the byte-identical valid/invalid verdict while
-        // collapsing an O(nnz) bounds pre-scan to O(#diagonals) — meaningful because this
-        // pass is serial while the row fill below fans across cores.
-        let range = if validate {
-            0..diag.len()
-        } else {
-            (diag.len() - 1)..diag.len()
-        };
-        for k in range {
-            let row = start_row + k;
-            let col = start_col + k;
-            if row >= shape.rows || col >= shape.cols {
-                return Err(SparseError::InvalidShape {
-                    message: "diagonal length exceeds matrix shape bounds".to_string(),
-                });
-            }
-        }
+    let Some(first) = diagonals.first() else {
+        return Err(SparseError::InvalidShape {
+            message: "at least one diagonal is required".to_string(),
+        });
+    };
+    let shape = if let Some(shape) = shape {
+        shape
+    } else {
+        // SciPy infers a square from the first diagonal and its offset.
+        let side = first
+            .len()
+            .checked_add(offsets[0].unsigned_abs())
+            .ok_or_else(|| SparseError::IndexOverflow {
+                message: "inferred diagonal shape overflows usize".to_string(),
+            })?;
+        Shape2D::new(side, side)
+    };
+    if shape.rows >= (isize::MAX as usize) / size_of::<usize>() {
+        return Err(SparseError::IndexOverflow {
+            message: "CSR row pointer array exceeds addressable memory".to_string(),
+        });
     }
 
-    let capacity = diagonals
-        .iter()
-        .try_fold(0usize, |total, diag| total.checked_add(diag.len()))
-        .ok_or_else(|| SparseError::IndexOverflow {
-            message: "diagonal entry count overflows usize".to_string(),
+    let validate = DIAGS_VALIDATE.load(std::sync::atomic::Ordering::Relaxed);
+    let mut capacity = 0usize;
+    let mut diagonal_order = Vec::with_capacity(diagonals.len());
+    for (diag, &offset) in diagonals.iter().zip(offsets) {
+        let magnitude = offset.unsigned_abs();
+        let length = if offset < 0 {
+            shape.rows.checked_sub(magnitude).map(|n| n.min(shape.cols))
+        } else {
+            shape.cols.checked_sub(magnitude).map(|n| n.min(shape.rows))
+        }
+        .ok_or_else(|| SparseError::InvalidShape {
+            message: format!("diagonal offset {offset} is outside the matrix shape"),
         })?;
-    let mut diagonal_order: Vec<(isize, &[f64])> = diagonals
-        .iter()
-        .zip(offsets.iter().copied())
-        .map(|(diag, offset)| (offset, diag.as_slice()))
-        .collect();
+        if diag.len() != 1 && diag.len() < length {
+            return Err(SparseError::InvalidShape {
+                message: format!(
+                    "diagonal at offset {offset} has length {}, expected {length} or a singleton",
+                    diag.len()
+                ),
+            });
+        }
+        capacity = capacity
+            .checked_add(length)
+            .ok_or_else(|| SparseError::IndexOverflow {
+                message: "diagonal entry count overflows usize".to_string(),
+            })?;
+        diagonal_order.push((offset, diag.as_slice()));
+    }
     diagonal_order.sort_unstable_by_key(|&(offset, _)| offset);
 
     // Each output row is a pure function of `row` and the (shared, read-only) offset-sorted
@@ -629,28 +620,6 @@ pub fn random(shape: Shape2D, density: f64, seed: u64) -> SparseResult<CooMatrix
     }
 
     CooMatrix::from_triplets(shape, data, rows, cols, true)
-}
-
-fn infer_shape(diagonals: &[Vec<f64>], offsets: &[isize]) -> SparseResult<Shape2D> {
-    let mut rows = 0usize;
-    let mut cols = 0usize;
-    for (diag, &offset) in diagonals.iter().zip(offsets.iter()) {
-        let len = diag.len();
-        if offset >= 0 {
-            rows = rows.max(len);
-            cols = cols.max(len + offset as usize);
-        } else {
-            let abs = (-offset) as usize;
-            rows = rows.max(len + abs);
-            cols = cols.max(len);
-        }
-    }
-    if rows == 0 && cols == 0 {
-        return Err(SparseError::InvalidShape {
-            message: "cannot infer shape from empty diagonals".to_string(),
-        });
-    }
-    Ok(Shape2D::new(rows, cols))
 }
 
 /// Construct a block diagonal sparse matrix from a list of sparse matrices.
@@ -1885,13 +1854,15 @@ mod tests {
     #[test]
     fn diags_honors_explicit_shape() {
         let csr = diags(
-            &[vec![1.0, 2.0], vec![3.0]],
+            &[vec![1.0, 2.0, 4.0, 5.0, 6.0], vec![3.0]],
             &[0, 2],
             Some(Shape2D::new(5, 5)),
         )
         .expect("diags");
         assert_eq!(csr.shape(), Shape2D::new(5, 5));
-        assert_eq!(csr.nnz(), 3);
+        assert_eq!(csr.indptr(), &[0, 2, 4, 6, 7, 8]);
+        assert_eq!(csr.indices(), &[0, 2, 1, 3, 2, 4, 3, 4]);
+        assert_eq!(csr.data(), &[1.0, 3.0, 2.0, 3.0, 4.0, 3.0, 5.0, 6.0]);
     }
 
     /// `diags` returns CSR, so its peer is `scipy.sparse.diags(...,
@@ -1945,10 +1916,42 @@ mod tests {
     }
 
     #[test]
-    fn diags_rejects_out_of_bounds_for_explicit_shape() {
-        let err = diags(&[vec![1.0, 2.0, 3.0]], &[1], Some(Shape2D::new(3, 3)))
-            .expect_err("bounds violation");
-        assert!(matches!(err, SparseError::InvalidShape { .. }));
+    fn diags_infers_square_from_first_offset_and_truncates_surplus() {
+        let csr = diags(&[vec![1.0, 2.0], vec![3.0; 6]], &[-1, 0], None).unwrap();
+        assert_eq!(csr.shape(), Shape2D::new(3, 3));
+        assert_eq!(csr.indptr(), &[0, 1, 3, 5]);
+        assert_eq!(csr.indices(), &[0, 0, 1, 1, 2]);
+        assert_eq!(csr.data(), &[3.0, 1.0, 3.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn diags_array_broadcasts_across_rectangular_bands() {
+        let array = diags_array(&[vec![-1.0], vec![2.0]], &[-1, 1], Some(Shape2D::new(3, 4)))
+            .expect("rectangular bands");
+        let csr = array.as_matrix();
+        assert_eq!(csr.indptr(), &[0, 1, 3, 5]);
+        assert_eq!(csr.indices(), &[1, 0, 2, 1, 3]);
+        assert_eq!(csr.data(), &[2.0, -1.0, 2.0, -1.0, 2.0]);
+    }
+
+    #[test]
+    fn diags_validates_short_diagonals_and_offset_boundaries() {
+        let shape = Some(Shape2D::new(3, 4));
+        for diag in [vec![], vec![1.0, 2.0]] {
+            assert!(matches!(
+                diags(&[diag], &[1], shape),
+                Err(SparseError::InvalidShape { .. })
+            ));
+        }
+        for offset in [-3, 4] {
+            assert_eq!(diags(&[vec![1.0]], &[offset], shape).unwrap().nnz(), 0);
+        }
+        for offset in [isize::MIN, -4, 5, isize::MAX] {
+            assert!(matches!(
+                diags(&[vec![1.0]], &[offset], shape),
+                Err(SparseError::InvalidShape { .. })
+            ));
+        }
     }
 
     #[test]
@@ -2154,9 +2157,9 @@ mod tests {
     }
 
     #[test]
-    fn diags_precheck_last_only_matches_full_scan_verdict() {
+    fn diags_trusted_and_checked_constructors_agree() {
         use std::sync::atomic::Ordering;
-        // (diagonals, offsets, shape) cases: valid ones and ones that exceed the shape.
+        // Full diagonals, oversized inputs, a singleton, and a short diagonal.
         // Named so `clippy::type_complexity` is satisfied by a definition
         // rather than an allow (frankenscipy-nwx8m).
         type DiagsCase<'a> = (&'a [&'a [f64]], &'a [isize], Shape2D);
@@ -2167,8 +2170,10 @@ mod tests {
                 &[1, 0],
                 Shape2D::new(3, 3),
             ),
-            (&[&[1.0, 2.0, 3.0]], &[1], Shape2D::new(3, 3)), // last col out of bounds
-            (&[&[1.0, 2.0, 3.0, 4.0]], &[0], Shape2D::new(3, 3)), // overruns both axes
+            (&[&[1.0, 2.0, 3.0]], &[1], Shape2D::new(3, 3)), // excess entry is ignored
+            (&[&[1.0, 2.0, 3.0, 4.0]], &[0], Shape2D::new(3, 3)), // excess entry is ignored
+            (&[&[2.0]], &[-1], Shape2D::new(4, 3)),
+            (&[&[1.0, 2.0]], &[0], Shape2D::new(3, 3)),
         ];
         for &(diags_in, offsets, shape) in cases {
             let owned: Vec<Vec<f64>> = diags_in.iter().map(|d| d.to_vec()).collect();

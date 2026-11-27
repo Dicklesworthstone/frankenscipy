@@ -6867,7 +6867,7 @@ fn diags_golden_text() -> String {
     write_csr(&mut output, "diags-tridiag-6", &small);
 
     let rectangular = diags(
-        &[vec![0.0, 3.0, -2.0], vec![4.0, 0.0]],
+        &[vec![0.0, 3.0, -2.0, 0.0], vec![4.0, 0.0]],
         &[1, -2],
         Some(Shape2D::new(4, 5)),
     )
