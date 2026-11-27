@@ -36,7 +36,7 @@
 
 use crate::{
     DecompOptions, LinalgError, LinalgWarning, MatrixAssumption, NormKind, SolveOptions,
-    hardened_dimension_check,
+    TriangularSolveOptions, TriangularTranspose, hardened_dimension_check,
 };
 use fsci_runtime::RuntimeMode;
 use nalgebra::{Complex, DMatrix};
@@ -1042,16 +1042,108 @@ fn triangular_rcond(mut t: DMatrix<C64>, upper: bool) -> f64 {
     }
 }
 
-/// In-place column-oriented triangular substitution.
+/// Solve a complex triangular system with the same triangle, transpose and
+/// unit-diagonal options as `scipy.linalg.solve_triangular`.
+///
+/// # Errors
+/// Returns an error for invalid shapes, nonfinite inputs under the selected
+/// finite-check policy, or a zero pivot on a non-unit diagonal.
+pub fn solve_triangular(
+    a: &[Vec<C64>],
+    b: &[C64],
+    options: TriangularSolveOptions,
+) -> Result<Vec<C64>, LinalgError> {
+    validate_triangular_system(a, b.len(), 1, options)?;
+    if (options.check_finite || options.mode == RuntimeMode::Hardened)
+        && b.iter().any(|&z| !is_finite(z))
+    {
+        return Err(LinalgError::NonFiniteInput);
+    }
+    let mut x = b.to_vec();
+    solve_triangular_rhs(a, &mut x, options);
+    Ok(x)
+}
+
+/// Solve a complex triangular system with one right-hand side per column of
+/// `b`. The solution has the same shape as `b`.
+///
+/// # Errors
+/// As [`solve_triangular`]. The two matrices must have the same row count.
+pub fn solve_triangular_matrix(
+    a: &[Vec<C64>],
+    b: &[Vec<C64>],
+    options: TriangularSolveOptions,
+) -> Result<ComplexMatrix, LinalgError> {
+    let (rows, cols) = shape(b)?;
+    validate_triangular_system(a, rows, cols, options)?;
+    check_finite(b, options.mode, options.check_finite)?;
+    if rows == 0 || cols == 0 {
+        return Ok(b.to_vec());
+    }
+    let mut x = to_dm(b, rows, cols);
+    for column in x.as_mut_slice().chunks_exact_mut(rows) {
+        solve_triangular_rhs(a, column, options);
+    }
+    Ok(rows_of(&x))
+}
+
+fn validate_triangular_system(
+    a: &[Vec<C64>],
+    rhs_rows: usize,
+    rhs_cols: usize,
+    options: TriangularSolveOptions,
+) -> Result<(), LinalgError> {
+    let n = square(
+        a,
+        DecompOptions {
+            mode: options.mode,
+            check_finite: options.check_finite,
+        },
+    )?;
+    if n != rhs_rows {
+        return Err(LinalgError::IncompatibleShapes {
+            a_shape: (n, n),
+            b_len: rhs_rows,
+        });
+    }
+    hardened_dimension_check(options.mode, rhs_rows, rhs_cols)?;
+    if rhs_cols != 0 && !options.unit_diagonal && (0..n).any(|i| a[i][i] == CZERO) {
+        return Err(LinalgError::SingularMatrix);
+    }
+    Ok(())
+}
+
+fn solve_triangular_rhs(a: &[Vec<C64>], x: &mut [C64], options: TriangularSolveOptions) {
+    let transposed = options.trans != TriangularTranspose::NoTranspose;
+    let upper = options.lower == transposed;
+    triangular_substitute(x, upper, options.unit_diagonal, |i, j| match options.trans {
+        TriangularTranspose::NoTranspose => a[i][j],
+        TriangularTranspose::Transpose => a[j][i],
+        TriangularTranspose::ConjugateTranspose => a[j][i].conj(),
+    });
+}
+
 fn triangular_solve_in_place(t: &DMatrix<C64>, x: &mut [C64], upper: bool, adjoint: bool) {
-    let n = t.nrows();
-    let at = |i: usize, j: usize| {
+    triangular_substitute(x, upper != adjoint, false, |i, j| {
         if adjoint { t[(j, i)].conj() } else { t[(i, j)] }
-    };
-    if upper != adjoint {
+    });
+}
+
+/// Column-oriented substitution on the effective operator. The accessor reads
+/// only the active triangle and never touches an implicit unit diagonal.
+fn triangular_substitute(
+    x: &mut [C64],
+    upper: bool,
+    unit_diagonal: bool,
+    at: impl Fn(usize, usize) -> C64,
+) {
+    let n = x.len();
+    if upper {
         for j in (0..n).rev() {
             if x[j] != CZERO {
-                x[j] = zladiv(x[j], at(j, j));
+                if !unit_diagonal {
+                    x[j] = zladiv(x[j], at(j, j));
+                }
                 let xj = x[j];
                 for i in 0..j {
                     x[i] -= xj * at(i, j);
@@ -1061,7 +1153,9 @@ fn triangular_solve_in_place(t: &DMatrix<C64>, x: &mut [C64], upper: bool, adjoi
     } else {
         for j in 0..n {
             if x[j] != CZERO {
-                x[j] = zladiv(x[j], at(j, j));
+                if !unit_diagonal {
+                    x[j] = zladiv(x[j], at(j, j));
+                }
                 let xj = x[j];
                 for i in j + 1..n {
                     x[i] -= xj * at(i, j);
@@ -2920,6 +3014,32 @@ mod tests {
             vec![c(-0.5, 0.0), c(2.0, 2.0), c(5.0, 0.0), c(1.5, -0.5)],
             vec![c(0.2, -0.3), c(-1.0, 0.0), c(0.7, 0.7), c(2.0, 3.0)],
         ]
+    }
+
+    #[test]
+    fn triangular_solve_preserves_rhs_shape_and_checks_the_selected_diagonal() {
+        let a = [vec![CZERO, c(2.0, 1.0)], vec![c(99.0, 0.0), CZERO]];
+        let options = TriangularSolveOptions {
+            unit_diagonal: true,
+            trans: TriangularTranspose::ConjugateTranspose,
+            ..TriangularSolveOptions::default()
+        };
+        let rhs = [vec![CONE, CZERO], vec![CZERO, CONE]];
+        // inv([[1, 0], [2-i, 1]])
+        let x = solve_triangular_matrix(&a, &rhs, options).unwrap();
+        assert_eq!(x, [vec![CONE, CZERO], vec![c(-2.0, 1.0), CONE]]);
+        let options = TriangularSolveOptions::default();
+        assert_eq!(
+            solve_triangular(&a, &[CZERO, CZERO], options),
+            Err(LinalgError::SingularMatrix)
+        );
+        assert!(matches!(
+            solve_triangular(&a, &[CONE], options),
+            Err(LinalgError::IncompatibleShapes { .. })
+        ));
+        let empty = [vec![], vec![]];
+        assert_eq!(solve_triangular_matrix(&a, &empty, options).unwrap(), empty);
+        assert!(solve_triangular(&[], &[], options).unwrap().is_empty());
     }
 
     #[test]

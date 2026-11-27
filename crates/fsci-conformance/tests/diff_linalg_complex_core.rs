@@ -23,7 +23,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_linalg::complex::{self as cx, C64, ComplexMatrix, MaybeComplexMatrix};
-use fsci_linalg::{DecompOptions, MatrixAssumption, NormKind, SolveOptions};
+use fsci_linalg::{
+    DecompOptions, MatrixAssumption, NormKind, SolveOptions, TriangularSolveOptions,
+    TriangularTranspose,
+};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-002";
@@ -38,6 +41,7 @@ const SPECTRAL_TOL: f64 = 1.0e-10;
 const ARMS: &[&str] = &[
     "solve",
     "solve_pos",
+    "solve_triangular",
     "lu",
     "lu_solve",
     "det",
@@ -276,6 +280,18 @@ fn cases() -> Vec<Case> {
             Some(b.clone()),
         ));
     }
+    for n in [1, 3, 8] {
+        let mut a = random_complex(n, n, 3800 + n as u64);
+        for (i, row) in a.iter_mut().enumerate() {
+            row[i] += C64::new(n as f64, 1.0);
+        }
+        out.push(case(
+            format!("triangular{n}"),
+            "solve_triangular",
+            a,
+            Some(random_vec(n, 3900 + n as u64)),
+        ));
+    }
     for (k, &(m, n)) in [(6usize, 3usize), (3, 6), (10, 4)].iter().enumerate() {
         let seed = 2000 + k as u64;
         let a = random_complex(m, n, seed);
@@ -387,6 +403,15 @@ for q in json.load(sys.stdin):
                 arm["v"]["x"] = v(sl.solve(a, b))
             elif op == "solve_pos":
                 arm["v"]["x"] = v(sl.solve(a, b, assume_a="pos"))
+            elif op == "solve_triangular":
+                rhs = np.column_stack([b, np.conj(b)])
+                for lower in (0, 1):
+                    for unit in (0, 1):
+                        for t in (0, 1, 2):
+                            key = f"x{lower}{unit}{t}"
+                            args = dict(lower=bool(lower), unit_diagonal=bool(unit), trans=t)
+                            arm["v"][key] = v(sl.solve_triangular(a, b, **args))
+                            arm["m"][key] = m(sl.solve_triangular(a, rhs, **args))
             elif op == "lu":
                 p, l, u = sl.lu(a)
                 arm["m"].update(p=m(p), l=m(l), u=m(u))
@@ -606,6 +631,36 @@ fn compare(c: &Case, arm: &OracleArm) -> Result<(f64, f64), String> {
             };
             let x = cx::solve(a, c.b.as_ref().unwrap(), o).map_err(e)?;
             (rel_err_vec(&x.x, &gv("x")), DIRECT_TOL)
+        }
+        "solve_triangular" => {
+            let b = c.b.as_ref().unwrap();
+            let rhs: ComplexMatrix = b.iter().map(|&z| vec![z, z.conj()]).collect();
+            let mut err = 0.0_f64;
+            for lower in [false, true] {
+                for unit_diagonal in [false, true] {
+                    for (t, trans) in [
+                        TriangularTranspose::NoTranspose,
+                        TriangularTranspose::Transpose,
+                        TriangularTranspose::ConjugateTranspose,
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let key = format!("x{}{}{t}", u8::from(lower), u8::from(unit_diagonal));
+                        let options = TriangularSolveOptions {
+                            lower,
+                            unit_diagonal,
+                            trans,
+                            ..TriangularSolveOptions::default()
+                        };
+                        let x = cx::solve_triangular(a, b, options).map_err(e)?;
+                        let matrix = cx::solve_triangular_matrix(a, &rhs, options).map_err(e)?;
+                        err = err.max(rel_err_vec(&x, &gv(&key)));
+                        err = err.max(rel_err_mat(&matrix, &gm(&key)));
+                    }
+                }
+            }
+            (err, DIRECT_TOL)
         }
         "lu" => {
             let r = cx::lu(a, opts()).map_err(e)?;
