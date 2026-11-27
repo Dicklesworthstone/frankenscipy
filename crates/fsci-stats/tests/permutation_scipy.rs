@@ -516,11 +516,11 @@ fn resource_preflight_rejects_limits_and_unrepresentable_output_without_callback
         pairwise,
         Err(StatsError::ResourceExhausted { .. })
     ));
-    let combined = with_hardened_stats_caps(3, 100, || {
+    let per_sample = with_hardened_stats_caps(1, 100, || {
         permutation_test_samples(data, statistic, hardened)
     });
     assert!(matches!(
-        combined,
+        per_sample,
         Err(StatsError::ResourceExhausted { .. })
     ));
     let long = [1.0; 30];
@@ -553,6 +553,66 @@ fn resource_preflight_rejects_limits_and_unrepresentable_output_without_callback
         )
         .unwrap();
     }
+}
+
+#[test]
+fn hardened_sample_cap_bounds_each_sample_and_resamples_bound_the_work() {
+    // ttest_ind_with_options, pearsonr_with_options and spearmanr_with_options apply
+    // hardened_max_sample_len to each input, and so does the permutation test: two samples
+    // within the cap are accepted even when their combined length exceeds it.
+    let calls = AtomicUsize::new(0);
+    let statistic = |samples: &[&[f64]]| {
+        calls.fetch_add(1, Ordering::Relaxed);
+        difference(samples)
+    };
+    let hardened = |n_resamples: usize| PermutationTestOptions {
+        mode: RuntimeMode::Hardened,
+        n_resamples,
+        ..PermutationTestOptions::default()
+    };
+    let six_a = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let six_b = [2.5, 3.5, 4.5, 5.5, 6.5, 7.5];
+    let three = [0.5, 9.0, 4.25];
+    let nine = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+    with_hardened_stats_caps(8, 6, || {
+        with_hardened_max_resamples(84, || {
+            // 6 + 6 = 12 > 8. C(12, 6) = 924 partitions exceed 10, so 10 random draws.
+            let random = permutation_test_samples(&[&six_a, &six_b], statistic, hardened(10))
+                .expect("each sample is within both caps");
+            assert!(!random.exact);
+            assert_eq!(random.null_distribution.len(), 10);
+            assert_eq!(calls.swap(0, Ordering::Relaxed), 11);
+
+            // 3 + 6 = 9 > 8. C(9, 3) = 84 partitions fit the budget and are enumerated
+            // exactly; one resample fewer turns the same data into 83 random draws.
+            let exact = permutation_test_samples(&[&three, &six_a], statistic, hardened(84))
+                .expect("each sample is within both caps");
+            assert!(exact.exact);
+            assert_eq!(exact.null_distribution.len(), 84);
+            assert_eq!(calls.swap(0, Ordering::Relaxed), 85);
+            let drawn = permutation_test_samples(&[&three, &six_a], statistic, hardened(83))
+                .expect("each sample is within both caps");
+            assert!(!drawn.exact);
+            assert_eq!(drawn.null_distribution.len(), 83);
+            assert_eq!(calls.swap(0, Ordering::Relaxed), 84);
+
+            // The resample cap still bounds the work, before any callback.
+            let over_budget = permutation_test_samples(&[&three, &six_a], statistic, hardened(85));
+            assert!(matches!(
+                over_budget,
+                Err(StatsError::ResourceExhausted { .. })
+            ));
+        });
+    });
+    // One sample longer than the sample cap is refused even when the pairwise cap allows it.
+    let too_long = with_hardened_stats_caps(8, 100, || {
+        permutation_test_samples(&[&nine, &three], statistic, hardened(10))
+    });
+    assert!(matches!(
+        too_long,
+        Err(StatsError::ResourceExhausted { .. })
+    ));
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
 }
 
 #[test]

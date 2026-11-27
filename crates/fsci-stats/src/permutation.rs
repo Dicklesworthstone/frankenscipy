@@ -40,9 +40,10 @@ pub enum PermutationAlternative {
 ///
 /// Hardened mode checks the existing sample and resample resource caps before
 /// invoking the statistic or allocating resampling buffers. Each sample is
-/// bounded by hardened_max_pairwise_len and their combined length is bounded
-/// by hardened_max_sample_len. Allocation-size overflow and allocation failure
-/// produce typed errors in either mode.
+/// bounded by hardened_max_pairwise_len and by hardened_max_sample_len, the way
+/// the other two-sample hardened tests bound each of their inputs; the work is
+/// bounded by n_resamples, which hardened_max_resamples caps. Allocation-size
+/// overflow and allocation failure produce typed errors in either mode.
 ///
 /// The random seed is reproducible within this implementation; it does not
 /// select NumPy's random-number stream. Scalar callbacks are evaluated in
@@ -216,8 +217,14 @@ fn validate(data: &[&[f64]], options: PermutationTestOptions) -> Result<usize, S
             });
         }
         total = total.checked_add(sample.len()).ok_or_else(resource_error)?;
+        // Per sample, as in ttest_ind_with_options, pearsonr_with_options and
+        // spearmanr_with_options. The combinatorial work needs no length cap:
+        // at most n_resamples statistic calls are made, and an exact
+        // Independent enumeration needs C(total, 2) <= n_resamples, so
+        // total <= 447 at the default HARDENED_MAX_RESAMPLES.
         if options.mode == RuntimeMode::Hardened
-            && (sample.len() > hardened_max_pairwise_len() || total > hardened_max_sample_len())
+            && (sample.len() > hardened_max_pairwise_len()
+                || sample.len() > hardened_max_sample_len())
         {
             return Err(StatsError::ResourceExhausted {
                 detail: "Hardened mode permutation sample lengths exceed stats caps",
