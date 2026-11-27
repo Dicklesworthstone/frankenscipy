@@ -498,38 +498,70 @@ fn scipy_random_matrix_output(
             message: "rows * cols overflows usize".to_string(),
         })?;
     // SciPy: `size = int(round(density * prod(shape)))`, NumPy round-half-to-even.
-    let nnz = if total == 0 {
-        0
-    } else {
-        ((density * total as f64).round_ties_even()).clamp(0.0, total as f64) as usize
+    let nnz = ((density * total as f64).round_ties_even() as usize).min(total);
+    if nnz > (isize::MAX as usize) / size_of::<f64>() {
+        return Err(SparseError::IndexOverflow {
+            message: "random sparse data exceeds addressable memory".to_string(),
+        });
+    }
+
+    let pointer_axis = match requested {
+        SparseFormat::Coo => 0,
+        SparseFormat::Csc => shape.cols,
+        _ => shape.rows,
     };
+    if pointer_axis >= (isize::MAX as usize) / size_of::<usize>() {
+        return Err(SparseError::IndexOverflow {
+            message: "compressed pointer array exceeds addressable memory".to_string(),
+        });
+    }
 
     let mut rows = Vec::with_capacity(nnz);
     let mut cols = Vec::with_capacity(nnz);
     let mut data = Vec::with_capacity(nnz);
-    if nnz > 0 {
-        // Sample DISTINCT flat positions, as SciPy does (it draws without
-        // replacement), so the result has exactly `nnz` stored entries and needs no
-        // duplicate summation.
-        let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
-        let mut seen: HashSet<usize> = HashSet::with_capacity(nnz);
-        while seen.len() < nnz {
-            state = xorshift64(state);
-            let flat = (state as usize) % total;
-            if !seen.insert(flat) {
-                continue;
+    // Xorshift has one absorbing state. Map that seed to a nonzero stream.
+    let mut state = (seed ^ 0x9E37_79B9_7F4A_7C15).max(1);
+    let mut seen = HashSet::new();
+    for last in total - nnz..total {
+        // Floyd sampling: draw one candidate in 0..=last. If it was used,
+        // select last, which no earlier iteration could have visited.
+        let flat = if nnz == total {
+            last
+        } else {
+            let candidate = random_below(&mut state, last as u64 + 1) as usize;
+            if seen.insert(candidate) {
+                candidate
+            } else {
+                seen.insert(last);
+                last
             }
-            rows.push(flat / shape.cols);
-            cols.push(flat % shape.cols);
-            state = xorshift64(state);
-            // Uniform [0, 1): 53 mantissa bits scaled by 2^-53, matching the
-            // standard double-precision construction and SciPy's half-open range.
-            data.push(((state >> 11) as f64) * (1.0f64 / 9_007_199_254_740_992.0));
-        }
+        };
+        rows.push(flat / shape.cols);
+        cols.push(flat % shape.cols);
+        state = xorshift64(state);
+        data.push(((state >> 11) as f64) * (1.0 / 9_007_199_254_740_992.0));
     }
 
-    let coo = CooMatrix::from_triplets(shape, data, rows, cols, false)?;
-    hstack_output_from_csr(coo.to_csr()?, requested)
+    // Canonical COO order without allocating a row pointer for every row.
+    // CSC likewise only needs workspace proportional to its column count.
+    let coo = CooMatrix::from_triplets(shape, data, rows, cols, requested == SparseFormat::Coo)?;
+    match requested {
+        SparseFormat::Coo => Ok(HstackOutput::Coo(coo)),
+        SparseFormat::Csc => Ok(HstackOutput::Csc(coo.to_csc()?)),
+        _ => hstack_output_from_csr(coo.to_csr()?, requested),
+    }
+}
+
+/// Uniform in `0..bound`. Nonzero xorshift visits 1..=u64::MAX, so the
+/// accepted prefix must contain an exact multiple of `bound` states.
+fn random_below(state: &mut u64, bound: u64) -> u64 {
+    let limit = u64::MAX - u64::MAX % bound;
+    loop {
+        *state = xorshift64(*state);
+        if *state <= limit {
+            return *state % bound;
+        }
+    }
 }
 
 /// Random sparse matrix, matching `scipy.sparse.rand(m, n, density, format, rng)`.
@@ -2278,6 +2310,32 @@ mod tests {
                 assert!(r < 7 && c < 5, "index ({r},{c}) out of bounds");
                 assert!(seen.insert((r, c)), "duplicate coordinate ({r},{c})");
             }
+        }
+    }
+
+    #[test]
+    fn rand_handles_zero_xorshift_state_at_partial_and_full_density() {
+        let seed = 0x9E37_79B9_7F4A_7C15;
+        for (density, count) in [(0.5, 8), (1.0, 16)] {
+            let coo = rand(4, 4, density, None, seed).unwrap().to_coo().unwrap();
+            assert_eq!(coo.nnz(), count);
+            assert!(coo.data().iter().all(|&v| (0.0..1.0).contains(&v)));
+            assert!(coo.data().iter().any(|&v| v > 0.0));
+            let coords: HashSet<_> = coo.row_indices().iter().zip(coo.col_indices()).collect();
+            assert_eq!(coords.len(), count);
+        }
+    }
+
+    #[test]
+    fn random_array_huge_tall_shape_only_allocates_stored_coordinates() {
+        let shape = Shape2D::new(usize::MAX, 1);
+        for format in ["coo", "csc"] {
+            let out = random_array(shape, 2.0 / usize::MAX as f64, Some(format), 29).unwrap();
+            assert_eq!(out.format_name(), format);
+            let coo = out.to_coo_array().unwrap();
+            assert_eq!(coo.data().len(), 2);
+            assert_ne!(coo.coords()[0][0], coo.coords()[0][1]);
+            assert_eq!(coo.coords()[1], [0, 0]);
         }
     }
 
