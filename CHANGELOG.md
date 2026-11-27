@@ -2,6 +2,211 @@
 
 ## [Unreleased]
 
+## [0.5.2] — 2026-11-27
+
+### Changed
+
+- **`fsci-stats` results that now match SciPy (`70982bdf0`):**
+  - `power_divergence` and `chisquare` evaluate SciPy's expression for every
+    term, with no zero guard, so zero observed or expected counts give SciPy's
+    `inf` or `NaN` instead of a finite statistic. `chisquare([1, 1], [2, 0])`
+    was `(0.5, 0.4795)` and is now `(inf, 0)`, as in SciPy. An infinite
+    statistic has p-value 0 and a `NaN` statistic has p-value `NaN`. Positive
+    counts give the same bits as before.
+  - `mod_log_likelihood_test` uses lambda = -1, SciPy's
+    `"mod-log-likelihood"`. It used lambda = 2/3, which is `"cressie-read"`.
+- **`MatrixNormal` and `MatrixT` refuse singular factors (`fsci-stats`,
+  `472fbde68`):** a singular row or column covariance was accepted and gave a
+  `-inf` log-determinant and wrong densities. Their `from_covariance`
+  constructors, and those of `MultivariateNormal`, `MultivariateT`, `Wishart`
+  and `InvWishart`, now share one check: a carried Cholesky factor is accepted
+  when every diagonal entry is finite and strictly positive, at any scale.
+  Before, those four refused a factor whose diagonal fell at or below 1e-15,
+  so `Covariance::from_diagonal(&[1e-40])` was rejected. This is part of
+  [#3](https://github.com/Dicklesworthstone/frankenscipy/issues/3).
+- **Hardened permutation tests cap each sample (`fsci-stats`, `6e09eee59`):**
+  Hardened mode checks every sample against `hardened_max_pairwise_len` and
+  `hardened_max_sample_len`, as `ttest_ind_with_options`,
+  `pearsonr_with_options` and `spearmanr_with_options` do, instead of capping
+  the sum of the sample lengths. Samples that are each within the caps are no
+  longer refused. The work stays bounded by `hardened_max_resamples`: at
+  most `n_resamples` statistic calls, and an exact enumeration only when its
+  count is at most `n_resamples`.
+- **`dbode` returns frequencies in physical units, `w / dt` (`fsci-signal`,
+  `5463457fa`).** `dfreqresp` keeps radians per sample.
+
+### Added
+
+- **`fsci-stats`:**
+  - Exact and paired permutation inference: independent samples, paired
+    labels and sign flips, and within-sample pairings, with exact null
+    distributions when the number of distinct arrangements fits the resample
+    budget (`7f448658d`).
+  - Continuous distributions built from user-defined densities (`804188960`).
+  - Stable modes for fourteen continuous families that returned `NaN`
+    (`3ca46b96d`).
+  - Noncentral chi-squared maximum-likelihood fitting and stable densities
+    (`2f00698fb`), and standardized Student t fitting by profiled maximum
+    likelihood (`260bb49df`).
+- **`fsci-opt`:**
+  - Constrained simplicial SHGO with bounded refinement (`75cf5cb90`).
+  - Global MILP bounds and configurable optimality gaps (`66d59a2ee`).
+  - Callable robust losses across nonlinear least squares (`aa3b4ecd3`).
+  - Missing observations in weighted `curve_fit`: `CurveFitNanPolicy`
+    (`Raise`, `Omit`) and SciPy's `check_finite` defaults (`e94b5a4a5`).
+  - Rectangular assignments with forbidden edges and maximization
+    (`5e46d4c04`).
+- **`fsci-integrate`:**
+  - Complex adaptive quadrature with component diagnostics (`b21306a3e`).
+  - Stiff solvers for complex ODEs (`ccbd33069`).
+  - ODEPACK controls for `odeint`: scalar or componentwise tolerances, first
+    and maximum steps, the per-output step budget, and analytic or banded
+    Jacobians (`7882b25b5`).
+  - Known interior features in adaptive vector quadrature (`e075bde46`).
+  - `nsum` over left-infinite and bilateral series (`956094809`).
+  - Reproducible randomized QMC with valid uncertainty estimates
+    (`8bc1a2f33`).
+  - Analytic sparse Jacobians in CASP stiffness selection (`7daea6db8`).
+- **`fsci-linalg`:** complex triangular solves with transpose, adjoint and
+  matrix right-hand sides (`ac45a697d`), and complex factorizations shared
+  across matrix right-hand sides (`67478ea58`).
+- **`fsci-sparse`:** `cg_preconditioned` for caller-supplied inverse
+  preconditioners (`8270fc5a7`), and `lsqr_with_options` with SciPy's controls,
+  stop codes and diagnostics (`da9bd4493`).
+- **`fsci-signal`:**
+  - Paired STFT analysis and least-squares reconstruction (`443d47051`).
+  - `sosfilt_with_state` and a prepared `SosFilter` for resumable block
+    filtering (`14d353ca6`).
+  - Gustafsson zero-phase filtering on short records (`21c2970bf`).
+  - Pole placement for multi-input systems, real and complex (`11573d088`).
+- **`fsci-ndimage`:** `rotate` for arrays of rank 2 and up, and `rotate_axes`,
+  with SciPy's spline boundaries (`48ab4f467`).
+- **`fsci-interpolate`:** `LinearNDInterpolator` in three through seven
+  dimensions (`0a7f80a66`).
+
+### Fixed
+
+- **`fsci-stats`:**
+  - `Kstwo::var` (`bc531625d`, `8418f3ab9`, `cda7b7ac1`): the nearest f64 to
+    the exact value at n = 1 and 2, and at least as close to exact as 0.5.1 at
+    every n with an exact reference (n = 1 to 21, 50 and 100). In paired
+    timings it is never slower than 0.5.1's `var`. `Kstwo::mean` is
+    bit-identical.
+  - `VonMisesFisher` sampling
+    ([#4](https://github.com/Dicklesworthstone/frankenscipy/issues/4),
+    `c22bf444c`): a mean within the unit-norm tolerance but not exactly unit
+    no longer sends every sample to the antipode, concentrated samples no
+    longer collapse onto the mean at p = 3, and p >= 4 at kappa > 1e6 is
+    sampled instead of refused.
+  - Covariance decompositions, singular spectral geometry and finite
+    covariance transforms after intermediate overflow (`c66afddfe`,
+    `6a35a4daf`).
+  - Maximum-likelihood fits: Cauchy (`c8774bd80`), ExponNorm (`09c8ca901`),
+    standardized shapes (`d36b3f878`), generalized normal (`155798343`),
+    skew-normal and integer Erlang (`677ef8e8b`), generalized gamma in both
+    shape regions (`f5eb014f7`), and Normal across extreme measurement scales
+    (`b2c67a628`). Public numerical distribution fitting is restored
+    (`1abeafb9d`).
+- **`fsci-opt`:**
+  - Least squares: minimum-norm steps in rank-deficient TRF models
+    (`70aec5299`), TRF descent normalized before LSMR regularization
+    (`f2545c6b0`), exact trust-region steps across residual scales
+    (`b45cc71e7`), finite Jacobian scaling (`0cc71d956`), finite costs and
+    scaled covariance (`5a2eb3551`), finite custom-loss curvature after
+    cancellation (`20fdfd5ef`), and derivatives at representable nodes within
+    bounds (`5c7899f39`).
+  - Root finding: DF-SANE no longer reports false convergence or accepts
+    invalid trials (`67351c891`); hybrid roots across equation scales
+    (`cb3152725`); Newton steps in nearly dependent equations (`52f0a6f06`)
+    and backtracking from overflowing trials (`fb2e91b17`); exact LM roots at
+    both ends of the iteration budget (`1f20a26d4`); scaled QR for rectangular
+    LM root fits (`c11c2951f`); Newton-Krylov memory bounded with restarted
+    GMRES (`77751df0d`); derivative-free secant solvers (`7309d051f`).
+  - Brent minimization keeps downhill bracket samples (`71393a181`) and
+    expands scalar seed intervals, reporting bracket failures (`e24343e9b`).
+  - Bounded TNC keeps gradients and Newton steps feasible (`bc47bbb5f`),
+    numerical derivatives respect representable stencils (`30bde6d70`), and
+    weighted isotonic pooling is range safe (`c157db2cb`).
+- **`fsci-integrate`:**
+  - Quadrature: the final Richardson trapezoid panel (`497e5a0a6`), errors
+    from every nested level (`a5785c840`), both unresolved tanh-sinh tails
+    (`6adb87144`), scaled vector quadrature and cancellation (`734b35696`),
+    shifted tail weights and bilateral addition error (`265db2378`), low-order
+    `nsum` terms and quadrature error (`6520037a9`), overflow in
+    infinite-series corrections (`9be681e90`), and cubature domains,
+    singularity breakpoints and accuracy at extreme ranges (`74dcb5d85`,
+    `1fbdf4e30`).
+  - ODEs: LSODA refuses nonfinite derivatives (`86bd30372`), terminal event
+    roots are refined to SciPy's precision (`841813eba`), and CASP stiffness
+    probes keep finite-difference evidence and two-step spectral gains
+    (`10a2f50f5`, `5d3ce50c3`).
+  - BVP parameter Jacobians and convergence certification (`ba3589c4f`).
+- **`fsci-linalg`:** `expm` scaling when finite column norms overflow, real
+  and complex (`ec936330f`); banded Cholesky accepts small nonzero pivots and
+  refuses nonfinite input (`2b80a1fba`); the requested transposed band system
+  is solved and certified (`ecff2741e`); the stabilizing continuous and
+  discrete Riccati solutions (`5e7ecf70d`, `be80ba7c5`); complex quotients
+  across the binary64 exponent range (`0651909d6`); complex structured
+  systems use the selected triangle (`77fe3bf73`) and report structured
+  conditioning (`f77ac3bc6`); Jordan terms and scaled matrix functions
+  (`57351e0ab`).
+- **`fsci-sparse`:** DIA storage width through products, `nnz` and NPZ I/O
+  (`7ffe8de44`); random sampling terminates for every seed, and tall COO and
+  CSC results stay sparse (`ab721807c`); SciPy's diagonal broadcasting,
+  lengths and inferred shape (`4a6632d72`); triangular solves with duplicate
+  entries and batched right-hand sides (`4ca8cca1c`); GMRES stops and detects
+  breakdown on the actual residual (`1cab14415`); BiCGSTAB convergence is
+  checked against the returned iterate (`cd5211693`); Arnoldi keeps
+  resolvable directions (`c34a76d62`).
+- **`fsci-signal`:** `freqz`, `freqs`, ZPK and SOS responses detect poles by
+  exact zero and divide without leaving the f64 range, and long filters are no
+  longer truncated by the FFT shortcut (`5463457fa`); STFT normalization,
+  windows, boundary extension, padding and frame times (`443d47051`);
+  decimation through pole-preserving SOS filters (`ba691b41a`).
+- **`fsci-ndimage`:** 2-D `fourier_ellipsoid` uses the disk Bessel kernel
+  (`1753239d4`).
+
+### Maintenance
+
+- Both lock files refreshed to the latest semver-compatible releases
+  (`a5967a55a`), and `rustfmt` applied to the 22 files that had drifted
+  (`d12ed3b30`).
+
+### Known limits
+
+- **COBYLA (carried forward from 0.4.0):** fsci follows OpenBLAS's SkylakeX
+  evaluation order. On hosts where NumPy and SciPy use other kernels (Haswell,
+  Zen and older), borderline problems can end with a different status. For
+  example, in hs7 fsci stops `Infeasible` at maxcv 4e-8 against catol 1.49e-8,
+  while SciPy on Haswell kernels reports success
+  ([#17](https://github.com/Dicklesworthstone/frankenscipy/issues/17)).
+- **Still open:**
+  credential revocation for the token in the publish script's history, an
+  owner action ([#1](https://github.com/Dicklesworthstone/frankenscipy/issues/1));
+  full scale and decomposition parity for `Covariance`
+  ([#3](https://github.com/Dicklesworthstone/frankenscipy/issues/3));
+  the `sha2` 0.11 formatting migration for the optional perf and ELF probes
+  ([#9](https://github.com/Dicklesworthstone/frankenscipy/issues/9));
+  exact or integer entry points for `chisquare` and Benford
+  ([#16](https://github.com/Dicklesworthstone/frankenscipy/issues/16)).
+- **Closed since 0.5.1:** the 0.5.1 notes listed these as open.
+  [#4](https://github.com/Dicklesworthstone/frankenscipy/issues/4) is fixed
+  above.
+  [#2](https://github.com/Dicklesworthstone/frankenscipy/issues/2) (N-D
+  geometry is bounded before allocation) and
+  [#6](https://github.com/Dicklesworthstone/frankenscipy/issues/6)
+  (header-only MAT allocations are bounded) were already fixed in 0.3.0
+  (`9f845e734`), and
+  [#18](https://github.com/Dicklesworthstone/frankenscipy/issues/18)
+  (`diff_sparse_lobpcg`) in 0.4.0 (`1e49e045c`).
+  [#15](https://github.com/Dicklesworthstone/frankenscipy/issues/15): the
+  Tokio edge in `Cargo.lock` is declared only under
+  `cfg(all(target_os = "emscripten", wasm_bindgen_unstable_tokio))`, an
+  unsupported opt-in build. `cargo tree -i tokio` is empty for the host,
+  `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`,
+  `wasm32-unknown-unknown` and `wasm32-unknown-emscripten`; the contributor
+  rules now check the ban per supported target (`ea1e8a93b`).
+
 ## [0.5.1] — 2026-11-23
 
 Supersedes the unpublished `v0.5.0` source tag (`95af13267`) as the live
