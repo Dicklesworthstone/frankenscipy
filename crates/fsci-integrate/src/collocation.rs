@@ -683,7 +683,7 @@ pub(crate) fn solve(
             // and unmet boundary conditions; reject this false-success path.
             if rms.iter().any(|value| !value.is_finite()) {
                 return Err(
-                    "non-finite RMS residual prevents convergence certification".to_string(),
+                    "non-finite RMS residual prevents convergence certification".to_string()
                 );
             }
             return Ok((finish(0, x, y, p, rms), sol));
@@ -744,7 +744,10 @@ mod tests {
             let (dy, dp) = analytic.f_jac(t, &y, &p, &f0).expect("analytic Jacobian");
             let (dy_fd, dp_fd) = numeric.f_jac(t, &y, &p, &f0).expect("finite differences");
             for (actual, expected) in dy.iter().chain(&dp).zip(dy_fd.iter().chain(&dp_fd)) {
-                assert!((actual - expected).abs() < 1e-5, "t={t}: {actual} != {expected}");
+                assert!(
+                    (actual - expected).abs() < 1e-5,
+                    "t={t}: {actual} != {expected}"
+                );
             }
             if t == 0.0 {
                 assert_eq!(dp, vec![-12.0, -12.0, -6.0, 17.0, 19.0, 29.0]);

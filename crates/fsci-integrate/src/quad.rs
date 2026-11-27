@@ -2897,7 +2897,10 @@ where
     while arithmetic_representable && subdivisions < options.max_subdivisions {
         let (estimate, error) = sum_cubature_regions(&regions, output_dim);
         if componentwise_cubature_converged(&estimate, &error, options.atol, options.rtol)
-            || estimate.iter().chain(&error).any(|value| !value.is_finite())
+            || estimate
+                .iter()
+                .chain(&error)
+                .any(|value| !value.is_finite())
         {
             break;
         }
@@ -3023,9 +3026,9 @@ fn validate_cubature_inputs(
     let nodes = dimensions.and_then(|n| match options.rule {
         CubatureRule::GaussKronrod | CubatureRule::Gk21 => 21_usize.checked_pow(n),
         CubatureRule::Gk15 => 15_usize.checked_pow(n),
-        CubatureRule::GenzMalik => corners.and_then(|count| {
-            count.checked_add(2 * a.len() * a.len() + 2 * a.len() + 1)
-        }),
+        CubatureRule::GenzMalik => {
+            corners.and_then(|count| count.checked_add(2 * a.len() * a.len() + 2 * a.len() + 1))
+        }
     });
     if corners.is_none() || nodes.is_none() {
         return Err(IntegrateValidationError::ResourceExhausted {
@@ -3155,11 +3158,11 @@ fn initial_cubature_regions(
         });
     };
     let mut regions = Vec::new();
-    regions.try_reserve(region_count).map_err(|_| {
-        IntegrateValidationError::ResourceExhausted {
+    regions
+        .try_reserve(region_count)
+        .map_err(|_| IntegrateValidationError::ResourceExhausted {
             message: "cubature initial partition exceeds available memory".to_string(),
-        }
-    })?;
+        })?;
     let mut lower = vec![0.0; ranges.len()];
     let mut upper = vec![0.0; ranges.len()];
     collect_initial_cubature_regions(&breakpoints, 0, &mut lower, &mut upper, &mut regions);
@@ -8059,7 +8062,11 @@ mod tests {
                     },
                 )
                 .expect("finite integral despite extreme intermediate scales");
-                assert_eq!(result.status, CubatureStatus::Converged, "{rule:?}: {result:?}");
+                assert_eq!(
+                    result.status,
+                    CubatureStatus::Converged,
+                    "{rule:?}: {result:?}"
+                );
                 assert!(
                     (result.estimate / expected - 1.0).abs() < 5e-13,
                     "{rule:?}: {result:?}, expected {expected}"
@@ -9611,11 +9618,7 @@ mod tests {
         let result = nsum(
             |x| {
                 calls.set(calls.get() + 1);
-                if x < 0.0 {
-                    (2.0 * x).exp()
-                } else {
-                    (-x).exp()
-                }
+                if x < 0.0 { (2.0 * x).exp() } else { (-x).exp() }
             },
             f64::NEG_INFINITY,
             f64::INFINITY,
@@ -10258,16 +10261,14 @@ mod tests {
         let sample = 1e-300_f64;
         let step = 1e110_f64;
         assert_eq!(sample / (2.0 * step), 0.0);
-        let (first, third) =
-            nsum_euler_maclaurin_corrections(sample, 0.0, 0.0, 0.0, step, step);
+        let (first, third) = nsum_euler_maclaurin_corrections(sample, 0.0, 0.0, 0.0, step, step);
         assert!((first / (sample / 24.0) - 1.0).abs() <= 1e-14);
         assert!((third / (-sample / 720.0) - 1.0).abs() <= 1e-14);
 
         // Equal step and probe spacing cancel even when their cubes do
         // not fit in f64, or when the spacing itself is subnormal.
         for step in [1e-110, 1e110, f64::from_bits(1)] {
-            let (first, third) =
-                nsum_euler_maclaurin_corrections(1.0, 0.0, 0.0, 0.0, step, step);
+            let (first, third) = nsum_euler_maclaurin_corrections(1.0, 0.0, 0.0, 0.0, step, step);
             assert!((first - 1.0 / 24.0).abs() <= 1e-15, "step={step}");
             assert!((third + 1.0 / 720.0).abs() <= 1e-16, "step={step}");
         }
@@ -10364,7 +10365,10 @@ mod tests {
             let result = nsum(
                 |x| {
                     calls.set(calls.get() + 1);
-                    assert!(calls.get() <= 13, "invalid samples reached the tail integral");
+                    assert!(
+                        calls.get() <= 13,
+                        "invalid samples reached the tail integral"
+                    );
                     if x == 8.0 * step {
                         f64::NAN
                     } else {

@@ -3790,9 +3790,7 @@ pub fn griddata(
     xi: &[Vec<f64>],
     method: GriddataMethod,
 ) -> Result<Vec<f64>, InterpError> {
-    if points.first().is_some_and(|point| point.len() == 1)
-        && method != GriddataMethod::Nearest
-    {
+    if points.first().is_some_and(|point| point.len() == 1) && method != GriddataMethod::Nearest {
         return griddata_1d(points, values, xi, method);
     }
     match method {
@@ -5806,10 +5804,7 @@ impl LinearNDInterpolator {
         };
 
         let delaunay = if ndim == 2 {
-            let pts: Vec<(f64, f64)> = triangulation_points
-                .iter()
-                .map(|p| (p[0], p[1]))
-                .collect();
+            let pts: Vec<(f64, f64)> = triangulation_points.iter().map(|p| (p[0], p[1])).collect();
             let triangulation = Delaunay2D::new(&pts)?;
             if triangulation.simplices.is_empty() {
                 return Err(InterpError::InvalidArgument {
@@ -5818,11 +5813,12 @@ impl LinearNDInterpolator {
             }
             LinearNDTriangulation::Planar(Box::new(triangulation))
         } else {
-            let triangulation = fsci_spatial::Delaunay::new(triangulation_points).map_err(|error| {
-                InterpError::InvalidArgument {
-                    detail: format!("LinearND triangulation error: {error}"),
-                }
-            })?;
+            let triangulation =
+                fsci_spatial::Delaunay::new(triangulation_points).map_err(|error| {
+                    InterpError::InvalidArgument {
+                        detail: format!("LinearND triangulation error: {error}"),
+                    }
+                })?;
             LinearNDTriangulation::HigherDimensional(Box::new(triangulation))
         };
         Ok(Self {
@@ -5902,11 +5898,12 @@ impl LinearNDInterpolator {
                 };
                 // Locate the whole batch so the N-D neighbor walk can start each query
                 // from the preceding simplex, instead of restarting at simplex zero.
-                let simplices = triangulation
-                    .find_simplex(queries, false, None)
-                    .map_err(|error| InterpError::InvalidArgument {
-                        detail: format!("LinearND query error: {error}"),
-                    })?;
+                let simplices =
+                    triangulation
+                        .find_simplex(queries, false, None)
+                        .map_err(|error| InterpError::InvalidArgument {
+                            detail: format!("LinearND query error: {error}"),
+                        })?;
                 Ok(queries
                     .iter()
                     .zip(simplices)

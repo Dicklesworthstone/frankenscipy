@@ -1824,12 +1824,7 @@ mod tests {
     fn dia_counts_stored_zeros_and_skips_absent_columns_in_matvec() {
         // The raw DIA row only covers columns 0..3. Column zero is padding
         // on offset +1, column two contains a stored zero, column three is absent.
-        let dia = DiaMatrix::new(
-            Shape2D::new(4, 5),
-            vec![vec![99.0, 2.0, 0.0]],
-            vec![1],
-        )
-        .unwrap();
+        let dia = DiaMatrix::new(Shape2D::new(4, 5), vec![vec![99.0, 2.0, 0.0]], vec![1]).unwrap();
         assert_eq!(dia.nnz(), 2);
         assert_eq!(dia.to_coo().unwrap().nnz(), 1);
         let x = [0.0, 3.0, f64::INFINITY, f64::INFINITY, f64::NAN];

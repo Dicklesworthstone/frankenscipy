@@ -240,7 +240,10 @@ fn diags_row_block(
     for row in base..end {
         let mut c = 0usize;
         for &(offset, diag) in diagonal_order {
-            let Some(col) = row.checked_add_signed(offset).filter(|&col| col < shape.cols) else {
+            let Some(col) = row
+                .checked_add_signed(offset)
+                .filter(|&col| col < shape.cols)
+            else {
                 continue;
             };
             // A diagonal is indexed from its first in-bounds element. A

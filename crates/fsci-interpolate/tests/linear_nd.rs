@@ -91,11 +91,7 @@ fn linear_nd_and_griddata_reproduce_affine_fields_through_seven_dimensions() {
 #[test]
 fn linear_nd_cube_interpolates_sites_and_preserves_outside_hull_fill() {
     let mut points: Vec<Vec<f64>> = (0..8)
-        .map(|bits| {
-            (0..3)
-                .map(|axis| f64::from((bits >> axis) & 1))
-                .collect()
-        })
+        .map(|bits| (0..3).map(|axis| f64::from((bits >> axis) & 1)).collect())
         .collect();
     points.push(vec![0.31, 0.27, 0.43]);
     // Duplicate data with the same value must not prevent N-D triangulation.
@@ -209,7 +205,11 @@ fn griddata_one_dimensional_linear_and_cubic_sort_sites_and_fill_outside() {
         let actual = griddata(&points, &values, &queries, method).unwrap();
         assert!(actual[0].is_nan() && actual[7].is_nan());
         for index in 1..7 {
-            assert_close(actual[index], field(queries[index][0]), "one-dimensional griddata");
+            assert_close(
+                actual[index],
+                field(queries[index][0]),
+                "one-dimensional griddata",
+            );
         }
         assert!(griddata(&points, &values, &[vec![0.0, 1.0]], method).is_err());
     }

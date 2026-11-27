@@ -5562,14 +5562,22 @@ mod tests {
                             actual: 0,
                         },
                     ),
-                    (2, Some(f64::NAN), IntegrateValidationError::NonFiniteJacobian),
+                    (
+                        2,
+                        Some(f64::NAN),
+                        IntegrateValidationError::NonFiniteJacobian,
+                    ),
                     (
                         2,
                         Some(f64::INFINITY),
                         IntegrateValidationError::NonFiniteJacobian,
                     ),
                     // Finite samples can still have an unrepresentable quotient.
-                    (2, Some(f64::MAX), IntegrateValidationError::NonFiniteJacobian),
+                    (
+                        2,
+                        Some(f64::MAX),
+                        IntegrateValidationError::NonFiniteJacobian,
+                    ),
                 ] {
                     let options = SolveIvpOptions {
                         t_span: (0.0, 1.0),
@@ -5604,7 +5612,10 @@ mod tests {
                     let returned = solve_ivp_with_casp_portfolio_and_audit(
                         &mut |_t, _y| {
                             solve_calls += 1;
-                            assert!(solve_calls <= failure_call, "invalid probe reached a solver");
+                            assert!(
+                                solve_calls <= failure_call,
+                                "invalid probe reached a solver"
+                            );
                             if solve_calls == failure_call {
                                 value.into_iter().collect()
                             } else {

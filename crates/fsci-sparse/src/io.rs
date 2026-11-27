@@ -1177,7 +1177,12 @@ mod tests {
             let mut archive = NpzArchive::new(bytes).unwrap();
             let (stored, dimensions) = read_numeric_member(&mut archive, "data").unwrap();
             assert_eq!(dimensions, [1, width]);
-            assert!(stored.iter().zip(&row).all(|(a, b)| a.to_bits() == b.to_bits()));
+            assert!(
+                stored
+                    .iter()
+                    .zip(&row)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+            );
             let loaded = round_trip(&dia, false);
             let SparseNpz::Matrix(SparseMatrixOutput::Dia(restored)) = loaded else {
                 panic!("expected DIA");

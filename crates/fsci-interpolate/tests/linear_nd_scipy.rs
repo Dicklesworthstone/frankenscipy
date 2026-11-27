@@ -7,9 +7,7 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::process::{Command, Stdio};
 
-use fsci_interpolate::{
-    GriddataMethod, LinearNDInterpolator, LinearNDOptions, griddata,
-};
+use fsci_interpolate::{GriddataMethod, LinearNDInterpolator, LinearNDOptions, griddata};
 
 #[test]
 fn linear_nd_rescale_handles_independent_units_and_custom_fill() {
@@ -39,10 +37,7 @@ fn linear_nd_rescale_handles_independent_units_and_custom_fill() {
     assert_eq!(batch, vec![value]);
     let outside = [origin[0] - spans[0], origin[1], origin[2]];
     assert_eq!(interpolator.eval(&outside).unwrap(), -123.5);
-    assert_eq!(
-        interpolator.eval(&[f64::NAN, 0.0, 0.0]).unwrap(),
-        -123.5
-    );
+    assert_eq!(interpolator.eval(&[f64::NAN, 0.0, 0.0]).unwrap(), -123.5);
 }
 
 #[test]
@@ -236,7 +231,11 @@ assert next(tokens, None) is None
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     let mut lines = stdout.lines();
-    let versions: Vec<&str> = lines.next().expect("oracle versions").split_whitespace().collect();
+    let versions: Vec<&str> = lines
+        .next()
+        .expect("oracle versions")
+        .split_whitespace()
+        .collect();
     assert_eq!(versions.len(), 2);
     if required {
         assert_eq!(versions[0], "1.17.1");
@@ -259,11 +258,13 @@ assert next(tokens, None) is None
 
 fn compare(actual: f64, expected: f64, label: &str, index: usize, api: &str) {
     if expected.is_nan() {
-        assert!(actual.is_nan(), "{label}/{api} query {index}: expected NaN, got {actual}");
+        assert!(
+            actual.is_nan(),
+            "{label}/{api} query {index}: expected NaN, got {actual}"
+        );
     } else {
         assert!(
-            actual.is_finite()
-                && (actual - expected).abs() <= 5e-11 * expected.abs().max(1.0),
+            actual.is_finite() && (actual - expected).abs() <= 5e-11 * expected.abs().max(1.0),
             "{label}/{api} query {index}: got {actual:.17e}, SciPy {expected:.17e}"
         );
     }
@@ -298,12 +299,15 @@ fn linear_nd_and_griddata_match_live_scipy_on_nonlinear_clouds() {
         let grid = if case.rescale {
             None
         } else {
-            Some(griddata(
-                &case.points,
-                &case.values,
-                &case.queries,
-                GriddataMethod::Linear,
-            ).unwrap())
+            Some(
+                griddata(
+                    &case.points,
+                    &case.values,
+                    &case.queries,
+                    GriddataMethod::Linear,
+                )
+                .unwrap(),
+            )
         };
         for (index, (&got, &want)) in batch.iter().zip(expected).enumerate() {
             compare(got, want, &case.label, index, "batch");
@@ -403,7 +407,13 @@ for method in ("linear", "cubic"):
                 .expect("oracle value")
                 .parse::<f64>()
                 .expect("oracle float");
-            compare(value, expected, "one-dimensional", index, &format!("{method:?}"));
+            compare(
+                value,
+                expected,
+                "one-dimensional",
+                index,
+                &format!("{method:?}"),
+            );
             compared += 1;
         }
     }

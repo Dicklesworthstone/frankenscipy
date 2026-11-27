@@ -38028,9 +38028,11 @@ pub fn spsolve_triangular_many(
         });
     }
     let lanes = right_hand_sides.len();
-    let size = n.checked_mul(lanes).ok_or_else(|| SparseError::InvalidShape {
-        message: "triangular right-hand side panel is too large".to_string(),
-    })?;
+    let size = n
+        .checked_mul(lanes)
+        .ok_or_else(|| SparseError::InvalidShape {
+            message: "triangular right-hand side panel is too large".to_string(),
+        })?;
     let mut panel = Vec::with_capacity(size);
     for row in 0..n {
         panel.extend(right_hand_sides.iter().map(|rhs| rhs[row]));

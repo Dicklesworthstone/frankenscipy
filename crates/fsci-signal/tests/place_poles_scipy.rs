@@ -186,7 +186,13 @@ fn check_case(case: &Case) -> PlacePolesResult {
     let n = case.a.len();
     assert_eq!(result.gain_matrix.len(), case.b[0].len(), "{}", case.name);
     assert!(result.gain_matrix.iter().all(|row| row.len() == n));
-    assert!(result.gain_matrix.iter().flatten().all(|value| value.is_finite()));
+    assert!(
+        result
+            .gain_matrix
+            .iter()
+            .flatten()
+            .all(|value| value.is_finite())
+    );
     assert_same_poles(&result.computed_poles, &case.poles, &case.name);
     let closed_loop: Vec<Vec<f64>> = (0..n)
         .map(|i| {
@@ -200,8 +206,8 @@ fn check_case(case: &Case) -> PlacePolesResult {
                 .collect()
         })
         .collect();
-    let independent = fsci_linalg::eig(&closed_loop, fsci_linalg::DecompOptions::default())
-        .unwrap();
+    let independent =
+        fsci_linalg::eig(&closed_loop, fsci_linalg::DecompOptions::default()).unwrap();
     let spectrum: Vec<_> = independent
         .eigenvalues_re
         .into_iter()
@@ -216,7 +222,10 @@ fn published_scipy_mimo_examples_place_real_and_complex_poles() {
     for case in published_cases() {
         let result = check_case(&case);
         let repeated = place_poles(&case.a, &case.b, &case.poles).unwrap();
-        assert_eq!(result.gain_matrix, repeated.gain_matrix, "deterministic gain");
+        assert_eq!(
+            result.gain_matrix, repeated.gain_matrix,
+            "deterministic gain"
+        );
     }
 }
 
@@ -269,7 +278,10 @@ fn rejects_uncontrollable_and_zero_rank_plants() {
         vec![vec![0.0]; 3],
     ] {
         assert!(
-            matches!(place_poles(&a, &b, &poles), Err(SignalError::NumericalFailure(_))),
+            matches!(
+                place_poles(&a, &b, &poles),
+                Err(SignalError::NumericalFailure(_))
+            ),
             "uncontrollable B={b:?}"
         );
     }
@@ -414,7 +426,10 @@ assert next(tokens, None) is None
         assert_eq!((scipy, numpy), ("1.17.1", "2.4.3"));
     }
     assert_eq!(tokens.next(), Some("CASES"));
-    assert_eq!(tokens.next().unwrap().parse::<usize>().unwrap(), cases.len());
+    assert_eq!(
+        tokens.next().unwrap().parse::<usize>().unwrap(),
+        cases.len()
+    );
     let mut compared = 0;
     for (index, (case, result)) in cases.iter().zip(&results).enumerate() {
         assert_eq!(tokens.next(), Some("CASE"));
@@ -436,7 +451,5 @@ assert next(tokens, None) is None
     }
     assert!(tokens.next().is_none(), "unexpected oracle trailing output");
     assert_eq!(compared, 26, "every generated case must be compared");
-    eprintln!(
-        "pole placement: compared {compared} cases against SciPy {scipy} / NumPy {numpy}"
-    );
+    eprintln!("pole placement: compared {compared} cases against SciPy {scipy} / NumPy {numpy}");
 }

@@ -21651,13 +21651,16 @@ fn dare_stable_subspace(
         .sum::<usize>();
     if stable_dim != n {
         return Err(LinalgError::ConvergenceFailure {
-            detail: "Riccati pencil has no separated stable subspace of the required dimension".into(),
+            detail: "Riccati pencil has no separated stable subspace of the required dimension"
+                .into(),
         });
     }
     let z = dmatrix_from_rows(&ordered.z)?;
     let top = z.view((0, 0), (n, n));
     let bottom = z.view((n, 0), (n, n));
-    top.transpose().lu().solve(&bottom.transpose())
+    top.transpose()
+        .lu()
+        .solve(&bottom.transpose())
         .map(|xt| xt.transpose())
         .ok_or(LinalgError::SingularMatrix)
 }
@@ -21682,13 +21685,19 @@ fn dare_stabilizes(
     let propagated = a.transpose() * x * &closed_loop;
     let residual = &propagated + q - x;
     let scale = propagated.amax().max(q.amax()).max(x.amax());
-    if !closed_loop.iter().chain(residual.iter()).all(|v| v.is_finite())
+    if !closed_loop
+        .iter()
+        .chain(residual.iter())
+        .all(|v| v.is_finite())
         || residual.amax() > (2048.0 * a.nrows() as f64 * f64::EPSILON) * scale
     {
         return false;
     }
     bounded_schur(closed_loop).is_ok_and(|schur| {
-        schur.complex_eigenvalues().iter().all(|pole| pole.re.hypot(pole.im) < 1.0)
+        schur
+            .complex_eigenvalues()
+            .iter()
+            .all(|pole| pole.re.hypot(pole.im) < 1.0)
     })
 }
 
@@ -21802,7 +21811,10 @@ pub fn solve_continuous_are(
     let right = &x_sym * &closed_loop;
     let residual = &left + &right + &q_mat;
     let scale = left.amax().max(right.amax()).max(q_mat.amax());
-    if !closed_loop.iter().chain(residual.iter()).all(|v| v.is_finite())
+    if !closed_loop
+        .iter()
+        .chain(residual.iter())
+        .all(|v| v.is_finite())
         || residual.amax() > (2048.0 * n as f64 * f64::EPSILON) * scale
         || !bounded_schur(closed_loop)?
             .complex_eigenvalues()
@@ -21881,9 +21893,13 @@ pub fn solve_discrete_are(
     let q_mat = dmatrix_from_rows(q)?;
     let r_mat = dmatrix_from_rows(r)?;
 
-    let candidate = r_mat.clone().lu().solve(&b_mat.transpose()).and_then(|rinv_bt| {
-        sda_iteration_dare(&a_mat, &(&b_mat * rinv_bt), &q_mat, 100, 1e-13).ok()
-    });
+    let candidate = r_mat
+        .clone()
+        .lu()
+        .solve(&b_mat.transpose())
+        .and_then(|rinv_bt| {
+            sda_iteration_dare(&a_mat, &(&b_mat * rinv_bt), &q_mat, 100, 1e-13).ok()
+        });
     let x_sym = match candidate {
         Some(x) if dare_stabilizes(&a_mat, &b_mat, &q_mat, &r_mat, &x) => x,
         _ => {

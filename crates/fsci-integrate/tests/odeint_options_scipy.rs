@@ -57,7 +57,10 @@ print(json.dumps(rows.tolist()))
         assert_eq!(row.len(), 3);
         for (i, floor) in [2e-9, 4e-24, 0.1].into_iter().enumerate() {
             let error = (row[i] - scipy[i]).abs();
-            assert!(error <= floor + 1e-8 * scipy[i].abs(), "{i}: {row:?}, {scipy:?}");
+            assert!(
+                error <= floor + 1e-8 * scipy[i].abs(),
+                "{i}: {row:?}, {scipy:?}"
+            );
         }
     }
 }

@@ -531,9 +531,7 @@ where
         let invalid_step = || OptError::InvalidArgument {
             detail: format!("cannot form a distinct finite-difference stencil at column {i}"),
         };
-        let valid_point = |point: f64| {
-            point.is_finite() && point >= lb[i] && point <= ub[i]
-        };
+        let valid_point = |point: f64| point.is_finite() && point >= lb[i] && point <= ub[i];
         let evaluate = |x: &[f64]| -> Result<Vec<f64>, OptError> {
             let values = fun(x);
             if values.len() != m {
@@ -578,7 +576,9 @@ where
                     let adjacent = x2[i] - x1[i];
                     if !valid_point(x1[i])
                         || !valid_point(x2[i])
-                        || [dx1, dx2, adjacent].iter().any(|dx| !dx.is_finite() || *dx == 0.0)
+                        || [dx1, dx2, adjacent]
+                            .iter()
+                            .any(|dx| !dx.is_finite() || *dx == 0.0)
                     {
                         return Err(invalid_step());
                     }
@@ -601,8 +601,8 @@ where
                             let difference = first - second;
                             let first_difference = f1[k] - f0[k];
                             let second_difference = f2[k] - f1[k];
-                            let numerator = first_difference
-                                + 0.5 * (first_difference - second_difference);
+                            let numerator =
+                                first_difference + 0.5 * (first_difference - second_difference);
                             let before_division = numerator / dx1;
                             if dx1 == 0.5 * dx2 && before_division.is_finite() {
                                 // Cancel differences before dividing by a tiny
@@ -623,7 +623,9 @@ where
                     let total = x2[i] - x1[i];
                     if !valid_point(x1[i])
                         || !valid_point(x2[i])
-                        || [left, right, total].iter().any(|dx| !dx.is_finite() || *dx == 0.0)
+                        || [left, right, total]
+                            .iter()
+                            .any(|dx| !dx.is_finite() || *dx == 0.0)
                     {
                         return Err(invalid_step());
                     }
@@ -3910,11 +3912,8 @@ pub fn bracket<F>(f: F, xa: f64, xb: f64) -> (f64, f64, f64, f64, f64, f64)
 where
     F: Fn(f64) -> f64,
 {
-    let Ok(samples) = minimize::downhill_bracket(
-        &mut |x| Ok::<_, std::convert::Infallible>(f(x)),
-        xa,
-        xb,
-    );
+    let Ok(samples) =
+        minimize::downhill_bracket(&mut |x| Ok::<_, std::convert::Infallible>(f(x)), xa, xb);
     let [(xa, fa), (xb, fb), (xc, fc)] = samples.points;
     (xa, xb, xc, fa, fb, fc)
 }
@@ -8076,7 +8075,12 @@ mod tests {
             linear_sum_assignment(&cost).unwrap_err().to_string(),
             "cost matrix is infeasible"
         );
-        let invalid = [(f64::NAN, false), (f64::NAN, true), (-inf, false), (inf, true)];
+        let invalid = [
+            (f64::NAN, false),
+            (f64::NAN, true),
+            (-inf, false),
+            (inf, true),
+        ];
         for (value, maximize) in invalid {
             assert!(matches!(
                 super::linear_sum_assignment_with_maximize(&[vec![value]], maximize),
@@ -10412,13 +10416,7 @@ mod tests {
         );
 
         let y = [-largest, -1e-300, 0.0, 1e-300, largest];
-        let weights = [
-            largest,
-            f64::from_bits(1),
-            1.0,
-            f64::MIN_POSITIVE,
-            largest,
-        ];
+        let weights = [largest, f64::from_bits(1), 1.0, f64::MIN_POSITIVE, largest];
         assert_eq!(isotonic_regression(&y, Some(&weights)), y.to_vec());
     }
 
@@ -10629,7 +10627,10 @@ mod tests {
             let gradient = approx_fprime(
                 &[x],
                 |point| {
-                    assert!(point[0].is_finite(), "callback received an infinite coordinate");
+                    assert!(
+                        point[0].is_finite(),
+                        "callback received an infinite coordinate"
+                    );
                     point[0] - x
                 },
                 1e-8,
@@ -10673,14 +10674,12 @@ mod tests {
                     absolute,
                     None,
                 );
-                assert!(matches!(result, Err(crate::OptError::InvalidArgument { .. })));
+                assert!(matches!(
+                    result,
+                    Err(crate::OptError::InvalidArgument { .. })
+                ));
             }
-            for (lower, upper) in [
-                (f64::NAN, 1.0),
-                (-1.0, f64::NAN),
-                (1.0, -1.0),
-                (0.0, 0.0),
-            ] {
+            for (lower, upper) in [(f64::NAN, 1.0), (-1.0, f64::NAN), (1.0, -1.0), (0.0, 0.0)] {
                 let result = approx_derivative(
                     |_| panic!("invalid bounds must not evaluate the callback"),
                     &[0.0],
@@ -10689,7 +10688,10 @@ mod tests {
                     None,
                     Some((&[lower], &[upper])),
                 );
-                assert!(matches!(result, Err(crate::OptError::InvalidArgument { .. })));
+                assert!(matches!(
+                    result,
+                    Err(crate::OptError::InvalidArgument { .. })
+                ));
             }
         }
     }
@@ -10714,7 +10716,10 @@ mod tests {
                         None,
                         None,
                     );
-                    assert!(matches!(result, Err(crate::OptError::InvalidArgument { .. })));
+                    assert!(matches!(
+                        result,
+                        Err(crate::OptError::InvalidArgument { .. })
+                    ));
                 }
             }
             for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
@@ -10733,7 +10738,10 @@ mod tests {
                         None,
                         None,
                     );
-                    assert!(matches!(result, Err(crate::OptError::NonFiniteInput { .. })));
+                    assert!(matches!(
+                        result,
+                        Err(crate::OptError::NonFiniteInput { .. })
+                    ));
                 }
             }
         }
@@ -10746,7 +10754,10 @@ mod tests {
             for x in [f64::MAX, -f64::MAX] {
                 let jacobian = approx_derivative(
                     |point| {
-                        assert!(point[0].is_finite(), "callback received an infinite coordinate");
+                        assert!(
+                            point[0].is_finite(),
+                            "callback received an infinite coordinate"
+                        );
                         vec![point[0]]
                     },
                     &[x],
@@ -10827,7 +10838,10 @@ mod tests {
             None,
             Some((&[lower], &[upper])),
         );
-        assert!(matches!(result, Err(crate::OptError::InvalidArgument { .. })));
+        assert!(matches!(
+            result,
+            Err(crate::OptError::InvalidArgument { .. })
+        ));
 
         // Three nodes near a binade boundary need their actual, unequal gaps.
         let x = f64::from_bits(1.0_f64.to_bits() - 1);
@@ -10847,11 +10861,7 @@ mod tests {
     fn approx_derivative_rejects_unrepresentable_slopes() {
         use crate::{FiniteDiffMethod, approx_derivative};
         let scalar = |point: &[f64]| {
-            if point[0] <= 0.0 {
-                -f64::MAX
-            } else {
-                f64::MAX
-            }
+            if point[0] <= 0.0 { -f64::MAX } else { f64::MAX }
         };
         assert!(matches!(
             approx_fprime(&[0.0], scalar, 1e-8),
@@ -10866,7 +10876,10 @@ mod tests {
                 None,
                 None,
             );
-            assert!(matches!(result, Err(crate::OptError::NonFiniteInput { .. })));
+            assert!(matches!(
+                result,
+                Err(crate::OptError::NonFiniteInput { .. })
+            ));
         }
     }
 

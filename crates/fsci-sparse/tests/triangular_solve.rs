@@ -27,11 +27,7 @@ fn duplicate_diagonals_are_summed_in_both_triangles() {
     let rhs = [vec![10., 16.], vec![-5., 7.]];
     for (a, use_lower, expected) in [
         (lower.clone(), true, [[2., 2.], [-1., 2.]]),
-        (
-            sparse_transpose(&lower),
-            false,
-            [[0.08, 3.2], [-1.84, 1.4]],
-        ),
+        (sparse_transpose(&lower), false, [[0.08, 3.2], [-1.84, 1.4]]),
     ] {
         let options = SparseTriangularSolveOptions {
             lower: use_lower,
@@ -134,7 +130,11 @@ fn rhs_panel_checks_all_dimensions_and_supports_empty_axes() {
         spsolve_triangular_many(&a, &[vec![1., 2.], vec![1.]], options),
         Err(SparseError::IncompatibleShape { .. })
     ));
-    assert!(spsolve_triangular_many(&a, &[], options).unwrap().is_empty());
+    assert!(
+        spsolve_triangular_many(&a, &[], options)
+            .unwrap()
+            .is_empty()
+    );
 
     let empty =
         CsrMatrix::from_components(Shape2D::new(0, 0), vec![], vec![], vec![0], true).unwrap();

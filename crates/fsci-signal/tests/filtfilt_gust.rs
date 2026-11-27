@@ -55,7 +55,11 @@ fn full_and_truncated_records_match_live_scipy() {
             let x: Vec<_> = (0..n).map(|i| f64::from((i * 31 + 3) % 17 - 8)).collect();
             for irlen in [None, Some(3)] {
                 let limit = irlen.map_or_else(|| "None".into(), |m| m.to_string());
-                writeln!(script, "print(*filtfilt({b:?},{a:?},{x:?},method='gust',irlen={limit}))").unwrap();
+                writeln!(
+                    script,
+                    "print(*filtfilt({b:?},{a:?},{x:?},method='gust',irlen={limit}))"
+                )
+                .unwrap();
                 outputs.push(filtfilt_gust(b, a, &x, irlen).unwrap());
             }
         }

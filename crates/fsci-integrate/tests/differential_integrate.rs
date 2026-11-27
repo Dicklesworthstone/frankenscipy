@@ -985,9 +985,14 @@ for name, f, a, b, step in [
                     "infinite_series" => {
                         nsum(|x| 1.0 / (x * x), 1.0, f64::INFINITY, 1.0, 0.0, 1e-11)
                     }
-                    "left_series" => {
-                        nsum(|x| (x - 3.25).exp(), f64::NEG_INFINITY, 3.25, 0.5, 0.0, 1e-11)
-                    }
+                    "left_series" => nsum(
+                        |x| (x - 3.25).exp(),
+                        f64::NEG_INFINITY,
+                        3.25,
+                        0.5,
+                        0.0,
+                        1e-11,
+                    ),
                     "bilateral_series" => nsum(
                         |x| (-(x - 0.25).powi(2)).exp(),
                         f64::NEG_INFINITY,
@@ -1166,7 +1171,6 @@ print(json.dumps({'scipy':scipy.__version__,'numpy':np.__version__,'rows':rows})
         oracle["scipy"], oracle["numpy"]
     );
 }
-
 
 /// Compare vector integrals in independently scaled component units. SciPy
 /// evaluates the same smooth functions in normalized coordinates: directly

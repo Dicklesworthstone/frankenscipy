@@ -94,7 +94,8 @@ fn care_selects_the_stabilizing_zero_state_cost_branch() {
             &[vec![0.0]],
             &[vec![1.0]],
             Default::default(),
-        ).unwrap()[0][0];
+        )
+        .unwrap()[0][0];
         assert_close(x, expected);
         assert!(a - x < 0.0);
     }
@@ -106,7 +107,8 @@ fn care_selects_the_stabilizing_zero_state_cost_branch() {
         &[vec![0.0; 2], vec![0.0; 2]],
         &identity(2),
         Default::default(),
-    ).unwrap();
+    )
+    .unwrap();
     assert_mat_close(&x, &[vec![2.5, 0.0], vec![0.0, 2.5]]);
 }
 
@@ -118,16 +120,20 @@ fn care_handles_mixed_modes_and_rejects_an_unstabilizable_system() {
         &[vec![0.0, 0.0], vec![0.0, 2.0]],
         &[vec![1.0]],
         Default::default(),
-    ).unwrap();
+    )
+    .unwrap();
     assert_mat_close(&x, &[vec![4.0, 0.0], vec![0.0, 1.0]]);
 
-    assert!(solve_continuous_are(
-        &[vec![2.0]],
-        &[vec![0.0]],
-        &[vec![0.0]],
-        &[vec![1.0]],
-        Default::default(),
-    ).is_err());
+    assert!(
+        solve_continuous_are(
+            &[vec![2.0]],
+            &[vec![0.0]],
+            &[vec![0.0]],
+            &[vec![1.0]],
+            Default::default(),
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -135,16 +141,25 @@ fn dare_selects_the_stabilizing_zero_state_cost_branch() {
     // Both zero and a² − 1 solve the scalar equation. Only one stabilizes a given a.
     for (a, expected) in [(2.0, 3.0), (1.01, 0.0201), (0.5, 0.0)] {
         let x = solve_discrete_are(
-            &[vec![a]], &[vec![1.0]], &[vec![0.0]], &[vec![1.0]], Default::default(),
-        ).unwrap()[0][0];
+            &[vec![a]],
+            &[vec![1.0]],
+            &[vec![0.0]],
+            &[vec![1.0]],
+            Default::default(),
+        )
+        .unwrap()[0][0];
         assert_close(x, expected);
         assert!((a / (1.0 + x)).abs() < 1.0);
     }
     // An unpenalized unstable complex-conjugate pair must move as one block.
     let x = solve_discrete_are(
-        &[vec![1.25, -0.875], vec![0.875, 1.25]], &identity(2),
-        &[vec![0.0; 2], vec![0.0; 2]], &identity(2), Default::default(),
-    ).unwrap();
+        &[vec![1.25, -0.875], vec![0.875, 1.25]],
+        &identity(2),
+        &[vec![0.0; 2], vec![0.0; 2]],
+        &identity(2),
+        Default::default(),
+    )
+    .unwrap();
     assert_mat_close(&x, &[vec![1.328125, 0.0], vec![0.0, 1.328125]]);
 }
 
@@ -152,22 +167,35 @@ fn dare_selects_the_stabilizing_zero_state_cost_branch() {
 fn dare_accepts_singular_input_cost_when_feedback_is_well_defined() {
     // SciPy 1.17.1, both input channels active but only the second penalized.
     let x = solve_discrete_are(
-        &[vec![0.8, 0.3], vec![-0.1, 0.6]], &identity(2),
-        &[vec![1.0, 0.2], vec![0.2, 2.0]], &[vec![0.0, 0.0], vec![0.0, 1.0]],
+        &[vec![0.8, 0.3], vec![-0.1, 0.6]],
+        &identity(2),
+        &[vec![1.0, 0.2], vec![0.2, 2.0]],
+        &[vec![0.0, 0.0], vec![0.0, 1.0]],
         Default::default(),
-    ).unwrap();
-    assert_mat_close(&x, &[
-        vec![1.0068976164143055, 0.1586143015141654],
-        vec![0.1586143015141654, 2.248314190915009],
-    ]);
+    )
+    .unwrap();
+    assert_mat_close(
+        &x,
+        &[
+            vec![1.0068976164143055, 0.1586143015141654],
+            vec![0.1586143015141654, 2.248314190915009],
+        ],
+    );
 }
 
 #[test]
 fn dare_rejects_uncontrollable_unstable_modes() {
     for q in [0.0, 1.0] {
-        assert!(solve_discrete_are(
-            &[vec![2.0]], &[vec![0.0]], &[vec![q]], &[vec![1.0]], Default::default(),
-        ).is_err());
+        assert!(
+            solve_discrete_are(
+                &[vec![2.0]],
+                &[vec![0.0]],
+                &[vec![q]],
+                &[vec![1.0]],
+                Default::default(),
+            )
+            .is_err()
+        );
     }
 }
 

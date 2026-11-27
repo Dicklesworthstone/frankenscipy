@@ -1021,8 +1021,7 @@ fn triangular_rcond(mut t: DMatrix<C64>, upper: bool) -> f64 {
     if smallest_diagonal == 0.0 {
         return 0.0;
     }
-    let exponent = (super::jacobi_frexp(largest).1
-        + super::jacobi_frexp(smallest_diagonal).1) / 2;
+    let exponent = (super::jacobi_frexp(largest).1 + super::jacobi_frexp(smallest_diagonal).1) / 2;
     let scale = 2.0_f64.powi(exponent.clamp(-1022, 1023));
     for z in t.iter_mut() {
         z.re /= scale;
@@ -1116,10 +1115,12 @@ fn validate_triangular_system(
 fn solve_triangular_rhs(a: &[Vec<C64>], x: &mut [C64], options: TriangularSolveOptions) {
     let transposed = options.trans != TriangularTranspose::NoTranspose;
     let upper = options.lower == transposed;
-    triangular_substitute(x, upper, options.unit_diagonal, |i, j| match options.trans {
-        TriangularTranspose::NoTranspose => a[i][j],
-        TriangularTranspose::Transpose => a[j][i],
-        TriangularTranspose::ConjugateTranspose => a[j][i].conj(),
+    triangular_substitute(x, upper, options.unit_diagonal, |i, j| {
+        match options.trans {
+            TriangularTranspose::NoTranspose => a[i][j],
+            TriangularTranspose::Transpose => a[j][i],
+            TriangularTranspose::ConjugateTranspose => a[j][i].conj(),
+        }
     });
 }
 
@@ -2488,10 +2489,14 @@ fn expm_dm(a: &DMatrix<C64>) -> Result<DMatrix<C64>, LinalgError> {
         let w = a * po;
         return lu_solve_matrix(&(&pe - &w), &(&pe + &w)).ok_or_else(singular);
     }
-    let Some(s) = super::expm_squarings(norm1, n, THETA[4], |scale| {
-        one_norm(&a.map(|z| z * scale))
-    }) else {
-        return Ok(DMatrix::from_element(n, n, Complex::new(f64::NAN, f64::NAN)));
+    let Some(s) =
+        super::expm_squarings(norm1, n, THETA[4], |scale| one_norm(&a.map(|z| z * scale)))
+    else {
+        return Ok(DMatrix::from_element(
+            n,
+            n,
+            Complex::new(f64::NAN, f64::NAN),
+        ));
     };
     let scale = 0.5_f64.powi(s);
     let scaled = a.map(|z| z * scale);
@@ -3118,8 +3123,8 @@ mod tests {
                 assert!((r.x[1] - c(2.0, -1.0)).norm() < 1e-13);
                 assert!(r.rcond > 0.05 && r.rcond <= 1.0);
                 assert!(r.warning.is_none());
-                let x = solve_matrix(&a, &[vec![rhs[0], off], vec![rhs[1], rhs2]], options)
-                    .unwrap();
+                let x =
+                    solve_matrix(&a, &[vec![rhs[0], off], vec![rhs[1], rhs2]], options).unwrap();
                 let expected = [vec![c(1.0, 1.0), CZERO], vec![c(2.0, -1.0), CONE]];
                 assert!(max_abs_diff(&x, &expected) < 1e-13);
             }
@@ -3178,11 +3183,7 @@ mod tests {
     fn complex_solve_handles_extreme_finite_divisors() {
         let huge = c(f64::MAX, f64::MAX);
         let tiny = f64::from_bits(1);
-        let scalar = |a, b| {
-            solve(&[vec![a]], &[b], SolveOptions::default())
-                .unwrap()
-                .x[0]
-        };
+        let scalar = |a, b| solve(&[vec![a]], &[b], SolveOptions::default()).unwrap().x[0];
         assert_eq!(scalar(huge, huge), CONE);
         assert_eq!(scalar(huge, huge.conj()), c(0.0, -1.0));
         let inv = scalar(huge, CONE);
@@ -3210,11 +3211,7 @@ mod tests {
 
     #[test]
     fn complex_solve_preserves_signed_zero_at_extreme_scale() {
-        let scalar = |a, b| {
-            solve(&[vec![a]], &[b], SolveOptions::default())
-                .unwrap()
-                .x[0]
-        };
+        let scalar = |a, b| solve(&[vec![a]], &[b], SolveOptions::default()).unwrap().x[0];
         let x = scalar(c(2.0, 0.0), c(f64::MAX, -0.0));
         assert_eq!(x.re, f64::MAX / 2.0);
         assert_eq!(x.im.to_bits(), (-0.0_f64).to_bits());

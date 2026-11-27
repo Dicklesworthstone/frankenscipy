@@ -9052,7 +9052,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn tnc_keeps_boundary_gradient_probes_inside_the_box() {
         let bounds = [(Some(0.0), Some(1.0))];

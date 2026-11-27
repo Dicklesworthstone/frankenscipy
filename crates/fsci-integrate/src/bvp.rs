@@ -798,16 +798,20 @@ mod tests {
                 assert!((result.sol(t)[0] - t).abs() < 1e-8, "{result:?}");
                 assert!((result.sol_derivative(t)[0] - 1.0).abs() < 1e-8);
             }
-            assert!(result.rms_residuals.iter().all(|r| r.is_finite() && *r <= 1e-6));
+            assert!(
+                result
+                    .rms_residuals
+                    .iter()
+                    .all(|r| r.is_finite() && *r <= 1e-6)
+            );
         }
     }
 
     #[test]
     fn solve_bvp_rejects_nonfinite_residual_audit() {
         let fun_jac = |_: f64, _: &[f64], _: &[f64]| (vec![vec![0.0]], Vec::new());
-        let bc_jac = |_: &[f64], _: &[f64], _: &[f64]| {
-            (vec![vec![1.0]], vec![vec![0.0]], Vec::new())
-        };
+        let bc_jac =
+            |_: &[f64], _: &[f64], _: &[f64]| (vec![vec![1.0]], vec![vec![0.0]], Vec::new());
         let options = BvpOptions {
             fun_jac: Some(&fun_jac),
             bc_jac: Some(&bc_jac),
@@ -906,18 +910,15 @@ mod tests {
                 ..BvpOptions::default()
             },
         );
-        assert!(
-            matches!(result, Err(BvpError::InvalidArgument(message))
-                if message.contains("`fun_jac`"))
-        );
+        assert!(matches!(result, Err(BvpError::InvalidArgument(message))
+                if message.contains("`fun_jac`")));
     }
 
     #[test]
     fn solve_bvp_many_routes_fixed_parameters_to_analytic_jacobians() {
         let fun = |_: f64, y: &[f64], p: &[f64]| vec![p[0] * y[0]];
         let bc = |ya: &[f64], _: &[f64], p: &[f64]| vec![p[1] * ya[0] - 1.0];
-        let fun_jac =
-            |_: f64, y: &[f64], p: &[f64]| (vec![vec![p[0]]], vec![vec![y[0], 0.0]]);
+        let fun_jac = |_: f64, y: &[f64], p: &[f64]| (vec![vec![p[0]]], vec![vec![y[0], 0.0]]);
         let bc_jac = |ya: &[f64], _: &[f64], p: &[f64]| {
             (vec![vec![p[1]]], vec![vec![0.0]], vec![vec![0.0, ya[0]]])
         };
