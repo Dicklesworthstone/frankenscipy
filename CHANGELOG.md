@@ -24,14 +24,33 @@
   Before, those four refused a factor whose diagonal fell at or below 1e-15,
   so `Covariance::from_diagonal(&[1e-40])` was rejected. This is part of
   [#3](https://github.com/Dicklesworthstone/frankenscipy/issues/3).
-- **Hardened permutation tests cap each sample (`fsci-stats`, `6e09eee59`):**
-  Hardened mode checks every sample against `hardened_max_pairwise_len` and
-  `hardened_max_sample_len`, as `ttest_ind_with_options`,
-  `pearsonr_with_options` and `spearmanr_with_options` do, instead of capping
-  the sum of the sample lengths. Samples that are each within the caps are no
-  longer refused. The work stays bounded by `hardened_max_resamples`: at
-  most `n_resamples` statistic calls, and an exact enumeration only when its
-  count is at most `n_resamples`.
+- **The existing permutation tests follow `scipy.stats.permutation_test`
+  (`fsci-stats`, `7f448658d`, `6e09eee59`):** `permutation_test`,
+  `permutation_test_with_options` and `PermutationMethod::test` now run on the
+  new permutation engine (see Added), so their p-values change.
+  - When there are at most `n_permutations` distinct partitions, every one is
+    enumerated and the p-value is count / N. Otherwise the random partitions
+    come from a different seeded generator than in 0.5.1.
+  - The p-value is twice the smaller inclusive tail, with SciPy's tie
+    tolerance of 100 machine epsilons relative to the observed statistic. In
+    0.5.1 it was the share of draws with `|T| >= |T_obs|`, so adding a
+    constant to the statistic changed it.
+  - Each sample needs at least two observations, all finite, and the
+    statistic must be finite on every resample. Otherwise `permutation_test`
+    returns `(NaN, NaN)`, as it did for empty or `NaN` samples, and the other
+    two return an error. `permutation_test_with_options` checks this after
+    Hardened mode's non-finite projection, when that is allowed.
+  - In Hardened mode each sample is checked against
+    `hardened_max_pairwise_len` and `hardened_max_sample_len`, as in
+    `ttest_ind_with_options`, `pearsonr_with_options` and
+    `spearmanr_with_options`. The work is bounded by `hardened_max_resamples`:
+    at most `n_resamples` statistic calls, and an exact enumeration only when
+    its count is at most `n_resamples`.
+- **`monte_carlo_test` and `MonteCarloMethod::test` use the same tails
+  (`fsci-stats`, `7f448658d`):** a two-sided p-value is twice the smaller
+  tail instead of the share of draws with `|T| >= |T_obs|`, and both one-sided
+  tails use the tie tolerance. The sampler and seed stream are unchanged.
+  `goodness_of_fit` uses one-sided tails, so only the tolerance reaches it.
 - **`dbode` returns frequencies in physical units, `w / dt` (`fsci-signal`,
   `5463457fa`).** `dfreqresp` keeps radians per sample.
 
