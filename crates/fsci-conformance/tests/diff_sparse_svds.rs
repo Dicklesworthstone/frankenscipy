@@ -16,7 +16,10 @@ use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_conformance::{ArmCounts, CompareLedger};
-use fsci_sparse::{CooMatrix, EigsOptions, FormatConvertible, LinearOperator, Shape2D, svds};
+use fsci_sparse::{
+    CooMatrix, CsrMatrix, EigsOptions, EigsWhich, FormatConvertible, LinearOperator, Shape2D,
+    SparseResult, svds,
+};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
@@ -442,4 +445,188 @@ fn diff_sparse_svds() {
         max_overall
     );
     ledger.finish(query.points.len());
+}
+
+#[test]
+fn diff_sparse_svds_extreme_scales_against_dense_svd() {
+    // ARPACK also forms the unscaled Gram matrix in SciPy, so its overflow
+    // would not be a trustworthy reference for these inputs. LAPACK's dense
+    // SVD rescales its input and gives an independent reference without
+    // changing the sparse/matrix-free representation used by FrankenSciPy.
+    let cases: Vec<Case> = [(11, 5), (5, 11)]
+        .into_iter()
+        .flat_map(|(rows, cols)| {
+            [0xdead_beef, 0xface_cafe]
+                .into_iter()
+                .map(move |seed| Case {
+                    case_id: format!("{rows}x{cols}_{seed:x}"),
+                    rows,
+                    cols,
+                    triplets: rect_dense(rows, cols, seed),
+                    k: 2,
+                    which: "LM".into(),
+                    v0: None,
+                })
+        })
+        .collect();
+    let scales = [1e-200, 1.0, 1e200];
+    let script = r#"
+import json
+import sys
+import numpy as np
+import scipy
+from scipy.linalg import svdvals
+assert scipy.__version__ == "1.17.1", scipy.__version__
+assert np.__version__ == "2.4.3", np.__version__
+query = json.load(sys.stdin)
+rows = []
+for case in query["cases"]:
+    for scale in query["scales"]:
+        a = np.zeros((case["rows"], case["cols"]))
+        for i, j, value in case["triplets"]:
+            a[i, j] = value * scale
+        values = svdvals(a) / scale
+        assert np.isfinite(values).all() and (values > 0).all()
+        rows.append(values.tolist())
+print(json.dumps(rows, allow_nan=False))
+"#;
+    let required = std::env::var_os(REQUIRE_SCIPY_ENV).is_some();
+    let mut child = match fsci_conformance::scipy_oracle_command()
+        .args(["-c", script])
+        .env("OPENBLAS_NUM_THREADS", "1")
+        .env("OMP_NUM_THREADS", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            assert!(
+                !required,
+                "required dense-SVD oracle could not start: {error}"
+            );
+            eprintln!("skipping optional dense-SVD oracle: {error}");
+            return;
+        }
+    };
+    let query = serde_json::json!({"cases": cases, "scales": scales});
+    let written = child
+        .stdin
+        .take()
+        .expect("oracle stdin")
+        .write_all(&serde_json::to_vec(&query).expect("encode scaled SVD cases"));
+    let output = child.wait_with_output().expect("wait for dense-SVD oracle");
+    if !output.status.success() || written.is_err() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !required,
+            "required dense-SVD oracle failed: {stderr}; input={written:?}"
+        );
+        eprintln!("skipping optional dense-SVD oracle: {stderr}");
+        return;
+    }
+    let reference: Vec<Vec<f64>> =
+        serde_json::from_slice(&output.stdout).expect("decode dense-SVD oracle");
+    assert_eq!(reference.len(), cases.len() * scales.len());
+
+    struct ProductsOnly<'a>(&'a CsrMatrix);
+    impl LinearOperator for ProductsOnly<'_> {
+        fn shape(&self) -> Shape2D {
+            self.0.shape()
+        }
+
+        fn matvec_into(&self, x: &[f64], y: &mut [f64]) -> SparseResult<()> {
+            self.0.matvec_into(x, y)
+        }
+
+        fn rmatvec_into(&self, x: &[f64], y: &mut [f64]) -> SparseResult<()> {
+            self.0.rmatvec_into(x, y)
+        }
+
+        fn to_dense(&self) -> SparseResult<Vec<Vec<f64>>> {
+            panic!("svds must not densify a matrix-free operator")
+        }
+    }
+
+    let mut ledger = CompareLedger::new("diff_sparse_svds_extreme_scales", &["svds"]);
+    for (case_index, case) in cases.iter().enumerate() {
+        for (scale_index, &scale) in scales.iter().enumerate() {
+            let matrix = CooMatrix::from_triplets(
+                Shape2D::new(case.rows, case.cols),
+                case.triplets.iter().map(|(_, _, v)| v * scale).collect(),
+                case.triplets.iter().map(|(i, _, _)| *i).collect(),
+                case.triplets.iter().map(|(_, j, _)| *j).collect(),
+                true,
+            )
+            .expect("scaled COO")
+            .to_csr()
+            .expect("scaled CSR");
+            let opaque = ProductsOnly(&matrix);
+            let oracle = &reference[case_index * scales.len() + scale_index];
+            assert_eq!(oracle.len(), case.rows.min(case.cols));
+            for (representation, operator) in [
+                ("csr", &matrix as &dyn LinearOperator),
+                ("operator", &opaque),
+            ] {
+                for which in [EigsWhich::LargestMagnitude, EigsWhich::SmallestMagnitude] {
+                    let name = format!("{}_{scale:e}_{representation}_{which:?}", case.case_id);
+                    let expected: Vec<f64> = if which == EigsWhich::LargestMagnitude {
+                        oracle[..case.k].to_vec()
+                    } else {
+                        oracle.iter().rev().take(case.k).copied().collect()
+                    };
+                    let result = svds(
+                        operator,
+                        case.k,
+                        EigsOptions {
+                            which,
+                            ..EigsOptions::default()
+                        },
+                    )
+                    .unwrap_or_else(|error| panic!("{name}: {error}"));
+                    assert!(result.converged, "{name}: {result:?}");
+                    let actual: Vec<f64> =
+                        result.singular_values.iter().map(|v| v / scale).collect();
+                    let (expected, actual) = ledger
+                        .slices("svds", &name, Some(&expected), Some(&actual))
+                        .expect("both scaled SVD arms must be present");
+                    ledger.compared(
+                        "svds",
+                        &name,
+                        actual.iter().zip(expected).all(|(actual, expected)| {
+                            actual.is_finite()
+                                && (actual - expected).abs() <= 1e-10 * expected.abs()
+                        }),
+                    );
+                    for i in 0..case.k {
+                        let sigma = result.singular_values[i] / scale;
+                        let av = matrix.matvec(&result.vt[i]).expect("A v");
+                        let atu = matrix.rmatvec(&result.u[i]).expect("A^T u");
+                        for (image, vector) in [(&av, &result.u[i]), (&atu, &result.vt[i])] {
+                            let error = image
+                                .iter()
+                                .zip(vector)
+                                .fold(0.0_f64, |norm, (value, entry)| {
+                                    norm.hypot(value / scale - sigma * entry)
+                                });
+                            assert!(error <= 1e-9 * oracle[0], "{name}: residual={error:e}");
+                        }
+                        for j in 0..=i {
+                            let expected = if i == j { 1.0 } else { 0.0 };
+                            for vectors in [&result.u, &result.vt] {
+                                let inner: f64 =
+                                    vectors[i].iter().zip(&vectors[j]).map(|(x, y)| x * y).sum();
+                                assert!(
+                                    (inner - expected).abs() < 1e-10,
+                                    "{name}: inner={inner:e}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    ledger.finish(cases.len() * scales.len() * 4);
 }

@@ -41790,6 +41790,45 @@ pub struct SvdsResult {
     pub converged: bool,
 }
 
+/// Keep the ordinary-scale arithmetic unchanged. Outside this range the
+/// Gram product and its squared norms need a change of units, even though
+/// every requested singular value may still be representable. A power of
+/// two avoids adding rounding when normalizing finite matrix entries.
+fn svds_normalization(magnitude: f64) -> f64 {
+    // A Gram product and its squared norms reach the fourth power of A's
+    // scale. These bounds leave exponent room for dimension-dependent sums.
+    const SMALL: f64 = f64::from_bits((1023 - 128) << 52);
+    const LARGE: f64 = f64::from_bits((1023 + 128) << 52);
+    if magnitude == 0.0 || (SMALL..=LARGE).contains(&magnitude) {
+        return 1.0;
+    }
+    let bits = magnitude.to_bits();
+    let exponent = bits & 0x7ff0_0000_0000_0000;
+    if exponent == 0 {
+        // The largest power of two in a subnormal number is itself a
+        // representable subnormal. Divide by it, never by its reciprocal.
+        f64::from_bits(1_u64 << (63 - bits.leading_zeros()))
+    } else {
+        f64::from_bits(exponent)
+    }
+}
+
+fn svds_normalize_values(values: &mut [f64], divisor: f64) -> SparseResult<()> {
+    if divisor != 1.0 {
+        for value in values.iter_mut() {
+            let normalized = *value / divisor;
+            if *value != 0.0 && normalized == 0.0 {
+                return Err(SparseError::Unsupported {
+                    feature: "svds normalization cannot retain this operator's full numeric range"
+                        .to_string(),
+                });
+            }
+            *value = normalized;
+        }
+    }
+    ensure_finite(values)
+}
+
 /// Compute the `k` largest or smallest singular triplets of a sparse matrix.
 ///
 /// Matches `scipy.sparse.linalg.svds(A, k=k, which=..., v0=...)`: Krylov–Schur
@@ -41811,8 +41850,13 @@ pub struct SvdsResult {
 /// Unlike SciPy's ARPACK backend, `k` may equal `min(rows, cols)`.
 ///
 /// `A` may be any [`LinearOperator`] that defines `rmatvec`. Non-finite
-/// entries or products are refused, and the projected SVD has a bounded
-/// iteration count.
+/// entries, incomplete products and changing opaque-operator shapes are
+/// refused, and the projected SVD has a bounded iteration count. A supplied
+/// CSR representation is authoritative for both forward and transpose
+/// products. The Gram calculation and projected SVD use normalized units
+/// at extreme scales; matrix-free operators must still return finite
+/// products in their original units. A normalization that would erase a
+/// nonzero value is refused rather than silently changing the nullspace.
 pub fn svds(
     a: &dyn LinearOperator,
     k: usize,
@@ -41846,7 +41890,14 @@ pub fn svds(
         });
     }
     let settings = resolve_krylov_settings(side, k, &options, true)?;
-    if let Some(matrix) = a.as_csr() {
+    let input_csr = a.as_csr();
+    if let Some(matrix) = input_csr {
+        if matrix.shape() != shape {
+            return Err(SparseError::IncompatibleShape {
+                message: "svds operator and its CSR representation have different shapes"
+                    .to_string(),
+            });
+        }
         ensure_finite(matrix.data())?;
     }
     let start = if let Some(v0) = options.v0 {
@@ -41872,24 +41923,67 @@ pub fn svds(
         None
     };
 
+    // Normalize explicit entries before multiplying. This also preserves
+    // subnormal CSR values that would vanish if A*v were formed first. No
+    // dense representation is needed, and ordinary inputs incur no copy.
+    let mut source_scale = input_csr.map_or(1.0, |matrix| {
+        svds_normalization(matrix.data().iter().fold(0.0_f64, |m, v| m.max(v.abs())))
+    });
+    let mut scale_known = input_csr.is_some();
+    let scaled_csr = input_csr
+        .filter(|_| source_scale != 1.0)
+        .map(|matrix| {
+            let mut scaled = matrix.clone();
+            svds_normalize_values(&mut scaled.data, source_scale)?;
+            Ok::<_, SparseError>(scaled)
+        })
+        .transpose()?;
+    let checked = CheckedLeastSquaresOperator { inner: a, shape };
+    let a: &dyn LinearOperator = if let Some(matrix) = scaled_csr.as_ref() {
+        matrix
+    } else if let Some(matrix) = input_csr {
+        matrix
+    } else {
+        &checked
+    };
+    let explicit_matrix = a.as_csr().is_some();
     // Reuse the cached CSC gather for CSR inputs, and retain caller-supplied
     // transpose products for matrix-free operators.
     let a_csc = a.as_csr().map(CsrMatrix::to_csc).transpose()?;
     let mut tmp = vec![0.0; m.max(n)];
     let gram_op = |v: &[f64], _bv: &[f64]| -> SparseResult<Vec<f64>> {
         let mut image = vec![0.0; side];
+        let first = &mut tmp[..m.max(n)];
         if transposed {
-            csc_transpose_matvec_into(a, a_csc.as_ref(), v, &mut tmp[..n])?;
-            ensure_finite(&tmp[..n])?;
-            a.matvec_into(&tmp[..n], &mut image)?;
+            csc_transpose_matvec_into(a, a_csc.as_ref(), v, first)?;
         } else {
-            a.matvec_into(v, &mut tmp[..m])?;
-            ensure_finite(&tmp[..m])?;
-            csc_transpose_matvec_into(a, a_csc.as_ref(), &tmp[..m], &mut image)?;
+            a.matvec_into(v, first)?;
         }
+        ensure_finite(first)?;
+        // An opaque operator provides no entries to inspect. Its first
+        // nonzero image fixes the units for every subsequent product. Zero
+        // images before that choice stay exactly zero under any scaling, so
+        // even an initial direction in the nullspace is safe. This requires
+        // no extra products or entry-by-entry probing of the operator.
+        if !scale_known {
+            let magnitude = first.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+            if magnitude > 0.0 {
+                source_scale = svds_normalization(magnitude);
+                scale_known = true;
+            }
+        }
+        let divisor = if explicit_matrix { 1.0 } else { source_scale };
+        svds_normalize_values(first, divisor)?;
+        if transposed {
+            a.matvec_into(first, &mut image)?;
+        } else {
+            csc_transpose_matvec_into(a, a_csc.as_ref(), first, &mut image)?;
+        }
+        svds_normalize_values(&mut image, divisor)?;
         Ok(image)
     };
     let run = symmetric_krylov_schur(gram_op, None, side, k, &settings, start.as_deref(), false)?;
+    let product_divisor = if explicit_matrix { 1.0 } else { source_scale };
     let count = run.vectors.len();
     let mut converged = count == k && run.converged.iter().all(|&value| value);
     if count == 0 {
@@ -41918,7 +42012,7 @@ pub fn svds(
         } else {
             a.matvec_into(input, output)?;
         }
-        ensure_finite(output)?;
+        svds_normalize_values(output, product_divisor)?;
     }
 
     // Order the projected columns independently of the requested output order.
@@ -41980,7 +42074,15 @@ pub fn svds(
     let mut av = vec![0.0; m];
     let mut atu = vec![0.0; n];
     for j in order {
-        let sigma = svd.singular_values[j];
+        let sigma = svd.singular_values[j] * source_scale;
+        if !sigma.is_finite() {
+            return Err(SparseError::NonFiniteInput {
+                message: "svds singular value exceeds the floating-point range".to_string(),
+            });
+        }
+        // Check the value actually returned, including its rounding when
+        // restoring subnormal units, rather than an unreported SVD value.
+        let normalized_sigma = sigma / source_scale;
         let projected_vector: Vec<f64> = projected_u.column(j).iter().copied().collect();
         let lifted_vector: Vec<f64> = lifted.column(j).iter().copied().collect();
         let (left, right) = if transposed {
@@ -41990,17 +42092,15 @@ pub fn svds(
         };
         a.matvec_into(&right, &mut av)?;
         csc_transpose_matvec_into(a, a_csc.as_ref(), &left, &mut atu)?;
-        ensure_finite(&av)?;
-        ensure_finite(&atu)?;
-        let left_residual = av
-            .iter()
-            .zip(&left)
-            .fold(0.0_f64, |norm, (&x, &y)| norm.hypot(x - sigma * y));
-        let right_residual = atu
-            .iter()
-            .zip(&right)
-            .fold(0.0_f64, |norm, (&x, &y)| norm.hypot(x - sigma * y));
-        let tolerance = settings.tol.max(f64::EPSILON.sqrt()) * (spectral_scale + sigma);
+        svds_normalize_values(&mut av, product_divisor)?;
+        svds_normalize_values(&mut atu, product_divisor)?;
+        let left_residual = av.iter().zip(&left).fold(0.0_f64, |norm, (&x, &y)| {
+            norm.hypot(x - normalized_sigma * y)
+        });
+        let right_residual = atu.iter().zip(&right).fold(0.0_f64, |norm, (&x, &y)| {
+            norm.hypot(x - normalized_sigma * y)
+        });
+        let tolerance = settings.tol.max(f64::EPSILON.sqrt()) * (spectral_scale + normalized_sigma);
         converged &= left_residual.is_finite()
             && right_residual.is_finite()
             && tolerance.is_finite()
@@ -42111,6 +42211,180 @@ mod svds_refinement_tests {
             let a = diagonal_rect(rows, cols, &[0.0; 4]);
             let result = svds(&a, 3, EigsOptions::default()).expect("zero SVD");
             check_triplets(&a, &result, &[0.0; 3]);
+        }
+    }
+
+    #[test]
+    fn svds_scale_safe_triplets_cover_extreme_sparse_and_matrix_free_inputs() {
+        struct ProductsOnly(CsrMatrix);
+        impl LinearOperator for ProductsOnly {
+            fn shape(&self) -> Shape2D {
+                self.0.shape()
+            }
+
+            fn matvec_into(&self, x: &[f64], y: &mut [f64]) -> SparseResult<()> {
+                self.0.matvec_into(x, y)
+            }
+
+            fn rmatvec_into(&self, x: &[f64], y: &mut [f64]) -> SparseResult<()> {
+                self.0.rmatvec_into(x, y)
+            }
+
+            fn to_dense(&self) -> SparseResult<Vec<Vec<f64>>> {
+                panic!("svds must preserve matrix-free input")
+            }
+        }
+
+        for scale in [1e-200, 1.0, 1e200] {
+            for (rows, cols) in [(7, 4), (4, 7)] {
+                let diagonal = [6.0 * scale, 3.0 * scale, 2.0 * scale, scale];
+                let sparse = diagonal_rect(rows, cols, &diagonal);
+                // Reproduce the original failure with the same sparse
+                // kernels: finite A has either an all-zero or a non-finite
+                // unnormalized Gram image. A successful test must recover
+                // the actual spectrum, not certify that unusable image.
+                let av = sparse.matvec(&vec![1.0; cols]).expect("unscaled A v");
+                let raw_gram = sparse.rmatvec(&av).expect("unscaled A^T A v");
+                if scale == 1e-200 {
+                    assert!(raw_gram.iter().all(|value| *value == 0.0));
+                } else if scale == 1e200 {
+                    assert!(raw_gram.iter().any(|value| !value.is_finite()));
+                }
+                let matrix_free = ProductsOnly(sparse.clone());
+                for operator in [&sparse as &dyn LinearOperator, &matrix_free] {
+                    for (which, expected) in [
+                        (EigsWhich::LargestMagnitude, [6.0, 3.0]),
+                        (EigsWhich::SmallestMagnitude, [1.0, 2.0]),
+                    ] {
+                        let result = svds(
+                            operator,
+                            2,
+                            EigsOptions {
+                                which,
+                                ..EigsOptions::default()
+                            },
+                        )
+                        .expect("representable singular triplets");
+                        assert!(result.converged, "scale={scale:e}, {which:?}: {result:?}");
+                        for (i, &want) in expected.iter().enumerate() {
+                            let sigma = result.singular_values[i] / scale;
+                            assert!((sigma - want).abs() < 1e-10, "{sigma} != {want}");
+                            let av = operator.matvec(&result.vt[i]).expect("A v");
+                            let atu = operator.rmatvec(&result.u[i]).expect("A^T u");
+                            for (image, vector) in [(&av, &result.u[i]), (&atu, &result.vt[i])] {
+                                let residual = image.iter().zip(vector).fold(
+                                    0.0_f64,
+                                    |norm, (&value, &entry)| {
+                                        norm.hypot(value / scale - sigma * entry)
+                                    },
+                                );
+                                assert!(residual < 1e-10, "scaled residual={residual:e}");
+                            }
+                            for j in 0..=i {
+                                let inner = if i == j { 1.0 } else { 0.0 };
+                                for vectors in [&result.u, &result.vt] {
+                                    assert!(
+                                        (dot_product(&vectors[i], &vectors[j]) - inner).abs()
+                                            < 1e-10
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn svds_extreme_scale_can_be_discovered_after_a_nullspace_start() {
+        for scale in [1e-200, 1e200] {
+            for (rows, cols) in [(7, 4), (4, 7)] {
+                let matrix = diagonal_rect(rows, cols, &[0.0, 6.0 * scale, 3.0 * scale, scale]);
+                let operator = crate::FunctionOperator::new(matrix.shape(), |x| matrix.matvec(x))
+                    .with_rmatvec(|x| matrix.rmatvec(x));
+                let result = svds(
+                    &operator,
+                    2,
+                    EigsOptions {
+                        v0: Some(&[1.0, 0.0, 0.0, 0.0]),
+                        ..EigsOptions::default()
+                    },
+                )
+                .expect("normalization after an exact zero first image");
+                assert!(result.converged, "scale={scale:e}: {result:?}");
+                for (actual, expected) in result.singular_values.iter().zip([6.0, 3.0]) {
+                    assert!((actual / scale - expected).abs() < 1e-10);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn svds_normalization_refuses_to_erase_a_nonzero_singular_direction() {
+        let matrix = diagonal_rect(2, 2, &[1e200, 1e-200]);
+        let operator = crate::FunctionOperator::new(matrix.shape(), |x| matrix.matvec(x))
+            .with_rmatvec(|x| matrix.rmatvec(x));
+        for a in [&matrix as &dyn LinearOperator, &operator] {
+            assert!(matches!(
+                svds(
+                    a,
+                    1,
+                    EigsOptions {
+                        which: EigsWhich::SmallestMagnitude,
+                        v0: Some(&[1.0, 1.0]),
+                        ..EigsOptions::default()
+                    }
+                ),
+                Err(SparseError::Unsupported { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn svds_rejects_incomplete_and_nonfinite_operator_products() {
+        struct MalformedProduct {
+            transpose: bool,
+            nonfinite: bool,
+        }
+        impl MalformedProduct {
+            fn apply(&self, x: &[f64], y: &mut [f64], transpose: bool) {
+                y[0] = 3.0 * x[0];
+                y[1] = 2.0 * x[1];
+                if transpose != self.transpose {
+                    y[2] = x[2];
+                } else if self.nonfinite {
+                    y[2] = f64::INFINITY;
+                }
+            }
+        }
+        impl LinearOperator for MalformedProduct {
+            fn shape(&self) -> Shape2D {
+                Shape2D::new(3, 3)
+            }
+
+            fn matvec_into(&self, x: &[f64], y: &mut [f64]) -> SparseResult<()> {
+                self.apply(x, y, false);
+                Ok(())
+            }
+
+            fn rmatvec_into(&self, x: &[f64], y: &mut [f64]) -> SparseResult<()> {
+                self.apply(x, y, true);
+                Ok(())
+            }
+        }
+
+        for transpose in [false, true] {
+            for nonfinite in [false, true] {
+                let operator = MalformedProduct {
+                    transpose,
+                    nonfinite,
+                };
+                assert!(matches!(
+                    svds(&operator, 1, EigsOptions::default()),
+                    Err(SparseError::NonFiniteInput { .. })
+                ));
+            }
         }
     }
 
