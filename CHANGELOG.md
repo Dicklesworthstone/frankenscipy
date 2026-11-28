@@ -368,6 +368,7 @@ crates.io and GitHub Release for all 19 `fsci-*` crates.
   Tokio edge under `wasm-bindgen-futures`' unstable Emscripten configuration,
   inactive on default Linux and macOS graphs
   ([#15](https://github.com/Dicklesworthstone/frankenscipy/issues/15)).
+  *Update in 0.5.2:* #15 is closed; see the 0.5.2 known limits.
 - **Earlier follow-up design work:** broader N-D geometry above dimension 8
   ([#2](https://github.com/Dicklesworthstone/frankenscipy/issues/2)),
   full scale-invariant `Covariance` decomposition parity
@@ -386,6 +387,7 @@ crates.io and GitHub Release for all 19 `fsci-*` crates.
   ([#18](https://github.com/Dicklesworthstone/frankenscipy/issues/18)),
   and historical credential-owner revocation
   ([#1](https://github.com/Dicklesworthstone/frankenscipy/issues/1)) remain open.
+  *Update in 0.5.2:* #2, #4, #6 and #18 are closed; see the 0.5.2 known limits.
 
 ## [0.4.0] — 2026-10-14
 
@@ -503,6 +505,7 @@ crates.io and GitHub Release for all 19 `fsci-*` crates.
   dependency under `wasm-bindgen-futures`' unstable Emscripten
   configuration. It is inactive in the default Linux graph
   ([#15](https://github.com/Dicklesworthstone/frankenscipy/issues/15)).
+  *Update in 0.5.2:* #15 is closed; see the 0.5.2 known limits.
 - **Earlier hardening work:**
   - geometry above the documented bounds and covariance decomposition
     parity ([#2](https://github.com/Dicklesworthstone/frankenscipy/issues/2),
@@ -515,6 +518,7 @@ crates.io and GitHub Release for all 19 `fsci-*` crates.
     ([#6](https://github.com/Dicklesworthstone/frankenscipy/issues/6)).
 
   All of these remain open.
+  *Update in 0.5.2:* of these, only #3 is still open.
 - **Publishing:** credential-owner revocation is still needed
   ([#1](https://github.com/Dicklesworthstone/frankenscipy/issues/1)). The
   optional batch publisher keeps its version and early-exit defects, and its
