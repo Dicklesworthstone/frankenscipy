@@ -9274,7 +9274,7 @@ mod tests {
             vec![(Some(f64::NEG_INFINITY), Some(1.0))],
         ] {
             let result = minimize(
-                &fun,
+                fun,
                 &[0.0],
                 MinimizeOptions {
                     method: Some(OptimizeMethod::Tnc),
